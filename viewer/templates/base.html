@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ title }} | Skills Catalog</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <header class="topbar">
+        <div class="brand">
+            <a href="/competencies">Локальный каталог skills</a>
+        </div>
+        <nav class="nav">
+            {% for item in nav %}
+            <a href="{{ item.href }}" class="nav-link{% if request_path == item.href or request_path.startswith(item.href ~ '/') %} active{% endif %}">{{ item.label }}</a>
+            {% endfor %}
+        </nav>
+    </header>
+
+    <main class="page-shell">
+        <aside class="summary-panel">
+            <div class="summary-card">
+                <div class="summary-label">Профили</div>
+                <div class="summary-value">{{ summary.counts.profiles if summary and summary.counts else "?" }}</div>
+            </div>
+            <div class="summary-card">
+                <div class="summary-label">Компетенции</div>
+                <div class="summary-value">{{ summary.counts.competencies if summary and summary.counts else "?" }}</div>
+            </div>
+            <div class="summary-card">
+                <div class="summary-label">Skills</div>
+                <div class="summary-value">{{ summary.counts.skills if summary and summary.counts else "?" }}</div>
+            </div>
+            <div class="summary-card">
+                <div class="summary-label">Индикаторы</div>
+                <div class="summary-value">{{ summary.counts.indicator_rows if summary and summary.counts else "?" }}</div>
+            </div>
+            <div class="summary-card summary-card-warn">
+                <div class="summary-label">Open review</div>
+                <div class="summary-value">{{ summary.counts.open_reviews if summary and summary.counts else "?" }}</div>
+            </div>
+        </aside>
+
+        <section class="content-panel">
+            {% block content %}{% endblock %}
+        </section>
+    </main>
+</body>
+</html>

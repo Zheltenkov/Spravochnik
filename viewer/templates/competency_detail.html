@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero hero-compact">
+    <div>
+        <a class="back-link" href="/competencies">← Назад к справочнику</a>
+        <h1>{{ competency.title }}</h1>
+        {% if competency.description %}
+        <p>{{ competency.description }}</p>
+        {% endif %}
+    </div>
+    <div class="metrics metrics-vertical">
+        <span>{{ competency.profile_count }} профилей</span>
+        <span>{{ competency.skill_count }} skills</span>
+        <span>{{ competency.indicator_count }} индикаторов</span>
+    </div>
+</section>
+
+{% for skill in skills %}
+<details class="tree-card">
+    <summary>
+        <div>
+            <strong>{{ skill.canonical_name }}</strong>
+            <div class="muted small">{{ skill.profile_count }} профилей, {{ skill.indicator_count }} индикаторов</div>
+        </div>
+    </summary>
+    <div class="card-body">
+        {% if skill.profile_names %}
+        <p class="small"><strong>Используется в профилях:</strong> {{ skill.profile_names }}</p>
+        {% endif %}
+        {% for indicator in skill.indicators %}
+        <div class="indicator-block">
+            <div class="indicator-line">
+                <span class="pill">{{ indicator.dimension_title }}</span>
+                <span>{{ indicator.indicator_text }}</span>
+            </div>
+            {% if indicator.levels %}
+            <div class="levels-grid">
+                {% for level in indicator.levels %}
+                <div class="level-cell">
+                    <span class="level-label">{{ level.label }}</span>
+                    <span class="level-value {{ level.kind }}">{{ level.value }}</span>
+                </div>
+                {% endfor %}
+            </div>
+            {% endif %}
+        </div>
+        {% endfor %}
+    </div>
+</details>
+{% endfor %}
+{% endblock %}

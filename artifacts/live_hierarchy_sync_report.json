@@ -1,0 +1,29 @@
+{
+  "typed_competency_count": 11,
+  "skill_count": 89,
+  "resolution_counts": {
+    "matched": 86,
+    "alias": 0,
+    "manual": 3,
+    "fuzzy": 0,
+    "missing": 0
+  },
+  "missing_skills": [],
+  "non_exact_matches": [
+    {
+      "live_skill_name": "Обеспечение безопасности микросервисов",
+      "resolution_status": "manual",
+      "match_note": "manual override -> Обеспечение безопасности микросвервисов"
+    },
+    {
+      "live_skill_name": "Настройка Java-окружения",
+      "resolution_status": "manual",
+      "match_note": "manual override -> Настройка Java- окружения"
+    },
+    {
+      "live_skill_name": "Работа с аннотацией и рефлексией",
+      "resolution_status": "manual",
+      "match_note": "manual override -> Работа с аннотацией и рефлесией"
+    }
+  ]
+}

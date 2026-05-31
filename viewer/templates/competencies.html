@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+    <div>
+        <h1>Справочник компетенций</h1>
+        {% if hierarchy_mode == "typed" %}
+        <p>Локальная копия live-иерархии: рубрика, skill, индикаторы.</p>
+        {% if directory_profile %}
+        <p class="small muted">Индикаторы раскрываются по локальным данным профиля {{ directory_profile.name }}.</p>
+        {% endif %}
+        {% else %}
+        <p>Локальный read-only viewer по данным, импортированным из Excel в SQLite.</p>
+        {% endif %}
+    </div>
+    <form class="search-form" method="get" action="/competencies">
+        <input type="text" name="q" value="{{ query }}" placeholder="Поиск по компетенциям, skills и индикаторам">
+        <div class="scope-row">
+            <label><input type="radio" name="scope" value="all" {% if scope == "all" %}checked{% endif %}> Везде</label>
+            <label><input type="radio" name="scope" value="competencies" {% if scope == "competencies" %}checked{% endif %}> По компетенциям</label>
+            <label><input type="radio" name="scope" value="skills" {% if scope == "skills" %}checked{% endif %}> По skills</label>
+            <label><input type="radio" name="scope" value="indicators" {% if scope == "indicators" %}checked{% endif %}> По индикаторам</label>
+        </div>
+        <button type="submit">Искать</button>
+    </form>
+</section>
+
+{% if hierarchy_mode == "typed" %}
+<section class="list-grid">
+    {% for competency in competencies %}
+    <details class="tree-card directory-card" {% if competency.open_on_load %}open{% endif %}>
+        <summary>
+            <div class="summary-head">
+                <span class="toggle-glyph" aria-hidden="true"></span>
+                <strong>{{ competency.name }}</strong>
+            </div>
+            <div class="summary-inline">
+                <span class="metrics-chip">{{ competency.skill_count }} skills</span>
+                <span class="metrics-chip">{{ competency.indicator_count }} индикаторов</span>
+            </div>
+        </summary>
+        <div class="card-body directory-stack">
+            {% for skill in competency.skills %}
+            <details class="skill-card directory-skill" {% if query %}open{% endif %}>
+                <summary>
+                    <div class="summary-head">
+                        <span class="toggle-glyph toggle-glyph-small" aria-hidden="true"></span>
+                        <div>
+                            <strong>{{ skill.display_name }}</strong>
+                            {% if skill.resolution_status != "matched" %}
+                            <div class="small muted">{{ skill.resolution_label }}</div>
+                            {% endif %}
+                            {% if skill.resolved_name and skill.resolved_name != skill.source_name %}
+                            <div class="small muted">Источник live: {{ skill.source_name }}</div>
+                            {% endif %}
+                            {% if skill.match_note %}
+                            <div class="small muted">{{ skill.match_note }}</div>
+                            {% endif %}
+                        </div>
+                    </div>
+                    <div class="summary-inline">
+                        <span class="metrics-chip">{{ skill.indicator_count }} индикаторов</span>
+                        {% if skill.resolution_status == "missing" %}
+                        <span class="status-badge warn">не сопоставлено</span>
+                        {% endif %}
+                    </div>
+                </summary>
+                <div class="card-body">
+                    {% if skill.indicators %}
+                        {% for indicator in skill.indicators %}
+                        <div class="indicator-block indicator-block-flat">
+                            <div class="indicator-line">
+                                <span class="pill">{{ indicator.dimension }}</span>
+                                <span>{{ indicator.text }}</span>
+                            </div>
+                        </div>
+                        {% endfor %}
+                    {% else %}
+                    <div class="empty-inline">
+                        <p class="small muted">Для этого skill пока нет локального набора индикаторов в выбранном профиле.</p>
+                    </div>
+                    {% endif %}
+                </div>
+            </details>
+            {% endfor %}
+        </div>
+    </details>
+    {% else %}
+    <article class="empty-state">
+        <h2>Совпадений не найдено</h2>
+        <p>Попробуйте ослабить запрос или переключить область поиска.</p>
+    </article>
+    {% endfor %}
+</section>
+{% else %}
+<section class="list-grid">
+    {% for competency in competencies %}
+    <article class="entity-card">
+        <div class="entity-head">
+            <div>
+                <h2><a href="/competencies/{{ competency.id }}">{{ competency.title }}</a></h2>
+                {% if competency.description %}
+                <p class="muted">{{ competency.description }}</p>
+                {% endif %}
+            </div>
+            <span class="status-badge">{{ competency.status }}</span>
+        </div>
+        <div class="metrics">
+            <span>{{ competency.profile_count }} профилей</span>
+            <span>{{ competency.skill_count }} skills</span>
+            <span>{{ competency.indicator_count }} индикаторов</span>
+        </div>
+    </article>
+    {% else %}
+    <article class="empty-state">
+        <h2>Совпадений не найдено</h2>
+        <p>Попробуйте ослабить запрос или переключить область поиска.</p>
+    </article>
+    {% endfor %}
+</section>
+{% endif %}
+{% endblock %}

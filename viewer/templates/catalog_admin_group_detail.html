@@ -1,0 +1,142 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero hero-compact">
+    <div>
+        <a class="back-link" href="/catalog-admin/groups">← Назад к группам</a>
+        <h1>{{ group.name }}</h1>
+        <p class="muted">{{ group.code }}</p>
+    </div>
+    <div class="metrics metrics-vertical">
+        <span>{{ group.skill_count }} skills</span>
+        <span>{{ group.indicator_count }} индикаторов</span>
+        <span>{{ group.status }}</span>
+    </div>
+</section>
+
+<section class="filter-panel">
+    <form class="admin-form" method="post" action="/catalog-admin/groups/{{ group.id }}">
+        <input type="hidden" name="action" value="update_group">
+        <div class="admin-grid">
+            <label>
+                <span>Название группы</span>
+                <input type="text" name="name" value="{{ group.name }}">
+            </label>
+            <label>
+                <span>Порядок</span>
+                <input type="number" name="sort_order" value="{{ group.sort_order }}">
+            </label>
+            <label>
+                <span>Status</span>
+                <select name="status">
+                    <option value="active" {% if group.status == "active" %}selected{% endif %}>active</option>
+                    <option value="candidate" {% if group.status == "candidate" %}selected{% endif %}>candidate</option>
+                    <option value="deprecated" {% if group.status == "deprecated" %}selected{% endif %}>deprecated</option>
+                </select>
+            </label>
+        </div>
+        <button type="submit">Сохранить группу</button>
+    </form>
+    <form class="admin-form admin-form-inline" method="post" action="/catalog-admin/groups/{{ group.id }}">
+        <input type="hidden" name="action" value="remove_group">
+        <div class="review-actions">
+            {% if group.total_skill_count == 0 %}
+            <button type="submit" class="action-btn action-btn-danger">Удалить группу</button>
+            <span class="muted">Пустая группа удаляется полностью.</span>
+            {% else %}
+            <button type="submit" class="action-btn action-btn-light">Архивировать группу</button>
+            <span class="muted">Если в группе уже есть skills, она не удаляется физически, а переводится в архивный статус.</span>
+            {% endif %}
+        </div>
+    </form>
+</section>
+
+<section class="filter-panel">
+    <form class="admin-form" method="post" action="/catalog-admin/groups/{{ group.id }}">
+        <input type="hidden" name="action" value="create_skill">
+        <div class="admin-grid">
+            <label>
+                <span>Новый skill</span>
+                <input type="text" name="name" placeholder="Название skill">
+            </label>
+            <label>
+                <span>Порядок</span>
+                <input type="number" name="sort_order" value="{{ skills|length + 1 }}">
+            </label>
+            <label>
+                <span>Источник</span>
+                <input type="text" name="source_skill_name" placeholder="source_skill_name">
+            </label>
+            <label>
+                <span>Resolution</span>
+                <select name="resolution_status">
+                    <option value="manual">manual</option>
+                    <option value="matched">matched</option>
+                    <option value="alias">alias</option>
+                    <option value="fuzzy">fuzzy</option>
+                    <option value="missing">missing</option>
+                </select>
+            </label>
+            <label>
+                <span>Active</span>
+                <select name="is_active">
+                    <option value="1">yes</option>
+                    <option value="0">no</option>
+                </select>
+            </label>
+            <label class="admin-span-2">
+                <span>Description</span>
+                <textarea name="description" rows="3" placeholder="Краткое описание skill"></textarea>
+            </label>
+            <label class="admin-span-2">
+                <span>Match note</span>
+                <textarea name="match_note" rows="2" placeholder="Почему так сопоставили"></textarea>
+            </label>
+        </div>
+        <button type="submit">Добавить skill</button>
+    </form>
+    <p class="muted">Сложность skill рассчитывается по индикаторам автоматически и появится после их заполнения.</p>
+</section>
+
+<section class="list-grid">
+    {% for skill in skills %}
+    <article class="entity-card">
+        <div class="entity-head">
+            <div>
+                <h2><a href="/catalog-admin/skills/{{ skill.id }}">{{ skill.name }}</a></h2>
+                {% if skill.source_skill_name %}
+                <p class="muted">source: {{ skill.source_skill_name }}</p>
+                {% endif %}
+            </div>
+            <span class="status-badge {% if not skill.is_active %}warn{% endif %}">{{ "active" if skill.is_active else "disabled" }}</span>
+        </div>
+        <div class="metrics">
+            <span>sort {{ skill.sort_order }}</span>
+            <span>{{ skill.indicator_count }} индикаторов</span>
+            {% if skill.complexity_summary %}
+            <span>сложность: {{ skill.complexity_summary }}</span>
+            {% endif %}
+            {% if skill.source_scale_title %}
+            <span>{{ skill.source_scale_title }}</span>
+            {% endif %}
+            <span>{{ skill.resolution_status }}</span>
+            {% if skill.match_note %}
+            <span>{{ skill.match_note }}</span>
+            {% endif %}
+        </div>
+        <form class="admin-form admin-form-inline" method="post" action="/catalog-admin/groups/{{ group.id }}">
+            <input type="hidden" name="action" value="remove_skill">
+            <input type="hidden" name="skill_id" value="{{ skill.id }}">
+            <div class="review-actions">
+                {% if skill.total_indicator_count == 0 %}
+                <button type="submit" class="action-btn action-btn-danger">Удалить skill</button>
+                <span class="muted">Если в skill нет индикаторов, он удаляется полностью.</span>
+                {% else %}
+                <button type="submit" class="action-btn action-btn-light">Архивировать skill</button>
+                <span class="muted">Если в skill уже есть индикаторы, он не удаляется физически, а выключается.</span>
+                {% endif %}
+            </div>
+        </form>
+    </article>
+    {% endfor %}
+</section>
+{% endblock %}

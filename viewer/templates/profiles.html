@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+    <div>
+        <h1>Скиллсеты</h1>
+        <p>Профили, собранные из Excel-источников и разложенные в локальную базу.</p>
+    </div>
+</section>
+
+<section class="list-grid">
+    {% for profile in profiles %}
+    <article class="entity-card">
+        <div class="entity-head">
+            <div>
+                <h2><a href="/profiles/{{ profile.id }}">{{ profile.name }}</a></h2>
+                <p class="muted">{{ profile.source_kind }}</p>
+            </div>
+            {% if profile.review_competencies %}
+            <span class="status-badge warn">{{ profile.review_competencies }} needs review</span>
+            {% endif %}
+        </div>
+        <div class="metrics">
+            <span>{{ profile.competency_count }} компетенций</span>
+            <span>{{ profile.skill_count }} skills</span>
+            <span>{{ profile.indicator_count }} индикаторов</span>
+        </div>
+    </article>
+    {% endfor %}
+</section>
+{% endblock %}

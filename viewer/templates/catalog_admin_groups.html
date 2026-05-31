@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+    <div>
+        <h1>Каталог DB</h1>
+        <p>Черновой CRUD поверх целевой структуры `group -> skill -> indicator`.</p>
+    </div>
+</section>
+
+<section class="filter-panel">
+    <form class="admin-form" method="post" action="/catalog-admin/groups">
+        <input type="hidden" name="action" value="create_group">
+        <div class="admin-grid admin-grid-compact">
+            <label>
+                <span>Новая группа</span>
+                <input type="text" name="name" placeholder="Например, Алгоритмы">
+            </label>
+            <label>
+                <span>Порядок</span>
+                <input type="number" name="sort_order" value="999">
+            </label>
+            <label>
+                <span>Status</span>
+                <select name="status">
+                    <option value="active">active</option>
+                    <option value="candidate">candidate</option>
+                    <option value="deprecated">deprecated</option>
+                </select>
+            </label>
+        </div>
+        <button type="submit">Создать группу</button>
+    </form>
+</section>
+
+<section class="list-grid">
+    {% for group in groups %}
+    <article class="entity-card">
+        <div class="entity-head">
+            <div>
+                <h2><a href="/catalog-admin/groups/{{ group.id }}">{{ group.name }}</a></h2>
+                <p class="muted">{{ group.code }}</p>
+            </div>
+            <span class="status-badge {% if group.status != 'active' %}warn{% endif %}">{{ group.status }}</span>
+        </div>
+        <div class="metrics">
+            <span>{{ group.skill_count }} skills</span>
+            <span>{{ group.indicator_count }} индикаторов</span>
+            <span>sort {{ group.sort_order }}</span>
+        </div>
+        <form class="admin-form admin-form-inline" method="post" action="/catalog-admin/groups">
+            <input type="hidden" name="action" value="update_group">
+            <input type="hidden" name="group_id" value="{{ group.id }}">
+            <div class="admin-grid">
+                <label>
+                    <span>Название</span>
+                    <input type="text" name="name" value="{{ group.name }}">
+                </label>
+                <label>
+                    <span>Порядок</span>
+                    <input type="number" name="sort_order" value="{{ group.sort_order }}">
+                </label>
+                <label>
+                    <span>Status</span>
+                    <select name="status">
+                        <option value="active" {% if group.status == "active" %}selected{% endif %}>active</option>
+                        <option value="candidate" {% if group.status == "candidate" %}selected{% endif %}>candidate</option>
+                        <option value="deprecated" {% if group.status == "deprecated" %}selected{% endif %}>deprecated</option>
+                    </select>
+                </label>
+            </div>
+            <div class="review-actions">
+                <button type="submit" class="action-btn action-btn-primary">Сохранить</button>
+                <a class="action-btn" href="/catalog-admin/groups/{{ group.id }}">Открыть группу</a>
+            </div>
+        </form>
+        <form class="admin-form admin-form-inline" method="post" action="/catalog-admin/groups">
+            <input type="hidden" name="action" value="remove_group">
+            <input type="hidden" name="group_id" value="{{ group.id }}">
+            <div class="review-actions">
+                {% if group.total_skill_count == 0 %}
+                <button type="submit" class="action-btn action-btn-danger">Удалить пустую группу</button>
+                <span class="muted">Группа без skills удаляется полностью.</span>
+                {% else %}
+                <button type="submit" class="action-btn action-btn-light">Архивировать группу</button>
+                <span class="muted">Группа со skills не удаляется, а переводится в архив.</span>
+                {% endif %}
+            </div>
+        </form>
+    </article>
+    {% endfor %}
+</section>
+{% endblock %}

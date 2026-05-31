@@ -1,0 +1,168 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+    <div>
+        <h1>Архив каталога</h1>
+        <p>Здесь находятся группы, skills и индикаторы, которые были убраны из рабочего каталога, но не потеряны.</p>
+    </div>
+</section>
+
+<section class="filter-panel">
+    <form class="filter-form" method="get" action="/catalog-admin/archive">
+        <label>
+            <span>Поиск</span>
+            <input type="search" name="q" value="{{ archive_query or '' }}" placeholder="Название группы, skill, текст индикатора">
+        </label>
+        <label>
+            <span>Раздел</span>
+            <select name="scope">
+                <option value="all" {% if archive_scope == "all" %}selected{% endif %}>Все</option>
+                <option value="groups" {% if archive_scope == "groups" %}selected{% endif %}>Только группы</option>
+                <option value="skills" {% if archive_scope == "skills" %}selected{% endif %}>Только skills</option>
+                <option value="indicators" {% if archive_scope == "indicators" %}selected{% endif %}>Только индикаторы</option>
+            </select>
+        </label>
+        <button type="submit">Найти</button>
+        {% if archive_query or archive_scope != "all" %}
+        <a class="action-btn action-btn-light" href="/catalog-admin/archive">Сбросить</a>
+        {% endif %}
+    </form>
+    <p class="muted">Из архива можно восстановить запись обратно в рабочий каталог. Для skills и индикаторов восстановление также включает родительские сущности, если они были скрыты.</p>
+</section>
+
+{% if archive_query %}
+<section class="filter-panel">
+    <p class="muted">Результаты поиска по запросу: <strong>{{ archive_query }}</strong></p>
+</section>
+{% endif %}
+
+{% if archive_scope in ["all", "groups"] %}
+<section class="archive-section">
+    <div class="summary-head">
+        <h2>Архивные группы</h2>
+        <span class="pill">{{ archived_groups|length }}</span>
+    </div>
+    {% if archived_groups %}
+    <section class="list-grid">
+        {% for group in archived_groups %}
+        <article class="entity-card">
+            <div class="entity-head">
+                <div>
+                    <h2>{{ group.name }}</h2>
+                    <p class="muted">{{ group.code }}</p>
+                </div>
+                <span class="status-badge warn">{{ group.status }}</span>
+            </div>
+            <div class="metrics">
+                <span>{{ group.total_skill_count }} skills</span>
+                <span>{{ group.total_indicator_count }} индикаторов</span>
+                <span>sort {{ group.sort_order }}</span>
+            </div>
+            <form class="admin-form admin-form-inline" method="post" action="/catalog-admin/archive">
+                <input type="hidden" name="action" value="restore_group">
+                <input type="hidden" name="group_id" value="{{ group.id }}">
+                <input type="hidden" name="q" value="{{ archive_query or '' }}">
+                <input type="hidden" name="scope" value="{{ archive_scope }}">
+                <div class="review-actions">
+                    <button type="submit" class="action-btn action-btn-primary">Восстановить группу</button>
+                </div>
+            </form>
+        </article>
+        {% endfor %}
+    </section>
+    {% else %}
+    <div class="empty-state">В архиве нет групп.</div>
+    {% endif %}
+</section>
+{% endif %}
+
+{% if archive_scope in ["all", "skills"] %}
+<section class="archive-section">
+    <div class="summary-head">
+        <h2>Архивные skills</h2>
+        <span class="pill">{{ archived_skills|length }}</span>
+    </div>
+    {% if archived_skills %}
+    <section class="list-grid">
+        {% for skill in archived_skills %}
+        <article class="entity-card">
+            <div class="entity-head">
+                <div>
+                    <h2>{{ skill.name }}</h2>
+                    <p class="muted">{{ skill.group_name }}</p>
+                </div>
+                <span class="status-badge warn">archived</span>
+            </div>
+            <div class="metrics">
+                <span>sort {{ skill.sort_order }}</span>
+                <span>{{ skill.total_indicator_count }} индикаторов</span>
+                {% if skill.complexity_summary %}
+                <span>{{ skill.complexity_summary }}</span>
+                {% endif %}
+                <span>{{ skill.resolution_status }}</span>
+            </div>
+            <form class="admin-form admin-form-inline" method="post" action="/catalog-admin/archive">
+                <input type="hidden" name="action" value="restore_skill">
+                <input type="hidden" name="skill_id" value="{{ skill.id }}">
+                <input type="hidden" name="q" value="{{ archive_query or '' }}">
+                <input type="hidden" name="scope" value="{{ archive_scope }}">
+                <div class="review-actions">
+                    <button type="submit" class="action-btn action-btn-primary">Восстановить skill</button>
+                    <a class="action-btn" href="/catalog-admin/skills/{{ skill.id }}">Открыть карточку</a>
+                </div>
+            </form>
+        </article>
+        {% endfor %}
+    </section>
+    {% else %}
+    <div class="empty-state">В архиве нет skills.</div>
+    {% endif %}
+</section>
+{% endif %}
+
+{% if archive_scope in ["all", "indicators"] %}
+<section class="archive-section">
+    <div class="summary-head">
+        <h2>Архивные индикаторы</h2>
+        <span class="pill">{{ archived_indicators|length }}</span>
+    </div>
+    {% if archived_indicators %}
+    <section class="list-grid">
+        {% for indicator in archived_indicators %}
+        <article class="entity-card">
+            <div class="entity-head">
+                <div>
+                    <h2>{{ indicator.indicator_type }}</h2>
+                    <p class="muted">{{ indicator.group_name }} → {{ indicator.skill_name }}</p>
+                </div>
+                <span class="status-badge warn">archived</span>
+            </div>
+            <p>{{ indicator.text }}</p>
+            <div class="metrics">
+                <span>sort {{ indicator.sort_order }}</span>
+                {% if indicator.complexity_label %}
+                <span>{{ indicator.complexity_label }}</span>
+                {% endif %}
+                {% if indicator.source_profile_name %}
+                <span>{{ indicator.source_profile_name }}</span>
+                {% endif %}
+            </div>
+            <form class="admin-form admin-form-inline" method="post" action="/catalog-admin/archive">
+                <input type="hidden" name="action" value="restore_indicator">
+                <input type="hidden" name="indicator_id" value="{{ indicator.id }}">
+                <input type="hidden" name="q" value="{{ archive_query or '' }}">
+                <input type="hidden" name="scope" value="{{ archive_scope }}">
+                <div class="review-actions">
+                    <button type="submit" class="action-btn action-btn-primary">Восстановить индикатор</button>
+                    <a class="action-btn" href="/catalog-admin/skills/{{ indicator.skill_id }}">Открыть skill</a>
+                </div>
+            </form>
+        </article>
+        {% endfor %}
+    </section>
+    {% else %}
+    <div class="empty-state">В архиве нет индикаторов.</div>
+    {% endif %}
+</section>
+{% endif %}
+{% endblock %}

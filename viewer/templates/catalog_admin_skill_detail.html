@@ -1,0 +1,201 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero hero-compact">
+    <div>
+        <a class="back-link" href="/catalog-admin/groups/{{ skill.group_id }}">← Назад к группе</a>
+        <h1>{{ skill.name }}</h1>
+        <p class="muted">{{ skill.group_name }}</p>
+    </div>
+    <div class="metrics metrics-vertical">
+        <span>{{ "active" if skill.is_active else "disabled" }}</span>
+        <span>sort {{ skill.sort_order }}</span>
+        <span>{{ skill.complexity_summary or "Сложность не задана" }}</span>
+        {% if skill.source_scale_title %}
+        <span>{{ skill.source_scale_title }}</span>
+        {% endif %}
+        <span>{{ skill.resolution_status }}</span>
+        {% if skill.source_skill_name %}
+        <span>{{ skill.source_skill_name }}</span>
+        {% endif %}
+    </div>
+</section>
+
+<section class="filter-panel">
+    <form class="admin-form" method="post" action="/catalog-admin/skills/{{ skill.id }}">
+        <input type="hidden" name="action" value="update_skill">
+        <div class="admin-grid">
+            <label>
+                <span>Название skill</span>
+                <input type="text" name="name" value="{{ skill.name }}">
+            </label>
+            <label>
+                <span>Source skill</span>
+                <input type="text" name="source_skill_name" value="{{ skill.source_skill_name or '' }}">
+            </label>
+            <label>
+                <span>Порядок</span>
+                <input type="number" name="sort_order" value="{{ skill.sort_order }}">
+            </label>
+            <label>
+                <span>Resolution</span>
+                <select name="resolution_status">
+                    <option value="matched" {% if skill.resolution_status == "matched" %}selected{% endif %}>matched</option>
+                    <option value="alias" {% if skill.resolution_status == "alias" %}selected{% endif %}>alias</option>
+                    <option value="manual" {% if skill.resolution_status == "manual" %}selected{% endif %}>manual</option>
+                    <option value="fuzzy" {% if skill.resolution_status == "fuzzy" %}selected{% endif %}>fuzzy</option>
+                    <option value="missing" {% if skill.resolution_status == "missing" %}selected{% endif %}>missing</option>
+                </select>
+            </label>
+            <label>
+                <span>Active</span>
+                <select name="is_active">
+                    <option value="1" {% if skill.is_active %}selected{% endif %}>yes</option>
+                    <option value="0" {% if not skill.is_active %}selected{% endif %}>no</option>
+                </select>
+            </label>
+            <label class="admin-span-2">
+                <span>Description</span>
+                <textarea name="description" rows="3">{{ skill.description or "" }}</textarea>
+            </label>
+            <label class="admin-span-2">
+                <span>Match note</span>
+                <textarea name="match_note" rows="2">{{ skill.match_note or "" }}</textarea>
+            </label>
+        </div>
+        <button type="submit">Сохранить skill</button>
+    </form>
+    <form class="admin-form admin-form-inline" method="post" action="/catalog-admin/skills/{{ skill.id }}">
+        <input type="hidden" name="action" value="remove_skill">
+        <div class="review-actions">
+            {% if skill.total_indicator_count == 0 %}
+            <button type="submit" class="action-btn action-btn-danger">Удалить skill</button>
+            <span class="muted">Пустой skill удаляется полностью.</span>
+            {% else %}
+            <button type="submit" class="action-btn action-btn-light">Архивировать skill</button>
+            <span class="muted">Skill с индикаторами не удаляется физически, а выключается для безопасного хранения истории.</span>
+            {% endif %}
+        </div>
+    </form>
+    <p class="muted">Сложность skill считается автоматически по уровням его индикаторов.</p>
+</section>
+
+<section class="filter-panel">
+    <form class="admin-form" method="post" action="/catalog-admin/skills/{{ skill.id }}">
+        <input type="hidden" name="action" value="create_indicator">
+        <div class="admin-grid">
+            <label>
+                <span>Indicator type</span>
+                <select name="indicator_type">
+                    <option value="Знает">Знает</option>
+                    <option value="Умеет">Умеет</option>
+                    <option value="Владеет">Владеет</option>
+                    <option value="Не указано">Не указано</option>
+                </select>
+            </label>
+            <label>
+                <span>Sort order</span>
+                <input type="number" name="sort_order" value="{{ indicators|length + 1 }}">
+            </label>
+            <label>
+                <span>Сложность</span>
+                <select name="complexity_band">
+                    {% for band, label in complexity_options %}
+                    <option value="{{ band }}">{{ label }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <label>
+                <span>Active</span>
+                <select name="is_active">
+                    <option value="1">yes</option>
+                    <option value="0">no</option>
+                </select>
+            </label>
+            <label class="admin-span-3">
+                <span>Текст индикатора</span>
+                <textarea name="text" rows="3" placeholder="Что именно должен знать или уметь"></textarea>
+            </label>
+        </div>
+        <button type="submit">Добавить индикатор</button>
+    </form>
+</section>
+
+<section class="list-grid">
+    {% for indicator in indicators %}
+    <article class="entity-card">
+        <form class="admin-form" method="post" action="/catalog-admin/skills/{{ skill.id }}">
+            <input type="hidden" name="action" value="update_indicator">
+            <input type="hidden" name="indicator_id" value="{{ indicator.id }}">
+            <div class="entity-head">
+                <div>
+                    <h2 class="indicator-type {% if indicator.indicator_type == 'Знает' %}indicator-type-knows{% endif %}">{{ indicator.indicator_type }}</h2>
+                    <p class="muted">
+                        sort {{ indicator.sort_order }}
+                        {% if indicator.complexity_label %} · {{ indicator.complexity_label }}{% endif %}
+                        {% if indicator.source_profile_name %} · {{ indicator.source_profile_name }}{% endif %}
+                    </p>
+                </div>
+                <span class="status-badge {% if not indicator.is_active %}warn{% endif %}">{{ "active" if indicator.is_active else "disabled" }}</span>
+            </div>
+            <div class="admin-grid">
+                <label>
+                    <span>Тип</span>
+                    <select name="indicator_type">
+                        <option value="Знает" {% if indicator.indicator_type == "Знает" %}selected{% endif %}>Знает</option>
+                        <option value="Умеет" {% if indicator.indicator_type == "Умеет" %}selected{% endif %}>Умеет</option>
+                        <option value="Владеет" {% if indicator.indicator_type == "Владеет" %}selected{% endif %}>Владеет</option>
+                        <option value="Не указано" {% if indicator.indicator_type == "Не указано" %}selected{% endif %}>Не указано</option>
+                    </select>
+                </label>
+                <label>
+                    <span>Sort order</span>
+                    <input type="number" name="sort_order" value="{{ indicator.sort_order }}">
+                </label>
+                <label>
+                    <span>Сложность</span>
+                    <select name="complexity_band">
+                        {% for band, label in complexity_options %}
+                        <option value="{{ band }}" {% if indicator.complexity_band == band %}selected{% endif %}>{{ label }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <label>
+                    <span>Active</span>
+                    <select name="is_active">
+                        <option value="1" {% if indicator.is_active %}selected{% endif %}>yes</option>
+                        <option value="0" {% if not indicator.is_active %}selected{% endif %}>no</option>
+                    </select>
+                </label>
+                <label class="admin-span-3">
+                    <span>Текст</span>
+                    <textarea name="text" rows="3">{{ indicator.text }}</textarea>
+                </label>
+                {% if indicator.source_scale_title %}
+                <label class="admin-span-3">
+                    <span>Шкала источника</span>
+                    <input type="text" value="{{ indicator.source_scale_title }}" disabled>
+                </label>
+                {% endif %}
+            </div>
+            <div class="review-actions">
+                <button type="submit" class="action-btn action-btn-primary">Сохранить индикатор</button>
+                <button type="submit" name="action" value="remove_indicator" class="action-btn {% if indicator.source_profile_name == 'manual' %}action-btn-danger{% else %}action-btn-light{% endif %}">
+                    {% if indicator.source_profile_name == 'manual' %}
+                    Удалить индикатор
+                    {% else %}
+                    Архивировать индикатор
+                    {% endif %}
+                </button>
+            </div>
+            <p class="muted">
+                {% if indicator.source_profile_name == 'manual' %}
+                Ручной индикатор можно удалить полностью.
+                {% else %}
+                Импортированный индикатор не удаляется физически, а выключается, чтобы не потерять исходные данные.
+                {% endif %}
+            </p>
+        </form>
+    </article>
+    {% endfor %}
+</section>
+{% endblock %}

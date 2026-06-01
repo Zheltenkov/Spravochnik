@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+    <div>
+        <h1>Заливка брифа</h1>
+        <p>Вставьте свободный текст «кого готовим» (или загрузите файл). Система декомпозирует
+        бриф, соберёт навыки-кандидаты с привязкой к источникам и резолвом против каталога —
+        всё спорное уйдёт в <a href="/reviews">очередь проверки</a>.</p>
+    </div>
+</section>
+
+<section class="filter-panel">
+    <form class="admin-form" method="post" action="/intake" enctype="multipart/form-data">
+        <label>
+            <span>Бриф (свободный текст)</span>
+            <textarea name="brief" rows="6" placeholder="Например: подготовить junior backend-разработчика на Python для финтеха…">{{ brief or "" }}</textarea>
+        </label>
+        <label>
+            <span>…или файл (.txt / .md / .docx)</span>
+            <input type="file" name="brief_file" accept=".txt,.md,.docx">
+        </label>
+        <div class="review-actions">
+            <button type="submit" class="action-btn action-btn-primary">Декомпозировать и проверить</button>
+        </div>
+    </form>
+</section>
+
+{% if result %}
+<section class="hero hero-compact">
+    <div><h1>Декомпозиция</h1></div>
+</section>
+<section class="chips-row">
+    <div class="summary-card"><div class="summary-label">Роль</div><div class="summary-value">{{ result.spec.role }}</div></div>
+    <div class="summary-card"><div class="summary-label">Грейд</div><div class="summary-value">{{ result.spec.seniority }}</div></div>
+    <div class="summary-card"><div class="summary-label">Домен</div><div class="summary-value">{{ result.spec.domain }}</div></div>
+</section>
+<section class="table-wrap">
+    <div class="small muted">Под-запросы для поиска:</div>
+    <ul>{% for q in result.spec.sub_queries %}<li>{{ q }}</li>{% endfor %}</ul>
+</section>
+
+<section class="hero hero-compact"><div><h1>Навыки-кандидаты (для проверки)</h1></div></section>
+<section class="table-wrap">
+    <table class="data-table">
+        <thead><tr>
+            <th>Навык</th><th>Группа</th><th>Bloom</th><th>Резолв против каталога</th>
+            <th>Увер.</th><th>Жюри</th><th>Решение</th><th>Причины</th>
+        </tr></thead>
+        <tbody>
+        {% for c in result.candidates %}
+            <tr>
+                <td><strong>{{ c.name }}</strong><div class="small muted">инструменты: {{ c.tools }}</div></td>
+                <td>{{ c.group }}</td>
+                <td>{{ c.bloom }}</td>
+                <td>
+                    <span class="pill {% if c.resolution in ('matched','alias') %}ghost{% endif %}">{{ c.resolution }}</span>
+                    {% if c.canonical_name %}<div class="small muted">→ {{ c.canonical_name }}</div>{% endif %}
+                </td>
+                <td>{{ c.confidence }}</td>
+                <td>{{ c.council_agreement if c.council_agreement is not none else "—" }}</td>
+                <td><span class="status-badge {% if c.decision != 'accepted' %}warn{% endif %}">{{ c.decision }}</span></td>
+                <td class="small muted">{{ c.reasons or "—" }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</section>
+
+<section class="hero hero-compact"><div><h1>Граф пререквизитов</h1></div></section>
+<section class="chips-row">
+    <div class="summary-card"><div class="summary-label">Рёбер в DAG</div><div class="summary-value">{{ result.dag.edges }}</div></div>
+    <div class="summary-card {% if result.dag.removed_cycle %}summary-card-warn{% endif %}"><div class="summary-label">Разорвано циклов</div><div class="summary-value">{{ result.dag.removed_cycle }}</div></div>
+    <div class="summary-card summary-card-soft"><div class="summary-label">Убрано избыточных</div><div class="summary-value">{{ result.dag.removed_transitive }}</div></div>
+    <div class="summary-card"><div class="summary-label">Ацикличен</div><div class="summary-value">{{ "да" if result.dag.acyclic else "нет" }}</div></div>
+</section>
+
+<section class="filter-panel">
+    <div class="small">Записано в каталог: бриф #{{ result.brief_id }}, evidence {{ result.persisted.evidence_source }},
+    предложений {{ result.persisted.skill_suggestion }}, рёбер {{ result.persisted.skill_prerequisite }}.
+    На проверку отправлено: <strong>{{ result.persisted.review_open }}</strong> →
+    <a href="/reviews">открыть очередь проверки</a>.</div>
+</section>
+{% endif %}
+{% endblock %}

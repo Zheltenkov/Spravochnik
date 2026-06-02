@@ -30,7 +30,7 @@ def main(src_db: str, work_db: str, migration_sql: str) -> None:
         print(f"   {c.name:42} {c.resolution:8} -> {tag[:38]:38} conf={c.confidence} [{c.decision}]")
     brief_id = storage.save_brief(con, BRIEF, spec)
     ev_idmap = storage.save_evidence(con, brief_id, evidence)
-    storage.save_suggestions(con, brief_id, cands, ev_idmap)
+    tmp_to_db = storage.save_suggestions(con, brief_id, cands, ev_idmap)
 
     # --- Стадия 2->3 ---
     edges, DAG, rc, rt, dag_payload = s23.run(cands)
@@ -42,7 +42,7 @@ def main(src_db: str, work_db: str, migration_sql: str) -> None:
         print(f"   цикл -> убрано слабейшее: {by[u]} -> {by[v]}")
     for u, v in rt:
         print(f"   избыточно -> убрано: {by[u]} -> {by[v]}")
-    n_pre = storage.save_prerequisites(con, DAG, cands)
+    n_pre = storage.save_prerequisites(con, brief_id, DAG, cands, tmp_to_db)
     n_pre_reviews = storage.save_prerequisite_reviews(con, brief_id, dag_payload["edge_review_queue"])
 
     # --- Чтение обратно из БД: подтверждение персистентности ---

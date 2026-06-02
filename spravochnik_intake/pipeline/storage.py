@@ -12,6 +12,11 @@ _REQUIRED_COLS = {
         ("parent_suggestion_id", "INTEGER"),
         ("atomize_rationale", "TEXT"),
     ],
+    "skill_prerequisite": [
+        ("brief_id", "INTEGER"),
+        ("src_suggestion_id", "INTEGER"),
+        ("dst_suggestion_id", "INTEGER"),
+    ],
 }
 
 
@@ -31,6 +36,13 @@ def apply_migration(con: sqlite3.Connection, sql_path: str) -> None:
         for name, decl in cols:
             if name not in existing:
                 con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_skill_suggestion_brief_decision ON skill_suggestion(brief_id, entity_type, atomicity, decision)"
+    )
+    if "brief_id" in _existing_cols(con, "skill_prerequisite"):
+        con.execute("CREATE INDEX IF NOT EXISTS idx_skill_prerequisite_brief ON skill_prerequisite(brief_id)")
+    if _existing_cols(con, "review_queue"):
+        con.execute("CREATE INDEX IF NOT EXISTS idx_review_queue_source_ref ON review_queue(source_ref, status)")
     con.commit()
 
 
@@ -88,7 +100,7 @@ def save_suggestions(con: sqlite3.Connection, brief_id: int, cands: list[SkillCa
         tmp_to_db[c.tmp_id] = con.execute("SELECT last_insert_rowid()").fetchone()[0]
         # спорное -> в существующую review_queue (переиспользуем механизм каталога)
         if c.decision == "needs_review":
-            rq_entity_type = "competency" if c.entity_type == "competency_block" else "skill"
+            rq_entity_type = c.entity_type
             primary_reason = c.reasons[0] if c.reasons else "needs_review"
             severity = "warning" if primary_reason in {"novel_skill", "council_split", "fuzzy_match_ambiguous", "low_confidence"} else "info"
             reasons_text = ", ".join(c.reasons) if c.reasons else "manual_review"
@@ -102,31 +114,40 @@ def save_suggestions(con: sqlite3.Connection, brief_id: int, cands: list[SkillCa
             con.execute(
                 """INSERT INTO review_queue(entity_type, entity_id, source_ref, reason_code, severity, details, status)
                    VALUES (?, ?, ?, ?, ?, ?, 'open')""",
-                (rq_entity_type, c.canonical_skill_id, f"brief:{brief_id}", primary_reason, severity, details),
+                (rq_entity_type, tmp_to_db[c.tmp_id], f"brief:{brief_id}", primary_reason, severity, details),
             )
     con.commit()
     return tmp_to_db
 
 
-def save_prerequisites(con: sqlite3.Connection, DAG, cands: list[SkillCandidate]) -> int:
+def save_prerequisites(
+    con: sqlite3.Connection,
+    brief_id: int,
+    DAG,
+    cands: list[SkillCandidate],
+    tmp_to_db: dict[str, int] | None = None,
+) -> int:
     by_tid = {c.tmp_id: c for c in cands}
     n = 0
     for u, v in DAG.edges():
         cu, cv = by_tid[u], by_tid[v]
         edge = DAG[u][v].get("edge")
         con.execute(
-            """INSERT INTO skill_prerequisite(src_skill_id, dst_skill_id, src_name, dst_name,
-               relation_type, confidence, source, review_state)
-               VALUES (?,?,?,?,?,?,?,?)""",
+            """INSERT INTO skill_prerequisite(brief_id, src_skill_id, dst_skill_id, src_suggestion_id, dst_suggestion_id,
+               src_name, dst_name, relation_type, confidence, source, review_state)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (
+                brief_id,
                 cu.canonical_skill_id,
                 cv.canonical_skill_id,
+                tmp_to_db.get(u) if tmp_to_db else None,
+                tmp_to_db.get(v) if tmp_to_db else None,
                 cu.name,
                 cv.name,
                 edge.relation_type if edge else "hard",
                 DAG[u][v].get("conf"),
                 edge.source if edge else "pipeline",
-                "accepted" if (cu.canonical_skill_id and cv.canonical_skill_id and (edge is None or edge.decision == "accept")) else "needs_review",
+                "accepted" if (edge is None or edge.decision == "accept") else "needs_review",
             ),
         )
         n += 1

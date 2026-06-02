@@ -59,6 +59,27 @@
     {% endfor %}
 </section>
 
+{% if dag_build_options %}
+<section class="filter-panel">
+    <form class="filter-form" method="post" action="/reviews/build-dag">
+        <label>
+            <span>Построение DAG по брифу</span>
+            <select name="brief_id">
+                {% for option in dag_build_options %}
+                <option value="{{ option.brief_id }}">
+                    #{{ option.brief_id }}
+                    {% if option.role %} · {{ option.role }}{% endif %}
+                    · accepted {{ option.accepted_atomic_count }}
+                    · open review {{ option.open_review_count }}
+                </option>
+                {% endfor %}
+            </select>
+        </label>
+        <button type="submit" class="action-btn action-btn-primary">Построить граф из принятого</button>
+    </form>
+</section>
+{% endif %}
+
 <section class="table-wrap">
     {% if items %}
     <table class="data-table">
@@ -108,7 +129,7 @@
                         <textarea name="resolution_note" rows="3" placeholder="Коротко: что решили и почему">{{ item.resolution_note or "" }}</textarea>
                         <div class="review-actions">
                             <button type="submit" name="new_status" value="resolved" class="action-btn action-btn-primary">Подтвердить решение</button>
-                            <button type="submit" name="new_status" value="ignored" class="action-btn">Пропустить</button>
+                            <button type="submit" name="new_status" value="ignored" class="action-btn">Отклонить</button>
                             <button type="submit" name="new_status" value="open" class="action-btn action-btn-light">Вернуть в очередь</button>
                         </div>
                     </form>

@@ -26,6 +26,21 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().casefold() in {"1", "true", "yes", "on"}
 
 
+def _env_structural_rules(name: str) -> list[tuple[str, str]]:
+    raw = os.environ.get(name, "реляцион>SQL;SQL>REST;REST>очеред")
+    rules: list[tuple[str, str]] = []
+    for chunk in raw.split(";"):
+        item = chunk.strip()
+        if not item or ">" not in item:
+            continue
+        left, right = item.split(">", 1)
+        src = left.strip()
+        dst = right.strip()
+        if src and dst:
+            rules.append((src, dst))
+    return rules
+
+
 _load_dotenv()
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPEN_ROUTER_API_KEY", "")
@@ -55,3 +70,4 @@ FUZZY_MATCH_MIN = int(os.environ.get("FUZZY_MATCH_MIN", "90"))      # rapidfuzz 
 # Стадия 2->3
 TAU_EDGE_ACCEPT = float(os.environ.get("TAU_EDGE_ACCEPT", "0.80"))
 REQUEST_TIMEOUT_SECONDS = int(os.environ.get("OPENROUTER_TIMEOUT_SECONDS", "90"))
+STRUCTURAL_PREREQ_RULES = _env_structural_rules("STRUCTURAL_PREREQ_RULES")

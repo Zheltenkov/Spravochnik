@@ -36,14 +36,21 @@ CREATE TABLE IF NOT EXISTS skill_suggestion (
     confidence    REAL,
     council_agreement REAL,
     evidence_ids  TEXT,                 -- JSON-список id из evidence_source
-    decision      TEXT NOT NULL DEFAULT 'pending' CHECK (decision IN ('pending','accepted','needs_review','rejected'))
+    decision      TEXT NOT NULL DEFAULT 'pending' CHECK (decision IN ('pending','accepted','needs_review','rejected','superseded')),
+    entity_type   TEXT NOT NULL DEFAULT 'skill',
+    atomicity     TEXT NOT NULL DEFAULT 'unknown',
+    parent_suggestion_id INTEGER REFERENCES skill_suggestion(id) ON DELETE SET NULL,
+    atomize_rationale TEXT
 );
 
 -- Граф пререквизитов: ребро src -> dst (src нужно раньше dst).
 CREATE TABLE IF NOT EXISTS skill_prerequisite (
     id            INTEGER PRIMARY KEY,
+    brief_id      INTEGER REFERENCES profile_brief(id) ON DELETE CASCADE,
     src_skill_id  INTEGER REFERENCES skill(id) ON DELETE CASCADE,
     dst_skill_id  INTEGER REFERENCES skill(id) ON DELETE CASCADE,
+    src_suggestion_id INTEGER REFERENCES skill_suggestion(id) ON DELETE SET NULL,
+    dst_suggestion_id INTEGER REFERENCES skill_suggestion(id) ON DELETE SET NULL,
     src_name      TEXT NOT NULL,
     dst_name      TEXT NOT NULL,
     relation_type TEXT NOT NULL DEFAULT 'hard' CHECK (relation_type IN ('hard','soft')),

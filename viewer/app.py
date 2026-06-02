@@ -33,7 +33,7 @@ DEFAULT_DB = BASE_DIR.parent / "artifacts" / "skills_catalog.sqlite"
 DEFAULT_TARGET_DB = BASE_DIR.parent / "artifacts" / "target_catalog.sqlite"
 DEFAULT_SUMMARY = BASE_DIR.parent / "artifacts" / "catalog_summary.json"
 DEFAULT_COMPARE_REPORT = BASE_DIR.parent / "artifacts" / "live_catalog_comparison.json"
-INTAKE_SCHEMA_SQL = BASE_DIR.parent / "new_tables.sql"
+INTAKE_SCHEMA_SQL = BASE_DIR.parent / "spravochnik_intake" / "sql" / "new_tables.sql"
 POWERSHELL_EXE = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
 TARGET_SCHEMA_READY: set[str] = set()
 INTAKE_SCHEMA_READY: set[str] = set()
@@ -273,8 +273,10 @@ def ensure_intake_runtime_schema(conn: sqlite3.Connection, db_path: Path) -> Non
     resolved = str(db_path.resolve())
     if resolved in INTAKE_SCHEMA_READY and table_exists(conn, "profile_brief"):
         return
-    conn.executescript(INTAKE_SCHEMA_SQL.read_text(encoding="utf-8"))
-    conn.commit()
+    from spravochnik_intake.pipeline import storage as intake_storage
+
+    intake_storage.apply_migration(conn, str(INTAKE_SCHEMA_SQL))
+    repair_intake_review_links(conn)
     INTAKE_SCHEMA_READY.add(resolved)
 
 
@@ -394,6 +396,339 @@ def list_recent_intake_jobs(conn: sqlite3.Connection, limit: int = 8) -> list[di
         item["status_label"] = intake_job_status_label(str(item.get("status")))
         item["current_stage_label"] = intake_stage_label(str(item.get("current_stage")))
     return items
+
+
+def parse_brief_id(source_ref: str | None) -> int | None:
+    if not source_ref or not source_ref.startswith("brief:"):
+        return None
+    tail = source_ref.split(":", 2)[1]
+    try:
+        return int(tail)
+    except ValueError:
+        return None
+
+
+def extract_quoted_name(details: str | None) -> str | None:
+    if not details or details.lstrip().startswith("{"):
+        return None
+    start = details.find("«")
+    end = details.find("»", start + 1) if start >= 0 else -1
+    if start < 0 or end < 0:
+        return None
+    return details[start + 1:end].strip() or None
+
+
+def repair_intake_review_links(conn: sqlite3.Connection) -> int:
+    if not table_exists(conn, "review_queue") or not table_exists(conn, "skill_suggestion"):
+        return 0
+
+    updated = 0
+    rows = conn.execute(
+        """
+        SELECT id, source_ref, details
+        FROM review_queue
+        WHERE entity_id IS NULL
+          AND source_ref LIKE 'brief:%'
+        ORDER BY id
+        """
+    ).fetchall()
+    for row in rows:
+        brief_id = parse_brief_id(row["source_ref"])
+        suggestion_name = extract_quoted_name(row["details"])
+        if brief_id is None or not suggestion_name:
+            continue
+        match_rows = conn.execute(
+            """
+            SELECT id
+            FROM skill_suggestion
+            WHERE brief_id = ? AND suggested_name = ?
+            ORDER BY id
+            """,
+            (brief_id, suggestion_name),
+        ).fetchall()
+        if len(match_rows) != 1:
+            continue
+        conn.execute("UPDATE review_queue SET entity_id = ? WHERE id = ?", (match_rows[0]["id"], row["id"]))
+        updated += 1
+    if updated:
+        conn.commit()
+    return updated
+
+
+def get_latest_job_id_for_brief(conn: sqlite3.Connection, brief_id: int) -> int | None:
+    row = conn.execute(
+        """
+        SELECT id
+        FROM intake_job
+        WHERE json_valid(result_payload)
+          AND json_extract(result_payload, '$.brief_id') = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (brief_id,),
+    ).fetchone()
+    return int(row["id"]) if row else None
+
+
+def get_brief_dag_state(conn: sqlite3.Connection, brief_id: int) -> dict[str, object]:
+    accepted_atomic = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM skill_suggestion
+        WHERE brief_id = ?
+          AND entity_type = 'skill'
+          AND atomicity = 'atomic'
+          AND decision = 'accepted'
+        """,
+        (brief_id,),
+    ).fetchone()[0]
+    pending_atomic = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM skill_suggestion
+        WHERE brief_id = ?
+          AND entity_type = 'skill'
+          AND atomicity = 'atomic'
+          AND decision = 'needs_review'
+        """,
+        (brief_id,),
+    ).fetchone()[0]
+    open_reviews = conn.execute(
+        "SELECT COUNT(*) FROM review_queue WHERE source_ref = ? AND status = 'open'",
+        (f"brief:{brief_id}",),
+    ).fetchone()[0]
+    prerequisite_rows = conn.execute(
+        "SELECT COUNT(*) FROM skill_prerequisite WHERE brief_id = ?",
+        (brief_id,),
+    ).fetchone()[0] if table_exists(conn, "skill_prerequisite") and column_exists(conn, "skill_prerequisite", "brief_id") else 0
+    brief_row = conn.execute(
+        "SELECT role, domain FROM profile_brief WHERE id = ?",
+        (brief_id,),
+    ).fetchone()
+    return {
+        "brief_id": brief_id,
+        "role": brief_row["role"] if brief_row else None,
+        "domain": brief_row["domain"] if brief_row else None,
+        "latest_job_id": get_latest_job_id_for_brief(conn, brief_id),
+        "accepted_atomic_count": int(accepted_atomic),
+        "pending_atomic_count": int(pending_atomic),
+        "open_review_count": int(open_reviews),
+        "prerequisite_count": int(prerequisite_rows),
+    }
+
+
+def build_deferred_dag_payload(state: dict[str, object], *, status: str, message: str) -> dict[str, object]:
+    return {
+        "status": status,
+        "message": message,
+        "accepted_atomic_candidates": int(state["accepted_atomic_count"]),
+        "pending_atomic_candidates": int(state["pending_atomic_count"]),
+        "open_review_count": int(state["open_review_count"]),
+        "nodes": 0,
+        "edges": 0,
+        "removed_cycle": 0,
+        "removed_transitive": 0,
+        "acyclic": True,
+        "waves": [],
+        "order": [],
+        "final_edges": [],
+        "edge_review_queue": [],
+        "used_candidate_ids": [],
+    }
+
+
+def update_jobs_dag_payload(
+    conn: sqlite3.Connection,
+    brief_id: int,
+    dag_payload: dict[str, object],
+    persisted_update: dict[str, object] | None = None,
+) -> None:
+    rows = conn.execute(
+        """
+        SELECT id, result_payload
+        FROM intake_job
+        WHERE status = 'succeeded'
+          AND json_valid(result_payload)
+          AND json_extract(result_payload, '$.brief_id') = ?
+        """,
+        (brief_id,),
+    ).fetchall()
+    for row in rows:
+        payload = json.loads(row["result_payload"])
+        payload["dag"] = dag_payload
+        if persisted_update and isinstance(payload.get("persisted"), dict):
+            payload["persisted"].update(persisted_update)
+        conn.execute(
+            "UPDATE intake_job SET result_payload = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(payload, ensure_ascii=False), utc_now_iso(), row["id"]),
+        )
+    conn.commit()
+
+
+def clear_brief_dag_artifacts(conn: sqlite3.Connection, brief_id: int) -> None:
+    if table_exists(conn, "skill_prerequisite") and column_exists(conn, "skill_prerequisite", "brief_id"):
+        conn.execute("DELETE FROM skill_prerequisite WHERE brief_id = ?", (brief_id,))
+    if table_exists(conn, "review_queue"):
+        conn.execute(
+            """
+            DELETE FROM review_queue
+            WHERE source_ref = ?
+              AND json_valid(details)
+              AND json_extract(details, '$.review_kind') = 'prerequisite_edge'
+            """,
+            (f"brief:{brief_id}",),
+        )
+    conn.commit()
+
+
+def refresh_brief_dag_state(
+    conn: sqlite3.Connection,
+    brief_id: int,
+    *,
+    status: str = "deferred",
+    message: str | None = None,
+) -> dict[str, object]:
+    state = get_brief_dag_state(conn, brief_id)
+    if message is None:
+        if state["accepted_atomic_count"]:
+            message = "Граф неактуален после изменений в review. Перестройте DAG по принятым навыкам."
+            status = "stale" if state["prerequisite_count"] else status
+        else:
+            message = "Граф пока не строится: нет принятых атомарных навыков."
+    dag_payload = build_deferred_dag_payload(state, status=status, message=message)
+    update_jobs_dag_payload(
+        conn,
+        brief_id,
+        dag_payload,
+        persisted_update={
+            "skill_prerequisite": 0,
+            "prerequisite_reviews": 0,
+            "review_open": int(state["open_review_count"]),
+        },
+    )
+    return state
+
+
+def load_accepted_skill_candidates(conn: sqlite3.Connection, brief_id: int):
+    from spravochnik_intake.pipeline.models import IndicatorSpec, SkillCandidate
+
+    rows = conn.execute(
+        """
+        SELECT
+            ss.id,
+            ss.suggested_name,
+            ss.group_name,
+            ss.bloom,
+            ss.tools,
+            ss.evidence_ids,
+            ss.resolution,
+            ss.canonical_skill_id,
+            ss.confidence,
+            ss.council_agreement
+        FROM skill_suggestion ss
+        WHERE ss.brief_id = ?
+          AND ss.entity_type = 'skill'
+          AND ss.atomicity = 'atomic'
+          AND ss.decision = 'accepted'
+        ORDER BY ss.id
+        """,
+        (brief_id,),
+    ).fetchall()
+
+    bloom_fallback = {"remember", "understand", "apply", "analyze", "evaluate", "create"}
+    cands = []
+    tmp_to_db: dict[str, int] = {}
+    for row in rows:
+        bloom_label = str(row["bloom"] or "remember").strip().casefold()
+        if bloom_label not in bloom_fallback:
+            bloom_label = "remember"
+        tmp_id = f"S{row['id']}"
+        candidate = SkillCandidate(
+            tmp_id=tmp_id,
+            name=row["suggested_name"],
+            group=row["group_name"] or "Без группы",
+            indicators=[IndicatorSpec(text=row["suggested_name"], bloom=bloom_label)],
+            tools=json.loads(row["tools"] or "[]"),
+            evidence_ids=[str(item) for item in json.loads(row["evidence_ids"] or "[]") if item is not None],
+            confidence=float(row["confidence"] or 0.0),
+            council_agreement=float(row["council_agreement"]) if row["council_agreement"] is not None else None,
+            entity_type="skill",
+            atomicity="atomic",
+            resolution=row["resolution"],
+            canonical_skill_id=row["canonical_skill_id"],
+            decision="accepted",
+        )
+        cands.append(candidate)
+        tmp_to_db[tmp_id] = int(row["id"])
+    return cands, tmp_to_db
+
+
+def build_dag_for_brief(conn: sqlite3.Connection, brief_id: int) -> dict[str, object]:
+    from spravochnik_intake.pipeline import stage_catalog_to_dag, storage
+
+    clear_brief_dag_artifacts(conn, brief_id)
+    cands, tmp_to_db = load_accepted_skill_candidates(conn, brief_id)
+    if not cands:
+        state = refresh_brief_dag_state(
+            conn,
+            brief_id,
+            status="deferred",
+            message="Граф не построен: методолог ещё не подтвердил ни одного атомарного навыка.",
+        )
+        return {
+            "brief_id": brief_id,
+            "state": state,
+            "dag": build_deferred_dag_payload(
+                state,
+                status="deferred",
+                message="Граф не построен: методолог ещё не подтвердил ни одного атомарного навыка.",
+            ),
+        }
+
+    edges, dag, removed_cycle, removed_transitive, dag_payload = stage_catalog_to_dag.run(cands)
+    prereq_count = storage.save_prerequisites(conn, brief_id, dag, cands, tmp_to_db)
+    prereq_review_count = storage.save_prerequisite_reviews(conn, brief_id, dag_payload["edge_review_queue"])
+    dag_payload["status"] = "built"
+    dag_payload["message"] = "Граф построен по подтверждённым атомарным навыкам."
+    dag_payload["accepted_atomic_candidates"] = len(cands)
+    dag_payload["prerequisite_rows"] = prereq_count
+    dag_payload["prerequisite_review_rows"] = prereq_review_count
+    update_jobs_dag_payload(
+        conn,
+        brief_id,
+        dag_payload,
+        persisted_update={
+            "skill_prerequisite": prereq_count,
+            "prerequisite_reviews": prereq_review_count,
+            "review_open": int(get_brief_dag_state(conn, brief_id)["open_review_count"]),
+        },
+    )
+    return {
+        "brief_id": brief_id,
+        "state": get_brief_dag_state(conn, brief_id),
+        "dag": dag_payload,
+        "edges": len(edges),
+        "removed_cycle": len(removed_cycle),
+        "removed_transitive": len(removed_transitive),
+    }
+
+
+def list_dag_build_options(conn: sqlite3.Connection) -> list[dict[str, object]]:
+    if not table_exists(conn, "profile_brief") or not table_exists(conn, "skill_suggestion"):
+        return []
+    rows = conn.execute(
+        """
+        SELECT pb.id, pb.role, pb.domain
+        FROM profile_brief pb
+        WHERE EXISTS (SELECT 1 FROM skill_suggestion ss WHERE ss.brief_id = pb.id)
+        ORDER BY pb.id DESC
+        """
+    ).fetchall()
+    options = []
+    for row in rows:
+        state = get_brief_dag_state(conn, int(row["id"]))
+        options.append(state)
+    return options
 
 
 def ensure_target_runtime_schema(conn: sqlite3.Connection) -> None:
@@ -554,7 +889,7 @@ def run_intake_pipeline(
     brief_text: str,
     progress_callback: Callable[[str, str], None] | None = None,
 ) -> dict[str, object]:
-    from spravochnik_intake.pipeline import stage_brief_to_catalog, stage_catalog_to_dag, storage
+    from spravochnik_intake.pipeline import stage_brief_to_catalog, storage
     from spravochnik_intake.pipeline import config as intake_config
     from spravochnik_intake.pipeline.catalog_repo import CatalogRepo
 
@@ -594,15 +929,14 @@ def run_intake_pipeline(
     finally:
         repo.con.close()
 
-    notify("prerequisites", "Формирование графа пререквизитов, снятие циклов и топологический порядок.")
-    _edges, dag, removed_cycle, removed_transitive, dag_payload = stage_catalog_to_dag.run(candidates)
     notify("persist", "Запись результатов в каталог и очередь проверки.")
     brief_id = storage.save_brief(conn, brief_text, spec)
     evidence_map = storage.save_evidence(conn, brief_id, evidence)
     storage.save_suggestions(conn, brief_id, candidates, evidence_map)
-    prereq_count = storage.save_prerequisites(conn, dag, candidates)
-    prereq_review_count = storage.save_prerequisite_reviews(conn, brief_id, dag_payload["edge_review_queue"])
-    review_open = conn.execute("SELECT COUNT(*) FROM review_queue WHERE status = 'open'").fetchone()[0]
+    review_open = conn.execute(
+        "SELECT COUNT(*) FROM review_queue WHERE status = 'open' AND source_ref = ?",
+        (f"brief:{brief_id}",),
+    ).fetchone()[0]
     by_tid = {candidate.tmp_id: candidate for candidate in candidates}
     atomize_events = []
     for candidate in candidates:
@@ -625,6 +959,16 @@ def run_intake_pipeline(
                     "rationale": candidate.atomize_rationale,
                 }
             )
+
+    dag_payload = build_deferred_dag_payload(
+        {
+            "accepted_atomic_count": candidate_metrics["accepted_total"],
+            "pending_atomic_count": candidate_metrics["atomic_skill_candidates"] - candidate_metrics["accepted_total"],
+            "open_review_count": review_open,
+        },
+        status="deferred",
+        message="Граф пререквизитов строится отдельным шагом после методологического подтверждения принятых атомарных навыков.",
+    )
 
     return {
         "brief_id": brief_id,
@@ -660,8 +1004,8 @@ def run_intake_pipeline(
         "persisted": {
             "evidence_source": len(evidence),
             "skill_suggestion": len(candidates),
-            "skill_prerequisite": prereq_count,
-            "prerequisite_reviews": prereq_review_count,
+            "skill_prerequisite": 0,
+            "prerequisite_reviews": 0,
             "review_open": review_open,
         },
         "meta": {
@@ -853,6 +1197,18 @@ def refresh_target_skill_complexity(conn: sqlite3.Connection, skill_id: int, com
 
 
 def update_review_status(conn: sqlite3.Connection, review_id: int, new_status: str, resolution_note: str) -> None:
+    repair_intake_review_links(conn)
+    review_row = conn.execute(
+        """
+        SELECT id, entity_id, source_ref, reason_code
+        FROM review_queue
+        WHERE id = ?
+        """,
+        (review_id,),
+    ).fetchone()
+    if not review_row:
+        return
+
     reviewed_at = datetime.now(UTC).isoformat() if new_status != "open" else None
     conn.execute(
         """
@@ -865,6 +1221,20 @@ def update_review_status(conn: sqlite3.Connection, review_id: int, new_status: s
         """,
         (new_status, resolution_note.strip() or None, reviewed_at, datetime.now(UTC).isoformat(), review_id),
     )
+    brief_id = parse_brief_id(review_row["source_ref"])
+    suggestion_id = review_row["entity_id"]
+    if suggestion_id and brief_id is not None:
+        mapped_decision = "needs_review"
+        if new_status == "resolved":
+            mapped_decision = "accepted"
+        elif new_status == "ignored":
+            mapped_decision = "rejected"
+        conn.execute(
+            "UPDATE skill_suggestion SET decision = ? WHERE id = ?",
+            (mapped_decision, suggestion_id),
+        )
+        clear_brief_dag_artifacts(conn, brief_id)
+        refresh_brief_dag_state(conn, brief_id, status="deferred")
     conn.commit()
 
 
@@ -2028,6 +2398,7 @@ def list_reviews(
     severity_filter: str,
     reason_filter: str,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]], list[dict[str, str]]]:
+    repair_intake_review_links(conn)
     params: list[object] = []
     where_parts: list[str] = []
     if status_filter != "all":
@@ -2408,6 +2779,19 @@ def create_app(db_path: Path, summary_path: Path, target_db_path: Path):
 
         conn = open_db(db_path)
         try:
+            if path == "/reviews/build-dag" and method == "POST":
+                ensure_intake_runtime_schema(conn, db_path)
+                form_data = parse_post_data(environ)
+                try:
+                    brief_id = int(form_data.get("brief_id", "0"))
+                except ValueError:
+                    return not_found(start_response, "Invalid brief id")
+                build_result = build_dag_for_brief(conn, brief_id)
+                latest_job_id = build_result["state"].get("latest_job_id")
+                if latest_job_id:
+                    return redirect_response(start_response, f"/intake/jobs/{latest_job_id}")
+                return redirect_response(start_response, "/reviews")
+
             if path == "/reviews" and method == "POST":
                 form_data = parse_post_data(environ)
                 try:
@@ -2526,6 +2910,7 @@ def create_app(db_path: Path, summary_path: Path, target_db_path: Path):
                         "severity_filter": severity_filter,
                         "reason_filter": reason_filter,
                         "reason_codes": reason_codes,
+                        "dag_build_options": list_dag_build_options(conn),
                         "request_path": path,
                     },
                 )
@@ -2623,6 +3008,22 @@ def create_app(db_path: Path, summary_path: Path, target_db_path: Path):
                     },
                 )
 
+            if path.startswith("/intake/jobs/") and path.endswith("/build-dag") and method == "POST":
+                try:
+                    job_id = int(path.removeprefix("/intake/jobs/").removesuffix("/build-dag"))
+                except ValueError:
+                    return not_found(start_response)
+                ensure_intake_runtime_schema(conn, db_path)
+                job = get_intake_job(conn, job_id)
+                if not job or not job.get("result_payload"):
+                    return not_found(start_response, "Intake job not found")
+                brief_id = job["result_payload"].get("brief_id")
+                if not isinstance(brief_id, int):
+                    return not_found(start_response, "Brief id not found")
+                build_result = build_dag_for_brief(conn, brief_id)
+                latest_job_id = build_result["state"].get("latest_job_id") or job_id
+                return redirect_response(start_response, f"/intake/jobs/{latest_job_id}")
+
             if path.startswith("/intake/jobs/") and method == "GET":
                 try:
                     job_id = int(path.removeprefix("/intake/jobs/"))
@@ -2635,6 +3036,9 @@ def create_app(db_path: Path, summary_path: Path, target_db_path: Path):
                     return not_found(start_response, "Intake job not found")
 
                 result = job.get("result_payload") if job.get("status") == "succeeded" else None
+                dag_build_state = None
+                if isinstance(result, dict) and isinstance(result.get("brief_id"), int):
+                    dag_build_state = get_brief_dag_state(conn, int(result["brief_id"]))
                 html = render(
                     "intake.html",
                     {
@@ -2644,6 +3048,7 @@ def create_app(db_path: Path, summary_path: Path, target_db_path: Path):
                         "job": job,
                         "recent_jobs": list_recent_intake_jobs(conn),
                         "result": result,
+                        "dag_build_state": dag_build_state,
                         "form_error": None if job.get("status") != "failed" else f"Ошибка intake-пайплайна: {job.get('error_text')}",
                         "upload_name": job.get("source_name"),
                         "request_path": "/intake",

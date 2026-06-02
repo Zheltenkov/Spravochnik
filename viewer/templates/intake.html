@@ -66,6 +66,19 @@
         <div class="summary-value">{{ 'включен' if job.use_council else 'выключен' }}</div>
     </div>
 </section>
+{% if dag_build_state %}
+<section class="filter-panel">
+    <div class="small muted">
+        DAG по брифу #{{ dag_build_state.brief_id }}:
+        accepted atomic = {{ dag_build_state.accepted_atomic_count }},
+        pending atomic = {{ dag_build_state.pending_atomic_count }},
+        open review = {{ dag_build_state.open_review_count }}.
+    </div>
+    <form class="review-actions" method="post" action="/intake/jobs/{{ job.id }}/build-dag">
+        <button type="submit" class="action-btn action-btn-primary">Построить DAG из принятого</button>
+    </form>
+</section>
+{% endif %}
 {% endif %}
 
 {% if recent_jobs %}
@@ -205,6 +218,16 @@
     <div class="summary-card summary-card-soft"><div class="summary-label">Убрано избыточных</div><div class="summary-value">{{ result.dag.removed_transitive }}</div></div>
     <div class="summary-card"><div class="summary-label">Ацикличен</div><div class="summary-value">{{ "да" if result.dag.acyclic else "нет" }}</div></div>
 </section>
+{% if result.dag.status and result.dag.status != 'built' %}
+<section class="filter-panel">
+    <div class="small"><strong>Состояние DAG:</strong> {{ result.dag.message }}</div>
+    <div class="small muted">
+        accepted atomic = {{ result.dag.accepted_atomic_candidates or 0 }},
+        pending atomic = {{ result.dag.pending_atomic_candidates or 0 }},
+        open review = {{ result.dag.open_review_count or 0 }}.
+    </div>
+</section>
+{% endif %}
 <div class="small muted">DAG строится только на узлах с `entity_type=skill`, `atomicity=atomic` и `decision=accepted`.</div>
 
 {% if result.dag.waves %}

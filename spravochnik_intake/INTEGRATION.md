@@ -1,47 +1,32 @@
-# Интеграция интейка брифа в Spravochnik
+# Интеграция intake в текущий viewer
 
-## Раскладка
-```
+## Живые точки входа
+```text
 Spravochnik/
-  pipeline/                      # пакет стадий 1->2 и 2->3
-  sql/new_tables.sql             # недостающие таблицы (рядом с catalog_schema.sql)
+  spravochnik_intake/
+    pipeline/                 # decompose/search/synthesize/atomize/resolve/council/triage
+    sql/new_tables.sql        # единственный источник миграций intake/DAG
   viewer/
-    app.py                       # + регистрация blueprint (ниже)
-    intake_routes.py             # роут /intake (этот файл)
-    templates/intake.html        # страница интейка
+    app.py                    # WSGI viewer, роуты /intake, /reviews, /intake/jobs/<id>/build-dag
+    templates/intake.html     # живая страница intake
+    templates/reviews.html    # живая страница review + кнопка сборки DAG
 ```
 
-## Подключение в viewer/app.py
-```python
-from viewer.intake_routes import intake_bp, init_intake
+## Как это работает сейчас
+1. `POST /intake` создаёт `intake_job` и запускает intake в фоне.
+2. Intake сохраняет `profile_brief`, `evidence_source`, `skill_suggestion` и записи в `review_queue`.
+3. В intake DAG больше не строится. В `result_payload.dag` сохраняется deferred-state.
+4. Методолог подтверждает/отклоняет `review_queue`.
+5. Отдельный шаг `POST /reviews/build-dag` или `POST /intake/jobs/<id>/build-dag` строит DAG только по:
+   - `entity_type = skill`
+   - `atomicity = atomic`
+   - `decision = accepted`
 
-init_intake(str(DB_PATH), str(BASE_DIR / "sql" / "new_tables.sql"))
-app.register_blueprint(intake_bp)
-```
-Добавь пункт навигации `{"href": "/intake", "label": "Бриф"}` в свой NAV (или используй
-NAV из intake_routes как образец).
+## Ключевой инвариант
+`viewer/app.py` читает миграции только из:
+`spravochnik_intake/sql/new_tables.sql`
 
-## Схема
-`new_tables.sql` идемпотентен (`CREATE TABLE IF NOT EXISTS`). Можно либо вызвать его
-из существующего `ensure_runtime_schema`, либо он применяется автоматически при первом
-POST /intake (`storage.apply_migration`). Существующая схема не меняется; `review_queue`
-переиспользуется (спорное -> status='open').
+Корневой `new_tables.sql` удалён специально, чтобы не было расхождения между кодом и SQL.
 
 ## Зависимости
-`pydantic, rapidfuzz, networkx, requests` (+ `python-docx` для загрузки .docx).
-
-## Поток
-GET /intake — форма (текст + опц. файл .txt/.md/.docx).
-POST /intake — сохраняет бриф в `profile_brief` -> стадия 1->2 (decompose, поиск,
-evidence, синтез, резолв против каталога, жюри, триаж) -> стадия 2->3 (prereq-DAG) ->
-рендерит ВСЮ информацию для проверки (декомпозиция, кандидаты с резолвом/уверенностью/
-решением, граф) и пишет результаты; спорное -> /reviews.
-
-## Режим
-MOCK по умолчанию (без ключей). LIVE: `export USE_LIVE=1 OPENROUTER_API_KEY=...`.
-
-## Важно про производительность
-В LIVE поиск+синтез+жюри идут секунды-минуты. Для боевого использования вынеси прогон
-в фоновую задачу: POST создаёт бриф со статусом "processing" и запускает воркер, а
-страница показывает результат по готовности. Текущая реализация синхронная (ок для MOCK
-и первой проверки).
+`pydantic`, `rapidfuzz`, `networkx`, `requests`, `python-docx`

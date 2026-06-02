@@ -7,11 +7,7 @@ from __future__ import annotations
 import json
 import networkx as nx
 from . import config, llm
-from .models import PrereqEdge, SkillCandidate, BLOOM
-
-
-def _bloom_of(cand: SkillCandidate) -> int:
-    return cand.bloom
+from .models import PrereqEdge, SkillCandidate
 
 
 def looks_corrupted(text: str | None) -> bool:
@@ -60,9 +56,8 @@ def propose_edges(cands: list[SkillCandidate]) -> list[PrereqEdge]:
         return None
 
     edges: list[PrereqEdge] = []
-    # структурные (mined)
-    structural = [("реляцион", "SQL"), ("SQL", "REST"), ("REST", "очеред")]
-    for a, b in structural:
+    # Структурные правила выносятся в конфиг, чтобы DAG-слой не был привязан к одному домену.
+    for a, b in config.STRUCTURAL_PREREQ_RULES:
         sa, sb = tid(a), tid(b)
         if sa and sb and sa != sb:
             edges.append(PrereqEdge(src=sa, dst=sb, relation_type="hard", confidence=0.9, source="syllabus"))

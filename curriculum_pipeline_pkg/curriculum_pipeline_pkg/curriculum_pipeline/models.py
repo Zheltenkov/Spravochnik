@@ -33,6 +33,7 @@ class SkillCandidate(BaseModel):
     resolution: Optional[Literal["matched", "alias", "fuzzy", "new"]] = None
     canonical_skill_id: Optional[int] = None
     canonical_name: Optional[str] = None
+    canonical_group: Optional[str] = None
     match_score: Optional[float] = None
     # жюри/триаж:
     council_agreement: Optional[float] = None

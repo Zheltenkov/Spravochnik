@@ -1,13 +1,24 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
+import csv
+import io
 import json
 import mimetypes
 import sqlite3
+import subprocess
+import sys
+import zipfile
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from email.parser import BytesParser
+from email.policy import default as email_policy
 from pathlib import Path
+from typing import Callable
 from urllib.parse import parse_qs, urlencode
 from wsgiref.simple_server import make_server
+import xml.etree.ElementTree as ET
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
@@ -15,11 +26,18 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = BASE_DIR / "templates"
 STATIC_DIR = BASE_DIR / "static"
+PROJECT_ROOT = BASE_DIR.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 DEFAULT_DB = BASE_DIR.parent / "artifacts" / "skills_catalog.sqlite"
 DEFAULT_TARGET_DB = BASE_DIR.parent / "artifacts" / "target_catalog.sqlite"
 DEFAULT_SUMMARY = BASE_DIR.parent / "artifacts" / "catalog_summary.json"
 DEFAULT_COMPARE_REPORT = BASE_DIR.parent / "artifacts" / "live_catalog_comparison.json"
+INTAKE_SCHEMA_SQL = BASE_DIR.parent / "new_tables.sql"
+POWERSHELL_EXE = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
 TARGET_SCHEMA_READY: set[str] = set()
+INTAKE_SCHEMA_READY: set[str] = set()
+INTAKE_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="intake")
 
 COMPLEXITY_OPTIONS = [
     ("", "Не указано"),
@@ -44,6 +62,20 @@ REVIEW_REASON_LABELS = {
     "level_headers_inherited_from_previous_block": "Шкала унаследована от предыдущего блока",
     "skill_name_trimmed": "Название skill было очищено",
     "base_text_without_levels": "Есть текст индикатора без уровней",
+    "novel_skill": "Новый skill не найден в каталоге",
+    "fuzzy_match_ambiguous": "Нечеткое совпадение с каталогом",
+    "low_confidence": "Низкая уверенность модели",
+    "single_source": "Недостаточно подтверждающих источников",
+    "council_split": "Модели не согласились между собой",
+    "composite_decomposed": "Кандидат разбит на атомарные части",
+    "non_skill:competency_block": "Это блок программы, а не skill",
+    "non_skill:curriculum_section": "Это учебный раздел, а не skill",
+    "needs_review": "Нужна методологическая проверка",
+    "cycle_broken": "Цикл в графе был разорван",
+    "redundant_transitive": "Ребро признано транзитивно избыточным",
+    "bloom_direction": "Нарушено направление по Блуму",
+    "ai_proposed": "Ребро предложено AI и требует проверки",
+    "low_confidence": "Низкая уверенность ребра",
 }
 REVIEW_STATUS_LABELS = {
     "open": "Открыто",
@@ -56,6 +88,27 @@ REVIEW_SEVERITY_LABELS = {
     "warning": "Внимание",
     "info": "Инфо",
     "all": "Все",
+}
+INTAKE_JOB_STATUS_LABELS = {
+    "pending": "В очереди",
+    "running": "Обрабатывается",
+    "succeeded": "Готово",
+    "failed": "Ошибка",
+}
+INTAKE_STAGE_LABELS = {
+    "queued": "Постановка в очередь",
+    "starting": "Запуск",
+    "decompose": "Декомпозиция брифа",
+    "search": "Поиск evidence",
+    "synthesize": "Синтез навыков",
+    "atomize": "Атомизация кандидатов",
+    "resolve": "Резолв против каталога",
+    "council": "Экспертное жюри",
+    "triage": "Финальный триаж",
+    "prerequisites": "Пререквизиты",
+    "persist": "Запись в БД",
+    "completed": "Завершено",
+    "failed": "Ошибка",
 }
 
 
@@ -81,6 +134,18 @@ def review_severity_label(severity: str | None) -> str:
     if not severity:
         return "Не указано"
     return REVIEW_SEVERITY_LABELS.get(severity, severity)
+
+
+def intake_job_status_label(status: str | None) -> str:
+    if not status:
+        return "Неизвестно"
+    return INTAKE_JOB_STATUS_LABELS.get(status, status)
+
+
+def intake_stage_label(stage: str | None) -> str:
+    if not stage:
+        return "Не указан"
+    return INTAKE_STAGE_LABELS.get(stage, stage)
 
 
 def open_db(db_path: Path) -> sqlite3.Connection:
@@ -117,13 +182,66 @@ def fetch_all(conn: sqlite3.Connection, query: str, params: tuple = ()) -> list[
     return [dict(row) for row in conn.execute(query, params)]
 
 
-def parse_post_data(environ) -> dict[str, str]:
+@dataclass
+class UploadedFile:
+    filename: str
+    content_type: str
+    data: bytes
+
+
+def _read_request_body(environ) -> bytes:
     content_length = int(environ.get("CONTENT_LENGTH") or 0)
     if content_length <= 0:
-        return {}
-    raw_body = environ["wsgi.input"].read(content_length).decode("utf-8")
-    parsed = parse_qs(raw_body, keep_blank_values=True)
-    return {key: values[-1] for key, values in parsed.items()}
+        return b""
+    return environ["wsgi.input"].read(content_length)
+
+
+def parse_multipart_form_data(raw_body: bytes, content_type: str) -> tuple[dict[str, str], dict[str, UploadedFile]]:
+    header_blob = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8")
+    message = BytesParser(policy=email_policy).parsebytes(header_blob + raw_body)
+    form_data: dict[str, str] = {}
+    files: dict[str, UploadedFile] = {}
+
+    for part in message.iter_parts():
+        if part.get_content_disposition() != "form-data":
+            continue
+        field_name = part.get_param("name", header="content-disposition")
+        if not field_name:
+            continue
+
+        payload = part.get_payload(decode=True) or b""
+        filename = part.get_filename()
+        if filename:
+            if payload:
+                files[field_name] = UploadedFile(
+                    filename=filename,
+                    content_type=part.get_content_type(),
+                    data=payload,
+                )
+            continue
+
+        charset = part.get_content_charset() or "utf-8"
+        form_data[field_name] = payload.decode(charset, errors="replace")
+
+    return form_data, files
+
+
+def parse_post_form_and_files(environ) -> tuple[dict[str, str], dict[str, UploadedFile]]:
+    raw_body = _read_request_body(environ)
+    if not raw_body:
+        return {}, {}
+
+    content_type = environ.get("CONTENT_TYPE", "")
+    if content_type.casefold().startswith("multipart/form-data"):
+        return parse_multipart_form_data(raw_body, content_type)
+
+    parsed = parse_qs(raw_body.decode("utf-8"), keep_blank_values=True)
+    return {key: values[-1] for key, values in parsed.items()}, {}
+
+
+def parse_post_data(environ) -> dict[str, str]:
+    form_data, _files = parse_post_form_and_files(environ)
+    return form_data
 
 
 def table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
@@ -149,6 +267,133 @@ def ensure_runtime_schema(conn: sqlite3.Connection) -> None:
             if not column_exists(conn, "review_queue", column_name):
                 conn.execute(f"ALTER TABLE review_queue ADD COLUMN {column_name} {column_type}")
         conn.commit()
+
+
+def ensure_intake_runtime_schema(conn: sqlite3.Connection, db_path: Path) -> None:
+    resolved = str(db_path.resolve())
+    if resolved in INTAKE_SCHEMA_READY and table_exists(conn, "profile_brief"):
+        return
+    conn.executescript(INTAKE_SCHEMA_SQL.read_text(encoding="utf-8"))
+    conn.commit()
+    INTAKE_SCHEMA_READY.add(resolved)
+
+
+def utc_now_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def create_intake_job(
+    conn: sqlite3.Connection,
+    *,
+    source_kind: str,
+    source_name: str | None,
+    file_path: str | None,
+    brief_text: str,
+    use_council: bool,
+) -> int:
+    current_time = utc_now_iso()
+    cursor = conn.execute(
+        """
+        INSERT INTO intake_job(
+            source_kind,
+            source_name,
+            file_path,
+            brief_text,
+            status,
+            current_stage,
+            progress_note,
+            use_council,
+            created_at,
+            updated_at
+        )
+        VALUES (?, ?, ?, ?, 'pending', 'queued', 'Задача поставлена в очередь на обработку.', ?, ?, ?)
+        """,
+        (source_kind, source_name, file_path, brief_text, 1 if use_council else 0, current_time, current_time),
+    )
+    conn.commit()
+    return int(cursor.lastrowid)
+
+
+def update_intake_job(
+    conn: sqlite3.Connection,
+    job_id: int,
+    *,
+    status: str | None = None,
+    current_stage: str | None = None,
+    progress_note: str | None = None,
+    error_text: str | None = None,
+    result_payload: dict[str, object] | None = None,
+    mark_started: bool = False,
+    mark_finished: bool = False,
+) -> None:
+    fields: list[str] = ["updated_at = ?"]
+    params: list[object] = [utc_now_iso()]
+
+    if status is not None:
+        fields.append("status = ?")
+        params.append(status)
+    if current_stage is not None:
+        fields.append("current_stage = ?")
+        params.append(current_stage)
+    if progress_note is not None:
+        fields.append("progress_note = ?")
+        params.append(progress_note)
+    if error_text is not None:
+        fields.append("error_text = ?")
+        params.append(error_text)
+    if result_payload is not None:
+        fields.append("result_payload = ?")
+        params.append(json.dumps(result_payload, ensure_ascii=False))
+    if mark_started:
+        fields.append("started_at = ?")
+        params.append(utc_now_iso())
+    if mark_finished:
+        fields.append("finished_at = ?")
+        params.append(utc_now_iso())
+
+    params.append(job_id)
+    conn.execute(f"UPDATE intake_job SET {', '.join(fields)} WHERE id = ?", tuple(params))
+    conn.commit()
+
+
+def get_intake_job(conn: sqlite3.Connection, job_id: int) -> dict[str, object] | None:
+    row = conn.execute("SELECT * FROM intake_job WHERE id = ?", (job_id,)).fetchone()
+    if not row:
+        return None
+    job = dict(row)
+    if job.get("result_payload"):
+        try:
+            job["result_payload"] = json.loads(job["result_payload"])
+        except json.JSONDecodeError:
+            job["result_payload"] = None
+    job["status_label"] = intake_job_status_label(str(job.get("status")))
+    job["current_stage_label"] = intake_stage_label(str(job.get("current_stage")))
+    return job
+
+
+def list_recent_intake_jobs(conn: sqlite3.Connection, limit: int = 8) -> list[dict[str, object]]:
+    items = fetch_all(
+        conn,
+        """
+        SELECT
+            id,
+            source_kind,
+            source_name,
+            status,
+            current_stage,
+            use_council,
+            created_at,
+            finished_at
+        FROM intake_job
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    for item in items:
+        item["status_label"] = intake_job_status_label(str(item.get("status")))
+        item["current_stage_label"] = intake_stage_label(str(item.get("current_stage")))
+    return items
 
 
 def ensure_target_runtime_schema(conn: sqlite3.Connection) -> None:
@@ -208,6 +453,317 @@ def ensure_target_runtime_schema(conn: sqlite3.Connection) -> None:
         for row in conn.execute("SELECT id FROM skill ORDER BY id"):
             refresh_target_skill_complexity(conn, row["id"], commit=False)
     conn.commit()
+
+
+def decode_uploaded_text(data: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "cp1251"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def extract_docx_text(data: bytes) -> str:
+    namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    paragraphs: list[str] = []
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        document_xml = archive.read("word/document.xml")
+    root = ET.fromstring(document_xml)
+    for paragraph in root.findall(".//w:p", namespace):
+        texts = [node.text for node in paragraph.findall(".//w:t", namespace) if node.text]
+        line = "".join(texts).strip()
+        if line:
+            paragraphs.append(line)
+    return "\n".join(paragraphs)
+
+
+def extract_csv_text(data: bytes) -> str:
+    decoded = decode_uploaded_text(data)
+    sample = decoded[:2048]
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
+    except csv.Error:
+        dialect = csv.excel
+
+    rows: list[str] = []
+    reader = csv.reader(io.StringIO(decoded), dialect)
+    for row in reader:
+        cells = [cell.replace("\ufeff", "").strip() for cell in row]
+        non_empty = [cell for cell in cells if cell]
+        if not non_empty:
+            continue
+        if len(non_empty) == 1:
+            rows.append(non_empty[0])
+            continue
+        head, tail = non_empty[0], non_empty[1:]
+        if len(tail) == 1:
+            rows.append(f"{head}: {tail[0]}")
+            continue
+        rows.append(f"{head}: {' | '.join(tail)}")
+    return "\n\n".join(rows)
+
+
+def extract_brief_text_from_bytes(data: bytes, suffix: str) -> str:
+    if suffix in {".txt", ".md"}:
+        return decode_uploaded_text(data).strip()
+    if suffix == ".csv":
+        return extract_csv_text(data).strip()
+    if suffix == ".docx":
+        return extract_docx_text(data).strip()
+    raise ValueError("Поддерживаются только файлы .txt, .md, .csv и .docx.")
+
+
+def load_brief_text_from_path(file_path_raw: str) -> tuple[str, str]:
+    file_path = Path(file_path_raw.strip().strip('"')).expanduser()
+    if not file_path.exists():
+        raise ValueError(f"Файл не найден: {file_path}")
+    if not file_path.is_file():
+        raise ValueError(f"Указанный путь не является файлом: {file_path}")
+
+    suffix = file_path.suffix.casefold()
+    data = file_path.read_bytes()
+    return extract_brief_text_from_bytes(data, suffix), file_path.name
+
+
+def load_brief_text(
+    form_data: dict[str, str],
+    files: dict[str, UploadedFile],
+) -> tuple[str, str | None, str, str | None]:
+    file_path_raw = form_data.get("brief_file_path", "").strip()
+    if file_path_raw:
+        brief_text, source_name = load_brief_text_from_path(file_path_raw)
+        return brief_text, source_name, "file", file_path_raw
+
+    uploaded_file = files.get("brief_file")
+    if uploaded_file:
+        suffix = Path(uploaded_file.filename).suffix.casefold()
+        brief_text = extract_brief_text_from_bytes(uploaded_file.data, suffix)
+        return brief_text, uploaded_file.filename, "file", uploaded_file.filename
+
+    brief_text = form_data.get("brief", "").strip()
+    if brief_text:
+        return brief_text, None, "text", None
+
+    return "", None, "text", None
+
+
+def run_intake_pipeline(
+    conn: sqlite3.Connection,
+    db_path: Path,
+    brief_text: str,
+    progress_callback: Callable[[str, str], None] | None = None,
+) -> dict[str, object]:
+    from spravochnik_intake.pipeline import stage_brief_to_catalog, stage_catalog_to_dag, storage
+    from spravochnik_intake.pipeline import config as intake_config
+    from spravochnik_intake.pipeline.catalog_repo import CatalogRepo
+
+    ensure_intake_runtime_schema(conn, db_path)
+    storage.apply_migration(conn, str(INTAKE_SCHEMA_SQL))
+
+    def notify(stage: str, note: str) -> None:
+        if progress_callback:
+            progress_callback(stage, note)
+
+    repo = CatalogRepo(str(db_path))
+    try:
+        notify("decompose", "Декомпозиция свободного брифа в роль, уровень и поисковые подзапросы.")
+        spec = stage_brief_to_catalog.decompose(brief_text)
+        notify("search", "Сбор внешних evidence по подзапросам.")
+        evidence = stage_brief_to_catalog.gather_evidence(spec["sub_queries"])
+        notify("synthesize", "Синтез навыков-кандидатов и индикаторов по найденным evidence.")
+        raw_candidates = stage_brief_to_catalog.synthesize(evidence, spec)
+        notify("atomize", "Проверка атомарности кандидатов, разбиение составных формулировок и реклассификация не-навыков.")
+        candidates = stage_brief_to_catalog.atomize_candidates(raw_candidates)
+        notify("resolve", "Сопоставление навыков-кандидатов с текущим каталогом.")
+        stage_brief_to_catalog.resolve_candidates(candidates, evidence, repo)
+        council_metrics_preview = {
+            "sent_to_council": len(stage_brief_to_catalog.select_council_candidates(candidates)),
+        }
+        if intake_config.USE_COUNCIL and council_metrics_preview["sent_to_council"] > 0:
+            notify(
+                "council",
+                f"Экспертное жюри проверяет спорные навыки: {council_metrics_preview['sent_to_council']} кандидатов.",
+            )
+            stage_brief_to_catalog.run_council(candidates)
+        else:
+            notify("council", "Council не потребовался: спорных навыков для panel нет.")
+        notify("triage", "Финальный триаж: что принять автоматически, а что отправить на review.")
+        stage_brief_to_catalog.triage_candidates(candidates)
+        candidate_metrics = stage_brief_to_catalog.build_candidate_metrics(candidates)
+    finally:
+        repo.con.close()
+
+    notify("prerequisites", "Формирование графа пререквизитов, снятие циклов и топологический порядок.")
+    _edges, dag, removed_cycle, removed_transitive, dag_payload = stage_catalog_to_dag.run(candidates)
+    notify("persist", "Запись результатов в каталог и очередь проверки.")
+    brief_id = storage.save_brief(conn, brief_text, spec)
+    evidence_map = storage.save_evidence(conn, brief_id, evidence)
+    storage.save_suggestions(conn, brief_id, candidates, evidence_map)
+    prereq_count = storage.save_prerequisites(conn, dag, candidates)
+    prereq_review_count = storage.save_prerequisite_reviews(conn, brief_id, dag_payload["edge_review_queue"])
+    review_open = conn.execute("SELECT COUNT(*) FROM review_queue WHERE status = 'open'").fetchone()[0]
+    by_tid = {candidate.tmp_id: candidate for candidate in candidates}
+    atomize_events = []
+    for candidate in candidates:
+        if candidate.atomicity == "composite":
+            atomize_events.append(
+                {
+                    "parent_name": candidate.name,
+                    "verdict": "composite",
+                    "children": [child.name for child in candidates if child.parent_tmp_id == candidate.tmp_id],
+                    "rationale": candidate.atomize_rationale,
+                }
+            )
+        elif candidate.atomicity == "non_skill":
+            atomize_events.append(
+                {
+                    "parent_name": candidate.name,
+                    "verdict": "non_skill",
+                    "entity_type": candidate.entity_type,
+                    "children": [],
+                    "rationale": candidate.atomize_rationale,
+                }
+            )
+
+    return {
+        "brief_id": brief_id,
+        "spec": spec,
+        "candidates": [
+            {
+                "name": candidate.name,
+                "group": candidate.group,
+                "bloom": candidate.bloom,
+                "entity_type": candidate.entity_type,
+                "atomicity": candidate.atomicity,
+                "parent_tmp_id": candidate.parent_tmp_id,
+                "parent_name": by_tid[candidate.parent_tmp_id].name if candidate.parent_tmp_id and candidate.parent_tmp_id in by_tid else None,
+                "resolution": candidate.resolution,
+                "canonical_name": candidate.canonical_name,
+                "confidence": f"{candidate.confidence:.2f}" if candidate.confidence else "—",
+                "council_agreement": None if candidate.council_agreement is None else f"{candidate.council_agreement:.2f}",
+                "decision": candidate.decision,
+                "reasons": ", ".join(review_reason_label(reason) for reason in candidate.reasons) if candidate.reasons else "",
+                "tools": ", ".join(candidate.tools) if candidate.tools else "—",
+            }
+            for candidate in candidates
+            if candidate.atomicity in {"atomic", "non_skill"}
+        ],
+        "atomize": {
+            "raw_count": len(raw_candidates),
+            "atomic_count": len([candidate for candidate in candidates if candidate.atomicity == "atomic"]),
+            "composite_count": len([candidate for candidate in candidates if candidate.atomicity == "composite"]),
+            "non_skill_count": len([candidate for candidate in candidates if candidate.atomicity == "non_skill"]),
+            "events": atomize_events,
+        },
+        "dag": dag_payload,
+        "persisted": {
+            "evidence_source": len(evidence),
+            "skill_suggestion": len(candidates),
+            "skill_prerequisite": prereq_count,
+            "prerequisite_reviews": prereq_review_count,
+            "review_open": review_open,
+        },
+        "meta": {
+            "use_live": intake_config.USE_LIVE,
+            "use_council": intake_config.USE_COUNCIL,
+            "model_plan": intake_config.MODEL_PLAN,
+            "model_search": intake_config.MODEL_SEARCH,
+            "model_panel": intake_config.MODEL_PANEL,
+        },
+        "council_metrics": candidate_metrics,
+    }
+
+
+def execute_intake_job(db_path: Path, job_id: int) -> None:
+    conn = open_db(db_path)
+    try:
+        ensure_intake_runtime_schema(conn, db_path)
+        job = get_intake_job(conn, job_id)
+        if not job:
+            return
+
+        update_intake_job(
+            conn,
+            job_id,
+            status="running",
+            current_stage="starting",
+            progress_note="Запуск intake-пайплайна.",
+            mark_started=True,
+        )
+
+        def progress(stage: str, note: str) -> None:
+            worker_conn = open_db(db_path)
+            try:
+                ensure_intake_runtime_schema(worker_conn, db_path)
+                update_intake_job(worker_conn, job_id, current_stage=stage, progress_note=note)
+            finally:
+                worker_conn.close()
+
+        result = run_intake_pipeline(conn, db_path, str(job["brief_text"]), progress_callback=progress)
+        update_intake_job(
+            conn,
+            job_id,
+            status="succeeded",
+            current_stage="completed",
+            progress_note="Обработка завершена.",
+            result_payload=result,
+            mark_finished=True,
+        )
+    except Exception as exc:
+        update_intake_job(
+            conn,
+            job_id,
+            status="failed",
+            current_stage="failed",
+            progress_note="Пайплайн завершился с ошибкой.",
+            error_text=str(exc),
+            mark_finished=True,
+        )
+    finally:
+        conn.close()
+
+
+def queue_intake_job(db_path: Path, job_id: int) -> None:
+    INTAKE_EXECUTOR.submit(execute_intake_job, db_path, job_id)
+
+
+def open_native_brief_picker() -> dict[str, object]:
+    """Открывает системный диалог выбора файла на Windows и возвращает путь."""
+    initial_dir = str((Path.home() / "Desktop").resolve()) if (Path.home() / "Desktop").exists() else str(PROJECT_ROOT)
+    script = rf"""
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.OpenFileDialog
+$dialog.Title = 'Выберите бриф'
+$dialog.Filter = 'Документы брифа|*.txt;*.md;*.csv;*.docx|Все файлы|*.*'
+$dialog.Multiselect = $false
+$dialog.InitialDirectory = '{initial_dir.replace("'", "''")}'
+if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    Write-Output $dialog.FileName
+}}
+"""
+    try:
+        completed = subprocess.run(
+            [POWERSHELL_EXE, "-NoProfile", "-Sta", "-Command", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=180,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            check=False,
+        )
+    except Exception as exc:
+        return {"ok": False, "error": f"Не удалось открыть системный диалог: {exc}"}
+
+    if completed.returncode != 0:
+        error_text = (completed.stderr or completed.stdout or "").strip() or "PowerShell завершился с ошибкой."
+        return {"ok": False, "error": error_text}
+
+    selected_path = (completed.stdout or "").strip()
+    if not selected_path:
+        return {"ok": False, "cancelled": True}
+    return {"ok": True, "path": selected_path, "name": Path(selected_path).name}
 
 
 def complexity_label_for_band(band: str | None) -> str | None:
@@ -1558,6 +2114,15 @@ def html_response(start_response, html: str, status: str = "200 OK"):
     return response(start_response, html.encode("utf-8"), status=status)
 
 
+def json_response(start_response, payload: dict[str, object], status: str = "200 OK"):
+    return response(
+        start_response,
+        json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        status=status,
+        content_type="application/json; charset=utf-8",
+    )
+
+
 def redirect_response(start_response, location: str):
     return response(start_response, b"", status="302 Found", headers=[("Location", location)])
 
@@ -1582,6 +2147,7 @@ def create_app(db_path: Path, summary_path: Path, target_db_path: Path):
                 {"label": "Каталог DB", "href": "/catalog-admin/groups"},
                 {"label": "Архив", "href": "/catalog-admin/archive"},
                 {"label": "Проверка", "href": "/reviews"},
+                {"label": "Бриф", "href": "/intake"},
             ],
             "complexity_options": COMPLEXITY_OPTIONS,
             "summary": summary,
@@ -1612,6 +2178,11 @@ def create_app(db_path: Path, summary_path: Path, target_db_path: Path):
 
         if path == "/catalog-admin":
             return redirect_response(start_response, "/catalog-admin/groups")
+
+        if path == "/intake/pick-file" and method == "POST":
+            picker_result = open_native_brief_picker()
+            status = "200 OK" if picker_result.get("ok") or picker_result.get("cancelled") else "500 Internal Server Error"
+            return json_response(start_response, picker_result, status=status)
 
         if path == "/catalog-admin/archive" and method == "GET":
             target_conn = open_target_db(target_db_path)
@@ -1956,6 +2527,126 @@ def create_app(db_path: Path, summary_path: Path, target_db_path: Path):
                         "reason_filter": reason_filter,
                         "reason_codes": reason_codes,
                         "request_path": path,
+                    },
+                )
+                return html_response(start_response, html)
+
+            if path == "/intake" and method == "GET":
+                ensure_intake_runtime_schema(conn, db_path)
+                html = render(
+                    "intake.html",
+                    {
+                        "title": "Бриф",
+                        "brief": "",
+                        "brief_file_path": "",
+                        "job": None,
+                        "recent_jobs": list_recent_intake_jobs(conn),
+                        "result": None,
+                        "form_error": None,
+                        "upload_name": None,
+                        "request_path": path,
+                    },
+                )
+                return html_response(start_response, html)
+
+            if path == "/intake" and method == "POST":
+                form_data, files = parse_post_form_and_files(environ)
+                try:
+                    brief_text, upload_name, source_kind, file_path = load_brief_text(form_data, files)
+                except ValueError as exc:
+                    html = render(
+                        "intake.html",
+                        {
+                            "title": "Бриф",
+                            "brief": form_data.get("brief", ""),
+                            "brief_file_path": form_data.get("brief_file_path", ""),
+                            "job": None,
+                            "recent_jobs": list_recent_intake_jobs(conn),
+                            "result": None,
+                            "form_error": str(exc),
+                            "upload_name": None,
+                            "request_path": path,
+                        },
+                    )
+                    return html_response(start_response, html, status="400 Bad Request")
+
+                if not brief_text:
+                    html = render(
+                        "intake.html",
+                        {
+                            "title": "Бриф",
+                            "brief": "",
+                            "brief_file_path": form_data.get("brief_file_path", ""),
+                            "job": None,
+                            "recent_jobs": list_recent_intake_jobs(conn),
+                            "result": None,
+                            "form_error": "Нужно вставить текст брифа или загрузить файл.",
+                            "upload_name": upload_name,
+                            "request_path": path,
+                        },
+                    )
+                    return html_response(start_response, html, status="400 Bad Request")
+
+                from spravochnik_intake.pipeline import config as intake_config
+
+                job_id = create_intake_job(
+                    conn,
+                    source_kind=source_kind,
+                    source_name=upload_name,
+                    file_path=file_path,
+                    brief_text=brief_text,
+                    use_council=intake_config.USE_COUNCIL,
+                )
+                queue_intake_job(db_path, job_id)
+                return redirect_response(start_response, f"/intake/jobs/{job_id}")
+
+            if path.startswith("/intake/jobs/") and path.endswith("/status") and method == "GET":
+                try:
+                    job_id = int(path.removeprefix("/intake/jobs/").removesuffix("/status"))
+                except ValueError:
+                    return not_found(start_response)
+                ensure_intake_runtime_schema(conn, db_path)
+                job = get_intake_job(conn, job_id)
+                if not job:
+                    return not_found(start_response, "Intake job not found")
+                return json_response(
+                    start_response,
+                    {
+                        "id": job["id"],
+                        "status": job["status"],
+                        "status_label": intake_job_status_label(str(job.get("status"))),
+                        "current_stage": job.get("current_stage"),
+                        "current_stage_label": intake_stage_label(str(job.get("current_stage"))),
+                        "progress_note": job.get("progress_note"),
+                        "error_text": job.get("error_text"),
+                        "finished_at": job.get("finished_at"),
+                    },
+                )
+
+            if path.startswith("/intake/jobs/") and method == "GET":
+                try:
+                    job_id = int(path.removeprefix("/intake/jobs/"))
+                except ValueError:
+                    return not_found(start_response)
+
+                ensure_intake_runtime_schema(conn, db_path)
+                job = get_intake_job(conn, job_id)
+                if not job:
+                    return not_found(start_response, "Intake job not found")
+
+                result = job.get("result_payload") if job.get("status") == "succeeded" else None
+                html = render(
+                    "intake.html",
+                    {
+                        "title": f"Бриф #{job_id}",
+                        "brief": job.get("brief_text", ""),
+                        "brief_file_path": job.get("file_path", "") or "",
+                        "job": job,
+                        "recent_jobs": list_recent_intake_jobs(conn),
+                        "result": result,
+                        "form_error": None if job.get("status") != "failed" else f"Ошибка intake-пайплайна: {job.get('error_text')}",
+                        "upload_name": job.get("source_name"),
+                        "request_path": "/intake",
                     },
                 )
                 return html_response(start_response, html)

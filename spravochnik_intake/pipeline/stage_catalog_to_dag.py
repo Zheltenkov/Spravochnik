@@ -14,6 +14,41 @@ def _bloom_of(cand: SkillCandidate) -> int:
     return cand.bloom
 
 
+def looks_corrupted(text: str | None) -> bool:
+    if not text:
+        return False
+    marker_count = text.count("?") + text.count("\ufffd")
+    if "??" in text or "\ufffd" in text:
+        return True
+    return marker_count >= 2 and (marker_count / max(len(text), 1)) >= 0.2
+
+
+def display_name(cand: SkillCandidate) -> str:
+    if cand.canonical_name and cand.resolution in {"matched", "alias", "fuzzy"}:
+        return cand.canonical_name
+    if cand.canonical_name and looks_corrupted(cand.name):
+        return cand.canonical_name
+    return cand.name
+
+
+def display_group(cand: SkillCandidate) -> str:
+    if cand.canonical_group and cand.resolution in {"matched", "alias", "fuzzy"}:
+        return cand.canonical_group
+    if cand.canonical_group and looks_corrupted(cand.group):
+        return cand.canonical_group
+    if looks_corrupted(cand.group):
+        return "Группа требует проверки"
+    return cand.group
+
+
+def _graph_candidates(cands: list[SkillCandidate]) -> list[SkillCandidate]:
+    return [
+        cand
+        for cand in cands
+        if cand.entity_type == "skill" and cand.atomicity == "atomic" and cand.decision == "accepted"
+    ]
+
+
 def propose_edges(cands: list[SkillCandidate]) -> list[PrereqEdge]:
     """Структурные рёбра (учебные карты) + предложения ИИ. tmp_id как узлы."""
     by_name = {c.name: c.tmp_id for c in cands}
@@ -59,6 +94,15 @@ def propose_edges(cands: list[SkillCandidate]) -> list[PrereqEdge]:
     return edges
 
 
+def deduplicate_edges(edges: list[PrereqEdge]) -> list[PrereqEdge]:
+    best: dict[tuple[str, str], PrereqEdge] = {}
+    for edge in edges:
+        key = (edge.src, edge.dst)
+        if key not in best or edge.confidence > best[key].confidence:
+            best[key] = edge
+    return list(best.values())
+
+
 def triage_edges(edges: list[PrereqEdge], cands: list[SkillCandidate]) -> None:
     bloom = {c.tmp_id: c.bloom for c in cands}
     for e in edges:
@@ -80,7 +124,7 @@ def build_dag(edges: list[PrereqEdge], cands: list[SkillCandidate]):
     G = nx.DiGraph()
     G.add_nodes_from(c.tmp_id for c in cands)
     for e in edges:
-        G.add_edge(e.src, e.dst, conf=e.confidence)
+        G.add_edge(e.src, e.dst, conf=e.confidence, edge=e)
 
     removed_cycle = []
     while True:
@@ -102,8 +146,126 @@ def build_dag(edges: list[PrereqEdge], cands: list[SkillCandidate]):
     return DAG, removed_cycle, removed_transitive
 
 
+def build_topological_waves(DAG: nx.DiGraph, cands: list[SkillCandidate]) -> tuple[list[list[str]], list[str]]:
+    by_tid = {cand.tmp_id: cand for cand in cands}
+    waves: list[list[str]] = []
+    order: list[str] = []
+    for generation in nx.topological_generations(DAG):
+        wave = sorted(generation, key=lambda tid: by_tid[tid].bloom)
+        waves.append(wave)
+        order.extend(wave)
+    return waves, order
+
+
+def build_edge_review_queue(
+    edges: list[PrereqEdge],
+    removed_cycle: list[tuple[str, str]],
+    removed_transitive: list[tuple[str, str]],
+    cands: list[SkillCandidate],
+) -> list[dict[str, object]]:
+    by_tid = {cand.tmp_id: cand for cand in cands}
+    display_names = {cand.tmp_id: display_name(cand) for cand in cands}
+    removed_cycle_set = set(removed_cycle)
+    removed_transitive_set = set(removed_transitive)
+    review_queue: list[dict[str, object]] = []
+
+    for edge in edges:
+        key = (edge.src, edge.dst)
+        if edge.decision == "needs_review" and key not in removed_cycle_set and key not in removed_transitive_set:
+            review_queue.append(
+                {
+                    "edge_key": f"{edge.src}->{edge.dst}",
+                    "edge_label": f"{display_names[edge.src]} -> {display_names[edge.dst]}",
+                    "reason_code": ",".join(edge.reasons) or "needs_review",
+                    "severity": "warning" if edge.bloom_violation else "info",
+                    "status": "open",
+                    "confidence": edge.confidence,
+                }
+            )
+
+    for src, dst in removed_cycle:
+        review_queue.append(
+            {
+                "edge_key": f"{src}->{dst}",
+                "edge_label": f"{display_names[src]} -> {display_names[dst]}",
+                "reason_code": "cycle_broken",
+                "severity": "warning",
+                "status": "open",
+                "confidence": None,
+            }
+        )
+
+    for src, dst in removed_transitive:
+        review_queue.append(
+            {
+                "edge_key": f"{src}->{dst}",
+                "edge_label": f"{display_names[src]} -> {display_names[dst]}",
+                "reason_code": "redundant_transitive",
+                "severity": "info",
+                "status": "open",
+                "confidence": None,
+            }
+        )
+
+    return review_queue
+
+
+def build_dag_payload(
+    edges: list[PrereqEdge],
+    DAG: nx.DiGraph,
+    removed_cycle: list[tuple[str, str]],
+    removed_transitive: list[tuple[str, str]],
+    cands: list[SkillCandidate],
+) -> dict[str, object]:
+    by_tid = {cand.tmp_id: cand for cand in cands}
+    display_names = {cand.tmp_id: display_name(cand) for cand in cands}
+    display_groups = {cand.tmp_id: display_group(cand) for cand in cands}
+    waves, order = build_topological_waves(DAG, cands)
+    review_queue = build_edge_review_queue(edges, removed_cycle, removed_transitive, cands)
+    final_edges = []
+    for src, dst in DAG.edges():
+        edge = DAG[src][dst].get("edge")
+        final_edges.append(
+            {
+                "src_id": src,
+                "dst_id": dst,
+                "src": display_names[src],
+                "dst": display_names[dst],
+                "source": edge.source if edge else "pipeline",
+                "relation_type": edge.relation_type if edge else "hard",
+                "confidence": edge.confidence if edge else DAG[src][dst].get("conf"),
+                "decision": edge.decision if edge else "accept",
+                "reasons": edge.reasons if edge else [],
+            }
+        )
+
+    return {
+        "nodes": DAG.number_of_nodes(),
+        "edges": DAG.number_of_edges(),
+        "removed_cycle": len(removed_cycle),
+        "removed_transitive": len(removed_transitive),
+        "acyclic": nx.is_directed_acyclic_graph(DAG),
+        "waves": [
+            [
+                {"id": tid, "name": display_names[tid], "group": display_groups[tid], "bloom": by_tid[tid].bloom}
+                for tid in wave
+            ]
+            for wave in waves
+        ],
+        "order": [
+            {"id": tid, "name": display_names[tid], "group": display_groups[tid], "bloom": by_tid[tid].bloom}
+            for tid in order
+        ],
+        "final_edges": final_edges,
+        "edge_review_queue": review_queue,
+    }
+
+
 def run(cands: list[SkillCandidate]):
-    edges = propose_edges(cands)
-    triage_edges(edges, cands)
-    DAG, removed_cycle, removed_transitive = build_dag(edges, cands)
-    return edges, DAG, removed_cycle, removed_transitive
+    used_candidates = _graph_candidates(cands)
+    edges = deduplicate_edges(propose_edges(used_candidates))
+    triage_edges(edges, used_candidates)
+    DAG, removed_cycle, removed_transitive = build_dag(edges, used_candidates)
+    dag_payload = build_dag_payload(edges, DAG, removed_cycle, removed_transitive, used_candidates)
+    dag_payload["used_candidate_ids"] = [cand.tmp_id for cand in used_candidates]
+    return edges, DAG, removed_cycle, removed_transitive, dag_payload

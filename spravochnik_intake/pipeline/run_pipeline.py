@@ -33,7 +33,7 @@ def main(src_db: str, work_db: str, migration_sql: str) -> None:
     storage.save_suggestions(con, brief_id, cands, ev_idmap)
 
     # --- Стадия 2->3 ---
-    edges, DAG, rc, rt = s23.run(cands)
+    edges, DAG, rc, rt, dag_payload = s23.run(cands)
     print(f"\n[2->3] предложено рёбер={len(edges)} | разорвано циклов={len(rc)} | "
           f"убрано избыточных={len(rt)} | итоговый DAG: {DAG.number_of_edges()} рёбер, "
           f"ацикличен={__import__('networkx').is_directed_acyclic_graph(DAG)}")
@@ -43,12 +43,14 @@ def main(src_db: str, work_db: str, migration_sql: str) -> None:
     for u, v in rt:
         print(f"   избыточно -> убрано: {by[u]} -> {by[v]}")
     n_pre = storage.save_prerequisites(con, DAG, cands)
+    n_pre_reviews = storage.save_prerequisite_reviews(con, brief_id, dag_payload["edge_review_queue"])
 
     # --- Чтение обратно из БД: подтверждение персистентности ---
     print("\n[persist] записано в рабочую БД:")
     for t in ["profile_brief", "evidence_source", "skill_suggestion", "skill_prerequisite"]:
         n = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
         print(f"   {t:20} {n}")
+    print(f"   prerequisite_reviews  {n_pre_reviews}")
     nopen = con.execute("SELECT COUNT(*) FROM review_queue WHERE status='open'").fetchone()[0]
     print(f"   review_queue(open)   {nopen}")
     con.close()

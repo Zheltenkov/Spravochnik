@@ -1,0 +1,890 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+    <div>
+        <h1>Заливка брифа</h1>
+        <p>Вставьте свободный текст «кого готовим» или загрузите файл. Система декомпозирует бриф,
+        сопоставит навыки с каталогом и отправит спорные случаи в <a href="/reviews">очередь проверки</a>.</p>
+    </div>
+</section>
+
+<section class="filter-panel">
+    <form class="admin-form" method="post" action="/intake" enctype="multipart/form-data" id="intake-form">
+        <label>
+            <span>Путь к файлу брифа</span>
+            <input type="text" name="brief_file_path" id="brief-file-path" value="{{ brief_file_path or '' }}" placeholder="Например: C:\Users\zvp\Downloads\brief.csv">
+        </label>
+        <div class="review-actions">
+            <button type="button" class="action-btn action-btn-light" id="native-picker-btn">Подставить путь через Windows</button>
+        </div>
+        <div class="small muted" id="picker-status">
+            Поддерживаются `.txt`, `.md`, `.csv`, `.docx`. Если путь к файлу заполнен, будет обработан файл. Если путь пустой, будет обработан текст ниже.
+        </div>
+        <label>
+            <span>Бриф (свободный текст)</span>
+            <textarea name="brief" id="brief-text" rows="8" placeholder="Например: подготовить junior backend-разработчика на Python для финтеха…">{{ brief or "" }}</textarea>
+        </label>
+        {% if upload_name %}
+        <div class="small muted">Источник файла: {{ upload_name }}</div>
+        {% endif %}
+        {% if form_error %}
+        <div class="status-badge warn">{{ form_error }}</div>
+        {% endif %}
+        <div class="review-actions">
+            <button type="submit" class="action-btn action-btn-primary">Обработать бриф</button>
+        </div>
+    </form>
+</section>
+
+{% if job %}
+<section class="hero hero-compact">
+    <div>
+        <h1>Задача intake #{{ job.id }}</h1>
+        <p>
+            Статус:
+            <span class="status-badge{% if job.status == 'failed' %} warn{% endif %}">{{ job.status_label }}</span>
+        </p>
+        <div class="small muted">
+            Источник: {{ 'документ' if job.source_kind == 'file' else 'текстовый бриф' }}
+            {% if job.source_name %} · {{ job.source_name }}{% endif %}
+            {% if job.created_at %} · создано {{ job.created_at }}{% endif %}
+        </div>
+    </div>
+</section>
+
+<section class="chips-row">
+    <div class="summary-card">
+        <div class="summary-label">Этап</div>
+        <div class="summary-value" id="job-stage">{{ job.current_stage_label or 'Постановка в очередь' }}</div>
+    </div>
+    <div class="summary-card">
+        <div class="summary-label">Прогресс</div>
+        <div class="summary-value" id="job-progress">{{ job.progress_note or 'Задача поставлена в очередь.' }}</div>
+    </div>
+    <div class="summary-card">
+        <div class="summary-label">Council</div>
+        <div class="summary-value">{{ 'включен' if job.use_council else 'выключен' }}</div>
+    </div>
+</section>
+{% endif %}
+
+{% if recent_jobs %}
+<section class="table-wrap">
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Последние intake-задачи</th>
+                <th>Источник</th>
+                <th>Статус</th>
+                <th>Этап</th>
+                <th>Council</th>
+                <th>Открыть</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for recent in recent_jobs %}
+            <tr>
+                <td>#{{ recent.id }}<div class="small muted">{{ recent.created_at }}</div></td>
+                <td>{{ recent.source_name or ('Текстовый бриф' if recent.source_kind == 'text' else 'Документ') }}</td>
+                <td><span class="status-badge{% if recent.status == 'failed' %} warn{% endif %}">{{ recent.status_label }}</span></td>
+                <td>{{ recent.current_stage_label }}</td>
+                <td>{{ 'on' if recent.use_council else 'off' }}</td>
+                <td><a href="/intake/jobs/{{ recent.id }}">Открыть</a></td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endif %}
+
+{% if result %}
+<section class="hero hero-compact">
+    <div><h1>Декомпозиция</h1></div>
+</section>
+<section class="chips-row">
+    <div class="summary-card"><div class="summary-label">Роль</div><div class="summary-value">{{ result.spec.role }}</div></div>
+    <div class="summary-card"><div class="summary-label">Грейд</div><div class="summary-value">{{ result.spec.seniority }}</div></div>
+    <div class="summary-card"><div class="summary-label">Домен</div><div class="summary-value">{{ result.spec.domain }}</div></div>
+</section>
+<section class="table-wrap">
+    <div class="small muted">Под-запросы для поиска:</div>
+    <ul>{% for q in result.spec.sub_queries %}<li>{{ q }}</li>{% endfor %}</ul>
+</section>
+
+{% if result.atomize %}
+<section class="hero hero-compact">
+    <div>
+        <h1>Атомизация</h1>
+        <p class="small muted">Система проверяет, является ли формулировка атомарным skill, составной записью или не-навыком. Композиты разбиваются, а рамочные блоки не попадают напрямую в DAG.</p>
+    </div>
+</section>
+<section class="chips-row">
+    <div class="summary-card"><div class="summary-label">Кандидатов из синтеза</div><div class="summary-value">{{ result.atomize.raw_count }}</div></div>
+    <div class="summary-card summary-card-soft"><div class="summary-label">Атомарных skills</div><div class="summary-value">{{ result.atomize.atomic_count }}</div></div>
+    <div class="summary-card summary-card-warn"><div class="summary-label">Разбито композитов</div><div class="summary-value">{{ result.atomize.composite_count }}</div></div>
+    <div class="summary-card summary-card-warn"><div class="summary-label">Не-навыки</div><div class="summary-value">{{ result.atomize.non_skill_count }}</div></div>
+</section>
+
+{% if result.atomize.events %}
+<section class="table-wrap">
+    <table class="data-table">
+        <thead><tr><th>Кандидат из синтеза</th><th>Вердикт</th><th>Результат</th><th>Обоснование</th></tr></thead>
+        <tbody>
+        {% for event in result.atomize.events %}
+            <tr>
+                <td><strong>{{ event.parent_name }}</strong></td>
+                <td>
+                    {% if event.verdict == 'composite' %}
+                    <span class="status-badge warn">composite</span>
+                    {% elif event.verdict == 'non_skill' %}
+                    <span class="status-badge warn">non_skill</span>
+                    {% else %}
+                    <span class="pill ghost">atomic</span>
+                    {% endif %}
+                </td>
+                <td>
+                    {% if event.verdict == 'composite' %}
+                    <div class="small">Разбито на:</div>
+                    <ul>{% for child in event.children %}<li>{{ child }}</li>{% endfor %}</ul>
+                    {% elif event.verdict == 'non_skill' %}
+                    <div class="small muted">Реклассифицировано как `{{ event.entity_type }}` и отправлено на review</div>
+                    {% else %}
+                    <span class="small muted">Оставлено как есть</span>
+                    {% endif %}
+                </td>
+                <td class="small muted">{{ event.rationale or "—" }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endif %}
+{% endif %}
+
+<section class="hero hero-compact"><div><h1>Навыки после атомизации</h1></div></section>
+<section class="table-wrap">
+    <table class="data-table">
+        <thead><tr>
+            <th>Навык</th><th>Группа</th><th>Bloom</th><th>Резолв против каталога</th>
+            <th>Увер.</th><th>Жюри</th><th>Решение</th><th>Причины</th>
+        </tr></thead>
+        <tbody>
+        {% for c in result.candidates %}
+            <tr>
+                <td>
+                    <strong>{{ c.name }}</strong>
+                    <div class="small muted">инструменты: {{ c.tools }}</div>
+                    {% if c.parent_name %}<div class="small muted">из декомпозиции: {{ c.parent_name }}</div>{% endif %}
+                    {% if c.entity_type != 'skill' %}<div class="small muted">тип: {{ c.entity_type }}</div>{% endif %}
+                </td>
+                <td>{{ c.group }}</td>
+                <td>{{ c.bloom }}</td>
+                <td>
+                    {% if c.resolution %}
+                    <span class="pill {% if c.resolution in ('matched','alias') %}ghost{% endif %}">{{ c.resolution }}</span>
+                    {% else %}
+                    —
+                    {% endif %}
+                    {% if c.canonical_name %}<div class="small muted">→ {{ c.canonical_name }}</div>{% endif %}
+                </td>
+                <td>{{ c.confidence }}</td>
+                <td>{{ c.council_agreement if c.council_agreement is not none else "—" }}</td>
+                <td><span class="status-badge {% if c.decision != 'accepted' %}warn{% endif %}">{{ c.decision }}</span></td>
+                <td class="small muted">{{ c.reasons or "—" }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</section>
+
+<section class="hero hero-compact"><div><h1>Граф пререквизитов</h1></div></section>
+<section class="chips-row">
+    <div class="summary-card"><div class="summary-label">Узлов в DAG</div><div class="summary-value">{{ result.dag.nodes }}</div></div>
+    <div class="summary-card"><div class="summary-label">Рёбер в DAG</div><div class="summary-value">{{ result.dag.edges }}</div></div>
+    <div class="summary-card {% if result.dag.removed_cycle %}summary-card-warn{% endif %}"><div class="summary-label">Разорвано циклов</div><div class="summary-value">{{ result.dag.removed_cycle }}</div></div>
+    <div class="summary-card summary-card-soft"><div class="summary-label">Убрано избыточных</div><div class="summary-value">{{ result.dag.removed_transitive }}</div></div>
+    <div class="summary-card"><div class="summary-label">Ацикличен</div><div class="summary-value">{{ "да" if result.dag.acyclic else "нет" }}</div></div>
+</section>
+<div class="small muted">DAG строится только на узлах с `entity_type=skill`, `atomicity=atomic` и `decision=accepted`.</div>
+
+{% if result.dag.waves %}
+<section class="hero hero-compact">
+    <div>
+        <h1>Карта зависимостей</h1>
+        <p>Колонки показывают волны обучения. Чем правее навык, тем позже он должен появиться в учебном маршруте.</p>
+    </div>
+</section>
+<section class="dag-visual-card">
+    <div class="dag-toolbar">
+        <div class="dag-legend">
+            <span class="dag-legend-chip dag-legend-chip-syllabus">Ребро из структуры</span>
+            <span class="dag-legend-chip dag-legend-chip-ai">Ребро от LLM</span>
+            <span class="dag-legend-chip dag-legend-chip-hard">Жёсткая зависимость</span>
+            <span class="dag-legend-chip dag-legend-chip-soft">Мягкая зависимость</span>
+        </div>
+        <div class="review-actions">
+            <button type="button" class="action-btn action-btn-light" id="dag-expand-all">Развернуть группы</button>
+            <button type="button" class="action-btn action-btn-light" id="dag-collapse-all">Свернуть группы</button>
+            <button type="button" class="action-btn" id="dag-export-svg">SVG</button>
+            <button type="button" class="action-btn" id="dag-export-png">PNG</button>
+            <button type="button" class="action-btn action-btn-primary" id="dag-export-pdf">PDF</button>
+        </div>
+    </div>
+    <div class="dag-graph-shell" id="dag-graph-shell">
+        <svg class="dag-edges-layer" id="dag-edges-layer" aria-hidden="true"></svg>
+        <div class="dag-columns" id="dag-columns">
+            {% for wave in result.dag.waves %}
+            <section class="dag-wave-column">
+                <div class="dag-wave-title">Волна {{ loop.index }}</div>
+                <div class="dag-wave-subtitle">{{ wave|length }} навыков</div>
+                {% for grouped in wave|groupby('group') %}
+                <details class="dag-group-cluster" data-group="{{ grouped.grouper }}" open>
+                    <summary>
+                        <span>{{ grouped.grouper }}</span>
+                        <span class="small muted">{{ grouped.list|length }} навыков</span>
+                    </summary>
+                    <div class="dag-group-nodes">
+                    {% for node in grouped.list %}
+                        <article class="dag-node-card" data-node-id="{{ node.id }}" data-group="{{ node.group }}">
+                            <div class="dag-node-meta">
+                                <span class="dag-node-group">{{ node.group }}</span>
+                                <span class="dag-node-bloom">Bloom {{ node.bloom }}</span>
+                            </div>
+                            <h3>{{ node.name }}</h3>
+                        </article>
+                    {% endfor %}
+                    </div>
+                </details>
+                {% endfor %}
+            </section>
+            {% endfor %}
+        </div>
+    </div>
+    <div class="dag-tooltip" id="dag-tooltip" hidden></div>
+    <div class="small muted">Наведи курсор на навык, чтобы подсветить его зависимости. Наведи на ребро, чтобы увидеть источник, confidence и причины review.</div>
+</section>
+
+<section class="hero hero-compact"><div><h1>Волны обучения</h1></div></section>
+<section class="chips-row">
+    {% for wave in result.dag.waves %}
+    <div class="summary-card">
+        <div class="summary-label">Волна {{ loop.index }}</div>
+        {% for node in wave %}
+        <div class="small{% if not loop.first %} muted{% endif %}">{{ node.name }} · bloom {{ node.bloom }} · {{ node.group }}</div>
+        {% endfor %}
+    </div>
+    {% endfor %}
+</section>
+{% endif %}
+
+{% if result.dag.order %}
+<section class="hero hero-compact"><div><h1>Итоговый порядок</h1></div></section>
+<section class="table-wrap">
+    <table class="data-table">
+        <thead><tr><th>#</th><th>Навык</th><th>Группа</th><th>Bloom</th></tr></thead>
+        <tbody>
+        {% for node in result.dag.order %}
+            <tr>
+                <td>{{ loop.index }}</td>
+                <td><strong>{{ node.name }}</strong></td>
+                <td>{{ node.group }}</td>
+                <td>{{ node.bloom }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endif %}
+
+{% if result.dag.final_edges %}
+<section class="hero hero-compact"><div><h1>Финальные рёбра DAG</h1></div></section>
+<section class="table-wrap">
+    <table class="data-table">
+        <thead><tr><th>Откуда</th><th>Куда</th><th>Тип</th><th>Источник</th><th>Уверенность</th><th>Decision</th><th>Причины</th></tr></thead>
+        <tbody>
+        {% for edge in result.dag.final_edges %}
+            <tr>
+                <td>{{ edge.src }}</td>
+                <td>{{ edge.dst }}</td>
+                <td>{{ edge.relation_type }}</td>
+                <td>{{ edge.source }}</td>
+                <td>{{ edge.confidence if edge.confidence is not none else "—" }}</td>
+                <td>{{ edge.decision }}</td>
+                <td class="small muted">{{ edge.reasons|join(", ") if edge.reasons else "—" }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endif %}
+
+{% if result.dag.edge_review_queue %}
+<section class="hero hero-compact"><div><h1>Проверка рёбер DAG</h1></div></section>
+<section class="table-wrap">
+    <table class="data-table">
+        <thead><tr><th>Ребро</th><th>Причина</th><th>Severity</th><th>Уверенность</th><th>Статус</th></tr></thead>
+        <tbody>
+        {% for item in result.dag.edge_review_queue %}
+            <tr>
+                <td>{{ item.edge_label }}</td>
+                <td>{{ item.reason_code }}</td>
+                <td>{{ item.severity }}</td>
+                <td>{{ item.confidence if item.confidence is not none else "—" }}</td>
+                <td>{{ item.status }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endif %}
+
+{% if result.meta %}
+<section class="chips-row">
+    <div class="summary-card"><div class="summary-label">Режим</div><div class="summary-value">{{ 'LIVE' if result.meta.use_live else 'MOCK' }}</div></div>
+    <div class="summary-card"><div class="summary-label">Council</div><div class="summary-value">{{ 'включен' if result.meta.use_council else 'выключен' }}</div></div>
+    <div class="summary-card"><div class="summary-label">Plan model</div><div class="summary-value">{{ result.meta.model_plan }}</div></div>
+    <div class="summary-card"><div class="summary-label">Search model</div><div class="summary-value">{{ result.meta.model_search }}</div></div>
+</section>
+{% endif %}
+
+{% if result.council_metrics %}
+<section class="hero hero-compact"><div><h1>Council и Триаж</h1></div></section>
+<section class="chips-row">
+    <div class="summary-card"><div class="summary-label">Всего кандидатов</div><div class="summary-value">{{ result.council_metrics.total_candidates }}</div></div>
+    <div class="summary-card"><div class="summary-label">Автопринято</div><div class="summary-value">{{ result.council_metrics.auto_accepted }}</div></div>
+    <div class="summary-card"><div class="summary-label">Ушло в panel</div><div class="summary-value">{{ result.council_metrics.sent_to_council }}</div></div>
+    <div class="summary-card"><div class="summary-label">Подтверждено panel</div><div class="summary-value">{{ result.council_metrics.accepted_after_council }}</div></div>
+    <div class="summary-card summary-card-warn"><div class="summary-label">Осталось на review</div><div class="summary-value">{{ result.council_metrics.needs_review_total }}</div></div>
+</section>
+<section class="chips-row">
+    <div class="summary-card"><div class="summary-label">Matched</div><div class="summary-value">{{ result.council_metrics.matched_total }}</div></div>
+    <div class="summary-card"><div class="summary-label">Alias</div><div class="summary-value">{{ result.council_metrics.alias_total }}</div></div>
+    <div class="summary-card"><div class="summary-label">Fuzzy</div><div class="summary-value">{{ result.council_metrics.fuzzy_total }}</div></div>
+    <div class="summary-card"><div class="summary-label">New</div><div class="summary-value">{{ result.council_metrics.new_total }}</div></div>
+    <div class="summary-card"><div class="summary-label">Review после panel</div><div class="summary-value">{{ result.council_metrics.review_after_council }}</div></div>
+</section>
+{% endif %}
+
+<section class="filter-panel">
+    <div class="small">
+        Записано в каталог: бриф #{{ result.brief_id }}, evidence {{ result.persisted.evidence_source }},
+        предложений {{ result.persisted.skill_suggestion }}, рёбер {{ result.persisted.skill_prerequisite }},
+        edge-review {{ result.persisted.prerequisite_reviews }}.
+        Открытых записей в очереди проверки: <strong>{{ result.persisted.review_open }}</strong> →
+        <a href="/reviews">открыть очередь проверки</a>.
+    </div>
+</section>
+{% endif %}
+<script>
+(() => {
+    const intakeForm = document.getElementById("intake-form");
+    const pickerButton = document.getElementById("native-picker-btn");
+    const pathInput = document.getElementById("brief-file-path");
+    const briefText = document.getElementById("brief-text");
+    const statusNode = document.getElementById("picker-status");
+    const jobStageNode = document.getElementById("job-stage");
+    const jobProgressNode = document.getElementById("job-progress");
+    const jobStatusNode = document.querySelector(".hero .status-badge");
+    const currentJobId = {{ job.id|tojson if job else "null" }};
+    const currentJobStatus = {{ job.status|tojson if job else 'null' }};
+    const dagPayload = {{ result.dag|tojson if result and result.dag else "null" }};
+    const dagShell = document.getElementById("dag-graph-shell");
+    const dagSvg = document.getElementById("dag-edges-layer");
+    const dagColumns = document.getElementById("dag-columns");
+    const dagTooltip = document.getElementById("dag-tooltip");
+    const dagExpandAllButton = document.getElementById("dag-expand-all");
+    const dagCollapseAllButton = document.getElementById("dag-collapse-all");
+    const dagExportSvgButton = document.getElementById("dag-export-svg");
+    const dagExportPngButton = document.getElementById("dag-export-png");
+    const dagExportPdfButton = document.getElementById("dag-export-pdf");
+
+    if (!intakeForm || !pickerButton || !pathInput || !briefText || !statusNode) {
+        return;
+    }
+
+    pickerButton.addEventListener("click", async () => {
+        pickerButton.disabled = true;
+        const originalText = pickerButton.textContent;
+        pickerButton.textContent = "Открываю диалог...";
+        statusNode.textContent = "Ожидается выбор файла в системном окне Windows.";
+
+        try {
+            const response = await fetch("/intake/pick-file", { method: "POST" });
+            const payload = await response.json();
+            if (payload.ok && payload.path) {
+                pathInput.value = payload.path;
+                statusNode.textContent = `Выбран файл: ${payload.name}`;
+                return;
+            }
+            if (payload.cancelled) {
+                statusNode.textContent = "Выбор файла отменён.";
+                return;
+            }
+            statusNode.textContent = payload.error || "Не удалось получить путь к файлу.";
+        } catch (_error) {
+            statusNode.textContent = "Не удалось открыть системный диалог. Вставь путь к файлу вручную в поле выше.";
+        } finally {
+            pickerButton.disabled = false;
+            pickerButton.textContent = originalText;
+        }
+    });
+
+    if (currentJobId && jobStageNode && jobProgressNode) {
+        const poll = async () => {
+            try {
+                const response = await fetch(`/intake/jobs/${currentJobId}/status`, { cache: "no-store" });
+                const payload = await response.json();
+                jobStageNode.textContent = payload.current_stage_label || payload.current_stage || "Не указан";
+                jobProgressNode.textContent = payload.progress_note || "Задача выполняется.";
+                if (jobStatusNode && payload.status_label) {
+                    jobStatusNode.textContent = payload.status_label;
+                    jobStatusNode.classList.toggle("warn", payload.status === "failed");
+                }
+                if (payload.status === "succeeded" || payload.status === "failed") {
+                    window.location.reload();
+                    return;
+                }
+            } catch (_error) {
+                jobProgressNode.textContent = "Не удалось обновить статус, повторяю запрос.";
+            }
+            window.setTimeout(poll, 4000);
+        };
+
+        const runningStates = new Set(["pending", "running"]);
+        if (runningStates.has(currentJobStatus)) {
+            window.setTimeout(poll, 1500);
+        }
+    }
+
+    const dagState = {
+        edgeRecords: [],
+        outgoing: new Map(),
+        incoming: new Map(),
+        activeNodeId: null,
+    };
+
+    const svgNamespace = "http://www.w3.org/2000/svg";
+    const textMeasureCanvas = document.createElement("canvas");
+    const textMeasureContext = textMeasureCanvas.getContext("2d");
+
+    const escapeHtml = (value) => String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;");
+
+    const edgeLabel = (edge) => {
+        const reasonText = edge.reasons && edge.reasons.length ? edge.reasons.join(", ") : "—";
+        const confidenceText = edge.confidence ?? "—";
+        return `
+            <div class="dag-tooltip-title">${escapeHtml(edge.src)} → ${escapeHtml(edge.dst)}</div>
+            <div><strong>Источник:</strong> ${escapeHtml(edge.source)}</div>
+            <div><strong>Тип:</strong> ${escapeHtml(edge.relation_type)}</div>
+            <div><strong>Уверенность:</strong> ${escapeHtml(confidenceText)}</div>
+            <div><strong>Решение:</strong> ${escapeHtml(edge.decision)}</div>
+            <div><strong>Причины:</strong> ${escapeHtml(reasonText)}</div>
+        `;
+    };
+
+    const showTooltip = (event, edge) => {
+        if (!dagTooltip) {
+            return;
+        }
+        dagTooltip.innerHTML = edgeLabel(edge);
+        dagTooltip.hidden = false;
+        const shellRect = dagShell.getBoundingClientRect();
+        const tooltipRect = dagTooltip.getBoundingClientRect();
+        const maxLeft = shellRect.width - tooltipRect.width - 14;
+        const nextLeft = Math.max(12, Math.min(event.clientX - shellRect.left + 18, maxLeft));
+        const nextTop = Math.max(12, event.clientY - shellRect.top - tooltipRect.height - 12);
+        dagTooltip.style.left = `${nextLeft}px`;
+        dagTooltip.style.top = `${nextTop}px`;
+    };
+
+    const hideTooltip = () => {
+        if (!dagTooltip) {
+            return;
+        }
+        dagTooltip.hidden = true;
+    };
+
+    const getDescendants = (nodeId, map) => {
+        const visited = new Set();
+        const stack = [...(map.get(nodeId) || [])];
+        while (stack.length) {
+            const current = stack.pop();
+            if (!current || visited.has(current)) {
+                continue;
+            }
+            visited.add(current);
+            for (const next of map.get(current) || []) {
+                if (!visited.has(next)) {
+                    stack.push(next);
+                }
+            }
+        }
+        return visited;
+    };
+
+    const clearDagHighlight = () => {
+        dagState.activeNodeId = null;
+        document.querySelectorAll(".dag-node-card").forEach((node) => {
+            node.classList.remove("dag-node-focus", "dag-node-upstream", "dag-node-downstream", "dag-node-dimmed");
+        });
+        for (const record of dagState.edgeRecords) {
+            record.element.classList.remove("dag-edge-active", "dag-edge-context", "dag-edge-dimmed");
+        }
+    };
+
+    const highlightDagPath = (nodeId) => {
+        dagState.activeNodeId = nodeId;
+        const upstream = getDescendants(nodeId, dagState.incoming);
+        const downstream = getDescendants(nodeId, dagState.outgoing);
+        document.querySelectorAll(".dag-node-card").forEach((node) => {
+            const currentId = node.dataset.nodeId;
+            node.classList.remove("dag-node-focus", "dag-node-upstream", "dag-node-downstream", "dag-node-dimmed");
+            if (currentId === nodeId) {
+                node.classList.add("dag-node-focus");
+                return;
+            }
+            if (upstream.has(currentId)) {
+                node.classList.add("dag-node-upstream");
+                return;
+            }
+            if (downstream.has(currentId)) {
+                node.classList.add("dag-node-downstream");
+                return;
+            }
+            node.classList.add("dag-node-dimmed");
+        });
+
+        for (const record of dagState.edgeRecords) {
+            record.element.classList.remove("dag-edge-active", "dag-edge-context", "dag-edge-dimmed");
+            if (record.srcId === nodeId || record.dstId === nodeId) {
+                record.element.classList.add("dag-edge-active");
+                continue;
+            }
+            const inUpstreamPath = upstream.has(record.srcId) && (upstream.has(record.dstId) || record.dstId === nodeId);
+            const inDownstreamPath = downstream.has(record.dstId) && (downstream.has(record.srcId) || record.srcId === nodeId);
+            if (inUpstreamPath || inDownstreamPath) {
+                record.element.classList.add("dag-edge-context");
+                continue;
+            }
+            record.element.classList.add("dag-edge-dimmed");
+        }
+    };
+
+    const attachNodeHoverHandlers = () => {
+        document.querySelectorAll(".dag-node-card").forEach((node) => {
+            node.addEventListener("mouseenter", () => highlightDagPath(node.dataset.nodeId));
+            node.addEventListener("mouseleave", () => clearDagHighlight());
+        });
+    };
+
+    const createEdgePath = (pathData, sourceClass, relationClass, markerId, edge) => {
+        const path = document.createElementNS(svgNamespace, "path");
+        path.setAttribute("d", pathData);
+        path.setAttribute("class", `dag-edge dag-edge-${sourceClass} dag-edge-${relationClass}`);
+        path.setAttribute("marker-end", `url(#${markerId})`);
+        path.dataset.srcId = edge.src_id;
+        path.dataset.dstId = edge.dst_id;
+        path.addEventListener("mouseenter", (event) => showTooltip(event, edge));
+        path.addEventListener("mousemove", (event) => showTooltip(event, edge));
+        path.addEventListener("mouseleave", hideTooltip);
+        return path;
+    };
+
+    const renderDagGraph = () => {
+        if (!dagPayload || !dagShell || !dagSvg || !dagColumns || !dagPayload.final_edges) {
+            return;
+        }
+
+        const shellRect = dagShell.getBoundingClientRect();
+        const columnsRect = dagColumns.getBoundingClientRect();
+        const width = Math.max(dagColumns.scrollWidth, columnsRect.width);
+        const height = Math.max(dagColumns.scrollHeight, columnsRect.height);
+        dagSvg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+        dagSvg.setAttribute("width", String(width));
+        dagSvg.setAttribute("height", String(height));
+        dagSvg.innerHTML = `
+            <defs>
+                <marker id="dag-arrow-syllabus" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+                    <path d="M0,0 L12,6 L0,12 z" fill="#0e8f6f"></path>
+                </marker>
+                <marker id="dag-arrow-ai" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+                    <path d="M0,0 L12,6 L0,12 z" fill="#b85c38"></path>
+                </marker>
+                <marker id="dag-arrow-pipeline" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+                    <path d="M0,0 L12,6 L0,12 z" fill="#7a6a4d"></path>
+                </marker>
+            </defs>
+        `;
+
+        dagState.edgeRecords = [];
+        dagState.outgoing = new Map();
+        dagState.incoming = new Map();
+        const nodeMap = new Map();
+        Array.from(document.querySelectorAll(".dag-node-card")).forEach((node) => {
+            if (node.offsetParent === null || node.getClientRects().length === 0) {
+                return;
+            }
+            nodeMap.set(node.dataset.nodeId, node);
+        });
+
+        for (const edge of dagPayload.final_edges) {
+            const srcNode = nodeMap.get(edge.src_id);
+            const dstNode = nodeMap.get(edge.dst_id);
+            if (!srcNode || !dstNode) {
+                continue;
+            }
+
+            const srcRect = srcNode.getBoundingClientRect();
+            const dstRect = dstNode.getBoundingClientRect();
+            const startX = srcRect.right - columnsRect.left;
+            const startY = srcRect.top - columnsRect.top + (srcRect.height / 2);
+            const endX = dstRect.left - columnsRect.left;
+            const endY = dstRect.top - columnsRect.top + (dstRect.height / 2);
+            const dx = Math.max(60, (endX - startX) * 0.4);
+            const pathData = `M ${startX} ${startY} C ${startX + dx} ${startY}, ${endX - dx} ${endY}, ${endX} ${endY}`;
+            const sourceClass = edge.source === "ai" ? "ai" : edge.source === "syllabus" ? "syllabus" : "pipeline";
+            const relationClass = edge.relation_type === "soft" ? "soft" : "hard";
+            const markerId = sourceClass === "ai" ? "dag-arrow-ai" : sourceClass === "syllabus" ? "dag-arrow-syllabus" : "dag-arrow-pipeline";
+            const path = createEdgePath(pathData, sourceClass, relationClass, markerId, edge);
+            dagSvg.appendChild(path);
+            dagState.edgeRecords.push({
+                srcId: edge.src_id,
+                dstId: edge.dst_id,
+                edge,
+                element: path,
+            });
+            if (!dagState.outgoing.has(edge.src_id)) {
+                dagState.outgoing.set(edge.src_id, new Set());
+            }
+            if (!dagState.incoming.has(edge.dst_id)) {
+                dagState.incoming.set(edge.dst_id, new Set());
+            }
+            dagState.outgoing.get(edge.src_id).add(edge.dst_id);
+            dagState.incoming.get(edge.dst_id).add(edge.src_id);
+        }
+
+        if (dagState.activeNodeId && nodeMap.has(dagState.activeNodeId)) {
+            highlightDagPath(dagState.activeNodeId);
+        } else {
+            clearDagHighlight();
+        }
+    };
+
+    const setAllDagGroups = (open) => {
+        document.querySelectorAll(".dag-group-cluster").forEach((group) => {
+            group.open = open;
+        });
+        window.requestAnimationFrame(renderDagGraph);
+    };
+
+    const wrapText = (text, maxWidth, font) => {
+        if (!textMeasureContext) {
+            return [text];
+        }
+        textMeasureContext.font = font;
+        const words = String(text).split(/\s+/).filter(Boolean);
+        const lines = [];
+        let currentLine = "";
+        for (const word of words) {
+            const probe = currentLine ? `${currentLine} ${word}` : word;
+            if (textMeasureContext.measureText(probe).width <= maxWidth || !currentLine) {
+                currentLine = probe;
+                continue;
+            }
+            lines.push(currentLine);
+            currentLine = word;
+        }
+        if (currentLine) {
+            lines.push(currentLine);
+        }
+        return lines.length ? lines : [String(text)];
+    };
+
+    const buildExportSvgMarkup = () => {
+        if (!dagPayload || !dagShell || !dagColumns || !dagPayload.final_edges) {
+            return null;
+        }
+
+        const columnsRect = dagColumns.getBoundingClientRect();
+        const visibleNodeCards = Array.from(document.querySelectorAll(".dag-node-card")).filter(
+            (node) => node.offsetParent !== null && node.getClientRects().length > 0
+        );
+
+        if (!visibleNodeCards.length) {
+            return null;
+        }
+
+        const nodeMap = new Map();
+        for (const node of visibleNodeCards) {
+            const rect = node.getBoundingClientRect();
+            nodeMap.set(node.dataset.nodeId, {
+                x: rect.left - columnsRect.left,
+                y: rect.top - columnsRect.top,
+                width: rect.width,
+                height: rect.height,
+                title: node.querySelector("h3")?.textContent?.trim() || "",
+                group: node.querySelector(".dag-node-group")?.textContent?.trim() || "",
+                bloom: node.querySelector(".dag-node-bloom")?.textContent?.trim() || "",
+            });
+        }
+
+        const visibleEdges = dagState.edgeRecords.filter((record) => nodeMap.has(record.srcId) && nodeMap.has(record.dstId));
+        const width = Math.max(dagColumns.scrollWidth, columnsRect.width);
+        const height = Math.max(dagColumns.scrollHeight, columnsRect.height) + 24;
+        const parts = [
+            `<svg xmlns="${svgNamespace}" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`,
+            "<defs>",
+            '<marker id="export-arrow-syllabus" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#0e8f6f"></path></marker>',
+            '<marker id="export-arrow-ai" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#b85c38"></path></marker>',
+            '<marker id="export-arrow-pipeline" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#7a6a4d"></path></marker>',
+            "</defs>",
+            '<rect width="100%" height="100%" fill="#f5efe3"></rect>',
+        ];
+
+        document.querySelectorAll(".dag-wave-column").forEach((column, index) => {
+            const rect = column.getBoundingClientRect();
+            const x = rect.left - columnsRect.left;
+            const y = 32;
+            const waveWidth = rect.width;
+            const waveHeight = Math.max(rect.height - 16, 180);
+            parts.push(
+                `<rect x="${x}" y="${y}" width="${waveWidth}" height="${waveHeight}" rx="22" fill="#fbf8f2" stroke="#d9cfbf"></rect>`,
+                `<text x="${x + 18}" y="22" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700" fill="#0e8f6f">Волна ${index + 1}</text>`
+            );
+        });
+
+        for (const record of visibleEdges) {
+            const pathD = record.element.getAttribute("d");
+            const sourceClass = record.edge.source === "ai" ? "ai" : record.edge.source === "syllabus" ? "syllabus" : "pipeline";
+            const markerId = sourceClass === "ai" ? "export-arrow-ai" : sourceClass === "syllabus" ? "export-arrow-syllabus" : "export-arrow-pipeline";
+            const dash = record.edge.relation_type === "soft" ? ' stroke-dasharray="8 6"' : "";
+            const stroke = sourceClass === "ai" ? "#b85c38" : sourceClass === "syllabus" ? "#0e8f6f" : "#7a6a4d";
+            parts.push(`<path d="${pathD}" fill="none" stroke="${stroke}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"${dash} marker-end="url(#${markerId})"></path>`);
+        }
+
+        for (const [, layout] of nodeMap) {
+            parts.push(
+                `<rect x="${layout.x}" y="${layout.y}" width="${layout.width}" height="${layout.height}" rx="18" fill="#ffffff" stroke="#d9cfbf"></rect>`,
+                `<rect x="${layout.x + 14}" y="${layout.y + 14}" width="${Math.min(140, layout.group.length * 7 + 24)}" height="24" rx="12" fill="rgba(14, 143, 111, 0.1)"></rect>`,
+                `<text x="${layout.x + 26}" y="${layout.y + 30}" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#0e8f6f">${escapeHtml(layout.group)}</text>`,
+                `<text x="${layout.x + layout.width - 84}" y="${layout.y + 30}" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#445255">${escapeHtml(layout.bloom)}</text>`
+            );
+            const lines = wrapText(layout.title, layout.width - 28, "700 15px 'Segoe UI', Arial, sans-serif");
+            lines.forEach((line, index) => {
+                parts.push(
+                    `<text x="${layout.x + 14}" y="${layout.y + 58 + (index * 18)}" font-family="Segoe UI, Arial, sans-serif" font-size="15" font-weight="700" fill="#1f2a2a">${escapeHtml(line)}</text>`
+                );
+            });
+        }
+
+        parts.push("</svg>");
+        return { markup: parts.join(""), width, height };
+    };
+
+    const downloadBlob = (blob, filename) => {
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        window.setTimeout(() => URL.revokeObjectURL(url), 500);
+    };
+
+    const exportDagSvg = () => {
+        const exportSvg = buildExportSvgMarkup();
+        if (!exportSvg) {
+            return;
+        }
+        downloadBlob(new Blob([exportSvg.markup], { type: "image/svg+xml;charset=utf-8" }), "dag-map.svg");
+    };
+
+    const exportDagPng = async () => {
+        const exportSvg = buildExportSvgMarkup();
+        if (!exportSvg) {
+            return;
+        }
+        const blob = new Blob([exportSvg.markup], { type: "image/svg+xml;charset=utf-8" });
+        const svgUrl = URL.createObjectURL(blob);
+        const image = new Image();
+        image.onload = () => {
+            const canvas = document.createElement("canvas");
+            canvas.width = Math.ceil(exportSvg.width * 2);
+            canvas.height = Math.ceil(exportSvg.height * 2);
+            const ctx = canvas.getContext("2d");
+            if (!ctx) {
+                URL.revokeObjectURL(svgUrl);
+                return;
+            }
+            ctx.scale(2, 2);
+            ctx.fillStyle = "#f5efe3";
+            ctx.fillRect(0, 0, exportSvg.width, exportSvg.height);
+            ctx.drawImage(image, 0, 0, exportSvg.width, exportSvg.height);
+            canvas.toBlob((pngBlob) => {
+                if (pngBlob) {
+                    downloadBlob(pngBlob, "dag-map.png");
+                }
+                URL.revokeObjectURL(svgUrl);
+            }, "image/png");
+        };
+        image.src = svgUrl;
+    };
+
+    const exportDagPdf = () => {
+        const exportSvg = buildExportSvgMarkup();
+        if (!exportSvg) {
+            return;
+        }
+        const printWindow = window.open("", "_blank", "width=1200,height=900");
+        if (!printWindow) {
+            return;
+        }
+        printWindow.document.write(`
+            <!doctype html>
+            <html lang="ru">
+            <head>
+                <meta charset="utf-8">
+                <title>DAG export</title>
+                <style>
+                    body { margin: 0; background: #f5efe3; font-family: 'Segoe UI', Arial, sans-serif; }
+                    .page { padding: 24px; }
+                    svg { width: 100%; height: auto; }
+                </style>
+            </head>
+            <body>
+                <div class="page">${exportSvg.markup}</div>
+                <script>
+                    window.onload = () => { window.print(); };
+                <\/script>
+            </body>
+            </html>
+        `);
+        printWindow.document.close();
+    };
+
+    if (dagPayload && dagPayload.final_edges) {
+        attachNodeHoverHandlers();
+        document.querySelectorAll(".dag-group-cluster").forEach((group) => {
+            group.addEventListener("toggle", () => {
+                hideTooltip();
+                window.requestAnimationFrame(renderDagGraph);
+            });
+        });
+        dagExpandAllButton?.addEventListener("click", () => setAllDagGroups(true));
+        dagCollapseAllButton?.addEventListener("click", () => setAllDagGroups(false));
+        dagExportSvgButton?.addEventListener("click", exportDagSvg);
+        dagExportPngButton?.addEventListener("click", exportDagPng);
+        dagExportPdfButton?.addEventListener("click", exportDagPdf);
+        window.requestAnimationFrame(renderDagGraph);
+        window.addEventListener("resize", () => {
+            hideTooltip();
+            renderDagGraph();
+        });
+    }
+})();
+</script>
+{% endblock %}

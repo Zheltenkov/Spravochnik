@@ -5,6 +5,8 @@ from pydantic import BaseModel, Field
 
 BLOOM = {"remember": 1, "understand": 2, "apply": 3, "analyze": 4, "evaluate": 5, "create": 6}
 BloomLevel = Literal["remember", "understand", "apply", "analyze", "evaluate", "create"]
+EntityType = Literal["skill", "competency_block", "curriculum_section"]
+Atomicity = Literal["atomic", "composite", "non_skill", "unknown"]
 
 
 class IndicatorSpec(BaseModel):
@@ -29,15 +31,21 @@ class SkillCandidate(BaseModel):
     tools: list[str] = Field(default_factory=list)
     evidence_ids: list[str] = Field(default_factory=list)
     confidence: float = 0.0
+    # атомизация: stage_atomize между synthesize и resolve
+    entity_type: EntityType = "skill"
+    atomicity: Atomicity = "unknown"
+    parent_tmp_id: Optional[str] = None
+    atomize_rationale: str = ""
     # резолв против каталога:
     resolution: Optional[Literal["matched", "alias", "fuzzy", "new"]] = None
     canonical_skill_id: Optional[int] = None
     canonical_name: Optional[str] = None
+    canonical_group: Optional[str] = None
     match_score: Optional[float] = None
     # жюри/триаж:
     council_agreement: Optional[float] = None
     council_ran: bool = False
-    decision: Optional[Literal["accepted", "needs_review"]] = None
+    decision: Optional[Literal["accepted", "needs_review", "superseded"]] = None
     reasons: list[str] = Field(default_factory=list)
 
     @property

@@ -5,6 +5,8 @@ __pycache__/
 
 .serena/
 .gitrepo/
+.env
+.playwright-mcp/
 .DS_Store
 __MACOSX/
 ._*

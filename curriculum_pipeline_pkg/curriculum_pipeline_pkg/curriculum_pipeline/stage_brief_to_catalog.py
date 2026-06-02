@@ -11,10 +11,37 @@ from .models import Evidence, IndicatorSpec, SkillCandidate
 from .catalog_repo import CatalogRepo
 
 
+def normalize_bloom(value: str | None) -> str:
+    mapping = {
+        "remember": "remember",
+        "recall": "remember",
+        "knowledge": "remember",
+        "understand": "understand",
+        "comprehend": "understand",
+        "apply": "apply",
+        "application": "apply",
+        "analyze": "analyze",
+        "analyse": "analyze",
+        "evaluate": "evaluate",
+        "evaluation": "evaluate",
+        "create": "create",
+        "creation": "create",
+        "знает": "remember",
+        "понимает": "understand",
+        "умеет": "apply",
+        "анализирует": "analyze",
+        "оценивает": "evaluate",
+        "создает": "create",
+        "создаёт": "create",
+    }
+    key = (value or "understand").strip().casefold()
+    return mapping.get(key, "understand")
+
+
 # --------- decompose ---------
 def decompose(brief: str) -> dict:
     if config.USE_LIVE:
-        sys = ("Разложи бриф в JSON: role, seniority, domain, sub_queries(list 4-6). Только JSON.")
+        sys = ("Разложи бриф в JSON: role, seniority, domain, sub_queries(list 3-4). Только JSON.")
         return json.loads(llm.content(llm.chat(config.MODEL_PLAN,
             [{"role": "system", "content": sys}, {"role": "user", "content": brief}], json_mode=True)))
     return {"role": "Backend разработчик на Python", "seniority": "junior", "domain": "финтех",
@@ -90,7 +117,11 @@ def synthesize(evidence: list[Evidence], spec: dict) -> list[SkillCandidate]:
             if not ids:
                 continue
             out.append(SkillCandidate(tmp_id=f"C{i:02d}", name=it["name"], group=it.get("group", ""),
-                indicators=[IndicatorSpec(**ind) for ind in it.get("indicators", [])],
+                indicators=[
+                    IndicatorSpec(text=ind["text"], bloom=normalize_bloom(ind.get("bloom")))
+                    for ind in it.get("indicators", [])
+                    if ind.get("text")
+                ],
                 tools=it.get("tools", []), evidence_ids=ids))
         return out
     # MOCK: реалистичные кандидаты под бриф (резолв пойдёт против реального каталога)
@@ -134,20 +165,31 @@ def _needs_panel(cand: SkillCandidate) -> bool:
     return not (cand.resolution in ("matched", "alias") and cand.confidence >= config.TAU_CONFIDENCE)
 
 
-def run(brief: str, repo: CatalogRepo) -> tuple[dict, list[Evidence], list[SkillCandidate]]:
-    spec = decompose(brief)
-    evidence = gather_evidence(spec["sub_queries"])
-    cands = synthesize(evidence, spec)
-    for c in cands:
-        c.confidence = _confidence(c, evidence)
-        repo.resolve(c)
+def resolve_candidates(cands: list[SkillCandidate], evidence: list[Evidence], repo: CatalogRepo) -> None:
+    for cand in cands:
+        cand.confidence = _confidence(cand, evidence)
+        repo.resolve(cand)
+
+
+def select_council_candidates(cands: list[SkillCandidate]) -> list[SkillCandidate]:
+    return [cand for cand in cands if _needs_panel(cand)]
+
+
+def run_council(cands: list[SkillCandidate]) -> dict[str, int]:
+    council_candidates = select_council_candidates(cands)
     if config.USE_COUNCIL:
-        for c in cands:
-            if _needs_panel(c):
-                votes = [_juror(m, c) for m in config.MODEL_PANEL]
-                c.council_ran = True
-                c.council_agreement = round(sum(votes) / len(votes), 2)
-                c.confidence = round(0.6 * c.confidence + 0.4 * c.council_agreement, 2)
+        for cand in council_candidates:
+            votes = [_juror(model, cand) for model in config.MODEL_PANEL]
+            cand.council_ran = True
+            cand.council_agreement = round(sum(votes) / len(votes), 2)
+            cand.confidence = round(0.6 * cand.confidence + 0.4 * cand.council_agreement, 2)
+    return {
+        "sent_to_council": len(council_candidates),
+        "council_executed": len([cand for cand in cands if cand.council_ran]),
+    }
+
+
+def triage_candidates(cands: list[SkillCandidate]) -> None:
     for c in cands:
         r = []
         n = len(set(c.evidence_ids))
@@ -163,4 +205,29 @@ def run(brief: str, repo: CatalogRepo) -> tuple[dict, list[Evidence], list[Skill
             r.append("council_split")
         c.decision = "accepted" if not r else "needs_review"
         c.reasons = r
+
+
+def build_candidate_metrics(cands: list[SkillCandidate]) -> dict[str, int]:
+    return {
+        "total_candidates": len(cands),
+        "auto_accepted": len([cand for cand in cands if not cand.council_ran and cand.decision == "accepted"]),
+        "sent_to_council": len([cand for cand in cands if cand.council_ran]),
+        "accepted_after_council": len([cand for cand in cands if cand.council_ran and cand.decision == "accepted"]),
+        "review_after_council": len([cand for cand in cands if cand.council_ran and cand.decision == "needs_review"]),
+        "needs_review_total": len([cand for cand in cands if cand.decision == "needs_review"]),
+        "accepted_total": len([cand for cand in cands if cand.decision == "accepted"]),
+        "matched_total": len([cand for cand in cands if cand.resolution == "matched"]),
+        "alias_total": len([cand for cand in cands if cand.resolution == "alias"]),
+        "fuzzy_total": len([cand for cand in cands if cand.resolution == "fuzzy"]),
+        "new_total": len([cand for cand in cands if cand.resolution == "new"]),
+    }
+
+
+def run(brief: str, repo: CatalogRepo) -> tuple[dict, list[Evidence], list[SkillCandidate]]:
+    spec = decompose(brief)
+    evidence = gather_evidence(spec["sub_queries"])
+    cands = synthesize(evidence, spec)
+    resolve_candidates(cands, evidence, repo)
+    run_council(cands)
+    triage_candidates(cands)
     return spec, evidence, cands

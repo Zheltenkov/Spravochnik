@@ -7,6 +7,8 @@ from .models import Evidence, PrereqEdge, SkillCandidate
 
 _REQUIRED_COLS = {
     "skill_suggestion": [
+        ("coverage_area", "TEXT"),
+        ("indicators_json", "TEXT"),
         ("entity_type", "TEXT NOT NULL DEFAULT 'skill'"),
         ("atomicity", "TEXT NOT NULL DEFAULT 'unknown'"),
         ("parent_suggestion_id", "INTEGER"),
@@ -19,6 +21,12 @@ _REQUIRED_COLS = {
     ],
 }
 
+_REVIEW_QUEUE_ENTITY_TYPE_MAP = {
+    "skill": "skill",
+    "competency_block": "block",
+    "curriculum_section": "block",
+}
+
 
 def _existing_cols(con: sqlite3.Connection, table: str) -> set[str]:
     return {row[1] for row in con.execute(f"PRAGMA table_info({table})")}
@@ -27,6 +35,10 @@ def _existing_cols(con: sqlite3.Connection, table: str) -> set[str]:
 def _supports_superseded(con: sqlite3.Connection) -> bool:
     row = con.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='skill_suggestion'").fetchone()
     return bool(row and row[0] and "superseded" in row[0])
+
+
+def _review_queue_entity_type(candidate: SkillCandidate) -> str:
+    return _REVIEW_QUEUE_ENTITY_TYPE_MAP.get(candidate.entity_type, "block")
 
 
 def apply_migration(con: sqlite3.Connection, sql_path: str) -> None:
@@ -75,15 +87,17 @@ def save_suggestions(con: sqlite3.Connection, brief_id: int, cands: list[SkillCa
         if stored_decision == "superseded" and not allow_superseded:
             stored_decision = "rejected"
         con.execute(
-            """INSERT INTO skill_suggestion(brief_id, suggested_name, group_name, bloom, tools,
-               resolution, canonical_skill_id, confidence, council_agreement, evidence_ids, decision,
-               entity_type, atomicity, parent_suggestion_id, atomize_rationale)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            """INSERT INTO skill_suggestion(brief_id, suggested_name, group_name, coverage_area, bloom,
+               indicators_json, tools, resolution, canonical_skill_id, confidence, council_agreement,
+               evidence_ids, decision, entity_type, atomicity, parent_suggestion_id, atomize_rationale)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 brief_id,
                 c.name,
                 c.group,
+                c.coverage_area,
                 max((i.bloom for i in c.indicators), default=None),
+                json.dumps([indicator.model_dump(mode="json") for indicator in c.indicators], ensure_ascii=False),
                 json.dumps(c.tools, ensure_ascii=False),
                 c.resolution,
                 c.canonical_skill_id,
@@ -100,7 +114,7 @@ def save_suggestions(con: sqlite3.Connection, brief_id: int, cands: list[SkillCa
         tmp_to_db[c.tmp_id] = con.execute("SELECT last_insert_rowid()").fetchone()[0]
         # спорное -> в существующую review_queue (переиспользуем механизм каталога)
         if c.decision == "needs_review":
-            rq_entity_type = c.entity_type
+            rq_entity_type = _review_queue_entity_type(c)
             primary_reason = c.reasons[0] if c.reasons else "needs_review"
             severity = "warning" if primary_reason in {"novel_skill", "council_split", "fuzzy_match_ambiguous", "low_confidence"} else "info"
             reasons_text = ", ".join(c.reasons) if c.reasons else "manual_review"
@@ -181,3 +195,91 @@ def save_prerequisite_reviews(con: sqlite3.Connection, brief_id: int, edge_revie
         count += 1
     con.commit()
     return count
+
+
+def clear_curriculum_plan(con: sqlite3.Connection, brief_id: int, source_policy: str = "accepted_only") -> None:
+    plan_rows = con.execute(
+        "SELECT id FROM curriculum_plan WHERE brief_id = ? AND source_policy = ?",
+        (brief_id, source_policy),
+    ).fetchall()
+    for row in plan_rows:
+        con.execute("DELETE FROM curriculum_plan_row WHERE plan_id = ?", (row["id"],))
+    con.execute(
+        "DELETE FROM curriculum_plan WHERE brief_id = ? AND source_policy = ?",
+        (brief_id, source_policy),
+    )
+    con.commit()
+
+
+def save_curriculum_plan(
+    con: sqlite3.Connection,
+    brief_id: int,
+    plan_payload: dict[str, object],
+    source_policy: str = "accepted_only",
+) -> dict[str, int]:
+    clear_curriculum_plan(con, brief_id, source_policy)
+    summary = plan_payload.get("summary") if isinstance(plan_payload.get("summary"), dict) else {}
+    cur = con.execute(
+        """
+        INSERT INTO curriculum_plan(
+            brief_id, source_policy, status, title, audience_level,
+            total_blocks, total_projects, total_hours, total_days, total_xp, payload_json, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """,
+        (
+            brief_id,
+            source_policy,
+            str(plan_payload.get("status", "draft")),
+            plan_payload.get("title"),
+            plan_payload.get("audience_level"),
+            int(summary.get("blocks", 0) or 0),
+            int(summary.get("projects", 0) or 0),
+            float(summary.get("total_hours", 0) or 0),
+            float(summary.get("total_days", 0) or 0),
+            int(summary.get("total_xp", 0) or 0),
+            json.dumps(plan_payload, ensure_ascii=False),
+        ),
+    )
+    plan_id = int(cur.lastrowid)
+    row_count = 0
+    for row in plan_payload.get("rows", []):
+        if not isinstance(row, dict):
+            continue
+        con.execute(
+            """
+            INSERT INTO curriculum_plan_row(
+                plan_id, block_index, row_number, project_index_in_block, block_title, block_goal,
+                project_name, project_summary, learning_outcomes, skills_list, audience_level,
+                required_tools, storytelling, delivery_format, group_size, effort_hours, effort_days,
+                cumulative_days, xp, platform_project_name, artifact_links
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                plan_id,
+                int(row.get("block_index", 0) or 0),
+                int(row.get("row_number", 0) or 0),
+                int(row.get("project_index_in_block", 0) or 0),
+                row.get("block_title"),
+                row.get("block_goal"),
+                row.get("project_name"),
+                row.get("project_summary"),
+                row.get("learning_outcomes"),
+                row.get("skills_list"),
+                row.get("audience_level"),
+                row.get("required_tools"),
+                row.get("storytelling"),
+                row.get("delivery_format"),
+                row.get("group_size"),
+                float(row.get("effort_hours", 0) or 0),
+                float(row.get("effort_days", 0) or 0),
+                float(row.get("cumulative_days", 0) or 0),
+                int(row.get("xp", 0) or 0),
+                row.get("platform_project_name"),
+                row.get("artifact_links"),
+            ),
+        )
+        row_count += 1
+    con.commit()
+    return {"plan_id": plan_id, "row_count": row_count}

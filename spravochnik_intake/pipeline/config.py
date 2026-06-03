@@ -50,13 +50,13 @@ USE_COUNCIL = _env_bool("USE_COUNCIL", True)
 OPENROUTER_URL = os.environ.get("OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
 OPENROUTER_HTTP_REFERER = os.environ.get("OPENROUTER_HTTP_REFERER", "http://127.0.0.1:8010")
 OPENROUTER_APP_TITLE = os.environ.get("OPENROUTER_APP_TITLE", "Spravochnik Intake")
-MODEL_PLAN = os.environ.get("MODEL_PLAN", "openai/gpt-4.1-mini")
+MODEL_PLAN = os.environ.get("MODEL_PLAN", "openai/gpt-5-mini")
 MODEL_SEARCH = os.environ.get("MODEL_SEARCH", "perplexity/sonar-pro")
 MODEL_PANEL = [
     item.strip()
     for item in os.environ.get(
         "MODEL_PANEL",
-        "openai/gpt-4.1-mini,anthropic/claude-3.5-haiku,google/gemini-2.0-flash-001",
+        "openai/gpt-5-mini,anthropic/claude-3.5-haiku,google/gemini-2.0-flash-001",
     ).split(",")
     if item.strip()
 ]
@@ -65,9 +65,24 @@ MODEL_PANEL = [
 TAU_CONFIDENCE = float(os.environ.get("TAU_CONFIDENCE", "0.75"))
 MIN_SOURCES = int(os.environ.get("MIN_SOURCES", "2"))
 COUNCIL_AGREE_OK = float(os.environ.get("COUNCIL_AGREE_OK", "0.67"))
+AUTO_ACCEPT_CONFIDENCE = float(os.environ.get("AUTO_ACCEPT_CONFIDENCE", "0.95"))
+AUTO_ACCEPT_COUNCIL_AGREEMENT = float(os.environ.get("AUTO_ACCEPT_COUNCIL_AGREEMENT", "1.0"))
+AUTO_ACCEPT_NEW_FOR_PROGRAM_BRIEF = _env_bool("AUTO_ACCEPT_NEW_FOR_PROGRAM_BRIEF", False)
+PROGRAM_BRIEF_MAX_SKILLS_PER_AREA = int(os.environ.get("PROGRAM_BRIEF_MAX_SKILLS_PER_AREA", "2"))
 FUZZY_MATCH_MIN = int(os.environ.get("FUZZY_MATCH_MIN", "90"))      # rapidfuzz score для fuzzy-резолва
 
 # Стадия 2->3
 TAU_EDGE_ACCEPT = float(os.environ.get("TAU_EDGE_ACCEPT", "0.80"))
 REQUEST_TIMEOUT_SECONDS = int(os.environ.get("OPENROUTER_TIMEOUT_SECONDS", "90"))
 STRUCTURAL_PREREQ_RULES = _env_structural_rules("STRUCTURAL_PREREQ_RULES")
+
+# Стадия 3->4: DAG -> учебный план (верхний планировщик)
+UP_HOURS_PER_DAY = float(os.environ.get("UP_HOURS_PER_DAY", "2.94"))
+UP_XP_PER_HOUR = int(os.environ.get("UP_XP_PER_HOUR", "10"))
+UP_MAX_SKILLS_PER_PROJECT = int(os.environ.get("UP_MAX_SKILLS_PER_PROJECT", "2"))
+UP_MAX_PROJECTS_PER_BLOCK = int(os.environ.get("UP_MAX_PROJECTS_PER_BLOCK", "3"))
+UP_HOUR_BANDS = [
+    int(item.strip())
+    for item in os.environ.get("UP_HOUR_BANDS", "8,12,16,20,24").split(",")
+    if item.strip()
+]

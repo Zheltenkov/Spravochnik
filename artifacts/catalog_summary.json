@@ -1,28 +1,23 @@
 {
-  "generated_at_utc": "2026-04-08T19:00:15.452082+00:00",
+  "generated_at_utc": "2026-06-02T18:24:49.152525+00:00",
   "counts": {
-    "workbooks": 15,
-    "sheets": 41,
-    "blocks": 216,
-    "profiles": 15,
-    "competencies": 136,
-    "profile_competencies": 216,
-    "skills": 855,
-    "competency_skills": 1256,
-    "indicator_rows": 16103,
-    "indicator_level_cells": 19076,
-    "open_reviews": 0
+    "workbooks": 13,
+    "sheets": 35,
+    "blocks": 182,
+    "profiles": 13,
+    "competencies": 116,
+    "profile_competencies": 182,
+    "skills": 746,
+    "competency_skills": 1140,
+    "indicator_rows": 15172,
+    "indicator_level_cells": 16307,
+    "open_reviews": 111
   },
   "duplicate_skills": [
     {
       "canonical_name": "Командное взаимодействие",
-      "profile_count": 10,
-      "competency_links": 11
-    },
-    {
-      "canonical_name": "Работа с системами управления задачами (Task Tracking)",
-      "profile_count": 10,
-      "competency_links": 11
+      "profile_count": 9,
+      "competency_links": 10
     },
     {
       "canonical_name": "Понимание основ реляционных баз данных",
@@ -33,6 +28,11 @@
       "canonical_name": "Следование Agile-методологии",
       "profile_count": 9,
       "competency_links": 10
+    },
+    {
+      "canonical_name": "Работа с системами управления задачами (Task Tracking)",
+      "profile_count": 8,
+      "competency_links": 9
     },
     {
       "canonical_name": "Работа с языком SQL",
@@ -94,22 +94,7 @@
     {
       "reason_code": "missing_dimension",
       "severity": "warning",
-      "cnt": 139
-    },
-    {
-      "reason_code": "missing_block_title",
-      "severity": "warning",
-      "cnt": 13
-    },
-    {
-      "reason_code": "orphan_indicator_row",
-      "severity": "error",
-      "cnt": 6
-    },
-    {
-      "reason_code": "ambiguous_skill_name",
-      "severity": "warning",
-      "cnt": 3
+      "cnt": 130
     },
     {
       "reason_code": "no_header_rows",
@@ -122,9 +107,9 @@
       "cnt": 2
     },
     {
-      "reason_code": "level_headers_inherited_from_previous_block",
+      "reason_code": "ambiguous_skill_name",
       "severity": "warning",
-      "cnt": 1
+      "cnt": 2
     }
   ],
   "scales": [

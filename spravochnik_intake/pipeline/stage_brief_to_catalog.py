@@ -5,9 +5,11 @@ decompose -> grounded-поиск -> evidence -> синтез -> резолв (р
 """
 from __future__ import annotations
 import json
+import re
 from datetime import date
 from . import config, llm
 from . import stage_atomize
+from . import stage_normalize
 from .models import Evidence, IndicatorSpec, SkillCandidate
 from .catalog_repo import CatalogRepo
 
@@ -39,28 +41,254 @@ def normalize_bloom(value: str | None) -> str:
     return mapping.get(key, "understand")
 
 
+def _normalized_spec(raw: dict[str, object]) -> dict[str, object]:
+    role = str(raw.get("target_role") or raw.get("role") or "").strip()
+    seniority = str(raw.get("target_seniority") or raw.get("seniority") or "").strip()
+    domain = str(raw.get("domain") or "").strip()
+    artifact_type = str(raw.get("artifact_type") or "learner_brief").strip() or "learner_brief"
+    operator_role = str(raw.get("operator_role") or "").strip() or None
+    program_goal = str(raw.get("program_goal") or "").strip()
+    must_include_areas = [
+        str(item).strip()
+        for item in (raw.get("must_include_areas") or [])
+        if str(item).strip()
+    ]
+    sub_queries = []
+    seen_queries: set[str] = set()
+    for item in (raw.get("sub_queries") or []):
+        query = str(item).strip()
+        norm = query.casefold()
+        if not query or norm in seen_queries:
+            continue
+        seen_queries.add(norm)
+        sub_queries.append(query)
+    return {
+        "artifact_type": artifact_type,
+        "role": role,
+        "seniority": seniority,
+        "domain": domain,
+        "operator_role": operator_role,
+        "program_goal": program_goal,
+        "must_include_areas": must_include_areas,
+        "sub_queries": sub_queries,
+    }
+
+
+def _mock_program_brief_spec() -> dict[str, object]:
+    return {
+        "artifact_type": "program_brief",
+        "role": "Технологический предприниматель",
+        "seniority": "начинающий",
+        "domain": "технологическое предпринимательство / цифровые продукты / AI-assisted product building",
+        "operator_role": "Дизайнер образовательной программы",
+        "program_goal": "Подготовить начинающего технологического предпринимателя к запуску цифрового продукта как бизнеса.",
+        "must_include_areas": [
+            "Выявление проблемы клиента и customer discovery",
+            "Проверка продуктовых гипотез",
+            "Сегментация клиентов и ценностное предложение",
+            "Определение границ MVP и продуктовая приоритизация",
+            "AI-assisted разработка и архитектурное мышление",
+            "Инженерная дисциплина: репозиторий, CI, тесты, релизы",
+            "Инфраструктура: деплой, observability, backup, incidents",
+            "AI-workflows и автоматизация бизнес-процессов",
+            "Маркетинг технологического продукта",
+            "Продажи и монетизация",
+            "Поддержка пользователей и feedback loop",
+            "Правовые, финансовые и административные основы",
+            "Стратегия, управление рисками и цели",
+            "Контроль качества AI, безопасность и human-in-the-loop",
+        ],
+        "sub_queries": [
+            "Навыки выпускника для customer discovery, problem framing, JTBD и проверки гипотез в технологическом предпринимательстве",
+            "Навыки выпускника для определения MVP, продуктовой приоритизации и AI-assisted разработки цифрового продукта",
+            "Навыки выпускника для go-to-market: позиционирование, каналы привлечения, продажи и монетизация технологического продукта",
+            "Навыки выпускника для инфраструктуры продукта, поддержки пользователей, observability, AI quality control и risk management",
+        ],
+    }
+
+
+_PROGRAM_ARTIFACT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\bкогорт"), "Описывает формирование когорты, а не skill выпускника."),
+    (re.compile(r"\bкритери(и|я)\s+отбор"), "Описывает правила набора в программу, а не skill выпускника."),
+    (re.compile(r"\bучастник(ов|а|и)?\b"), "Описывает управление участниками программы, а не skill выпускника."),
+    (re.compile(r"\bпреподавател"), "Описывает ресурс программы, а не skill выпускника."),
+    (re.compile(r"\bнаставник|\bментор"), "Описывает состав команды сопровождения программы, а не learner-skill."),
+    (re.compile(r"\bюрист|\bмаркетолог"), "Описывает staffing/outsourcing решение программы, а не learner-skill."),
+    (re.compile(r"\bфаундер"), "Описывает организационную модель команды, а не наблюдаемый skill."),
+    (re.compile(r"\bразмер\s+команд|\bчисленност"), "Описывает оргдизайн команды/потока, а не канонический skill."),
+]
+
+_COVERAGE_STOPWORDS = {
+    "и", "или", "для", "по", "с", "на", "в", "из", "к", "от", "как", "а", "не", "это",
+    "the", "and", "or", "of", "to", "with", "in",
+    "навыки", "умения", "компетенции", "область", "области", "контур", "базовый", "базовая",
+    "минимальный", "ключевой", "ключевые", "цифрового", "цифровых", "продукта", "продуктов",
+    "продукт", "program", "brief", "learner", "graduate", "outcomes",
+}
+
+
+def _reclassify_program_artifacts(cands: list[SkillCandidate], spec: dict[str, object]) -> None:
+    if str(spec.get("artifact_type") or "").strip() not in {"program_brief", "mixed"}:
+        return
+    for cand in cands:
+        text = f"{cand.name} {cand.group}".casefold()
+        for pattern, rationale in _PROGRAM_ARTIFACT_PATTERNS:
+            if pattern.search(text):
+                cand.entity_type = "curriculum_section"
+                cand.atomicity = "non_skill"
+                cand.decision = "needs_review"
+                cand.reasons = ["non_skill:curriculum_section"]
+                cand.atomize_rationale = rationale
+                break
+
+
+def _norm_tokens(value: str) -> set[str]:
+    # Грубая нормализация нужна только для coverage-аудита и не влияет на канонические имена.
+    tokens = {
+        token
+        for token in re.findall(r"[a-zA-Zа-яА-ЯёЁ0-9\-/]{3,}", value.casefold().replace("ё", "е"))
+        if token not in _COVERAGE_STOPWORDS
+    }
+    return tokens
+
+
+def _candidate_text(candidate: SkillCandidate) -> str:
+    indicator_text = " ".join(indicator.text for indicator in candidate.indicators)
+    return " ".join(
+        part for part in [candidate.name, candidate.group, candidate.coverage_area or "", indicator_text] if part
+    )
+
+
+def _lexical_overlap(left: str, right: str) -> float:
+    left_tokens = _norm_tokens(left)
+    right_tokens = _norm_tokens(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    intersection = left_tokens & right_tokens
+    return len(intersection) / max(min(len(left_tokens), len(right_tokens)), 1)
+
+
+def _build_coverage_audit(
+    spec: dict[str, object],
+    cands: list[SkillCandidate],
+    coverage_rows: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    # Coverage нужен как продуктовый сигнал: видно, какие обязательные области закрыты, а какие выпали.
+    areas = [str(item).strip() for item in spec.get("must_include_areas") or [] if str(item).strip()]
+    if not areas:
+        return {"covered_count": 0, "partial_count": 0, "uncovered_count": 0, "rows": []}
+
+    skills = [cand for cand in cands if cand.entity_type == "skill" and cand.atomicity == "atomic"]
+    coverage_index: dict[str, dict[str, object]] = {}
+    for row in coverage_rows or []:
+        area = str(row.get("area") or "").strip()
+        if not area:
+            continue
+        coverage_index[area] = {
+            "status": str(row.get("status") or "").strip() or "uncovered",
+            "rationale": str(row.get("rationale") or "").strip(),
+            "candidate_names": [str(name).strip() for name in row.get("candidate_names") or [] if str(name).strip()],
+        }
+
+    audit_rows: list[dict[str, object]] = []
+    covered_count = 0
+    partial_count = 0
+    uncovered_count = 0
+    for area in areas:
+        explicit = [cand for cand in skills if (cand.coverage_area or "").strip() == area]
+        if explicit:
+            status = "covered"
+            candidate_names = [cand.name for cand in explicit]
+            rationale = "Покрыто кандидатами, явно привязанными к области."
+        else:
+            lexical = [cand for cand in skills if _lexical_overlap(area, _candidate_text(cand)) >= 0.34]
+            if lexical:
+                status = "partial"
+                candidate_names = [cand.name for cand in lexical]
+                rationale = "Найдено только частичное лексическое пересечение с кандидатами."
+            else:
+                status = "uncovered"
+                candidate_names = []
+                rationale = "Для области не найдено ни одного кандидата."
+
+        if area in coverage_index:
+            status = coverage_index[area]["status"] or status
+            candidate_names = coverage_index[area]["candidate_names"] or candidate_names
+            rationale = coverage_index[area]["rationale"] or rationale
+
+        if status == "covered":
+            covered_count += 1
+        elif status == "partial":
+            partial_count += 1
+        else:
+            uncovered_count += 1
+
+        audit_rows.append(
+            {
+                "area": area,
+                "status": status,
+                "candidate_names": candidate_names,
+                "rationale": rationale,
+            }
+        )
+
+    return {
+        "covered_count": covered_count,
+        "partial_count": partial_count,
+        "uncovered_count": uncovered_count,
+        "rows": audit_rows,
+    }
+
+
 # --------- decompose ---------
 def decompose(brief: str) -> dict:
     if config.USE_LIVE:
-        sys = ("Разложи бриф в JSON: role, seniority, domain, sub_queries(list 3-4). Только JSON.")
-        return json.loads(llm.content(llm.chat(config.MODEL_PLAN,
-            [{"role": "system", "content": sys}, {"role": "user", "content": brief}], json_mode=True)))
+        sys = (
+            "Ты анализируешь бриф для построения skill portrait. "
+            "Если бриф описывает образовательную программу, курс, ветку, паспорт программы или ТЗ на продукт обучения, "
+            "то role/seniority должны описывать выпускника/learner после завершения программы, а не автора, методолога, дизайнера программы или команду запуска. "
+            "Отдельно выдели operator_role, если в тексте есть роль того, кто проектирует/запускает программу. "
+            "Верни только JSON с полями: "
+            "artifact_type ('learner_brief'|'program_brief'|'mixed'), "
+            "role, seniority, domain, operator_role, program_goal, "
+            "must_include_areas (list 8-16 обязательных областей компетенций выпускника), "
+            "sub_queries (list 4-6 поисковых запросов только про learner skills и graduate outcomes). "
+            "Запрещено заполнять sub_queries вопросами про размер когорты, бюджет программы, staffing, загрузку преподавателей, ресурсы команды запуска, KPI самой программы. "
+            "Нужно вытаскивать skills выпускника, а не операционные решения по запуску программы."
+        )
+        raw = json.loads(llm.content(llm.chat(
+            config.MODEL_PLAN,
+            [{"role": "system", "content": sys}, {"role": "user", "content": brief}],
+            json_mode=True,
+        )))
+        return _normalized_spec(raw)
     brief_lower = brief.lower()
     if "предпринимател" in brief_lower or "стартап" in brief_lower or "тз на продукт" in brief_lower:
-        return {
-            "role": "Технологический предприниматель",
-            "seniority": "начинающий",
-            "domain": "технологический бизнес / цифровые продукты",
+        return _mock_program_brief_spec()
+    return _normalized_spec(
+        {
+            "artifact_type": "learner_brief",
+            "role": "Backend разработчик на Python",
+            "seniority": "junior",
+            "domain": "финтех",
+            "operator_role": None,
+            "program_goal": "",
+            "must_include_areas": [
+                "Python backend development",
+                "Работа с БД и SQL",
+                "REST API",
+                "Очереди сообщений",
+                "Docker",
+            ],
             "sub_queries": [
-                "формулирование и анализ проблемы",
-                "ai-инструменты в маркетинге",
-                "основные бизнес-функции стартапа",
-                "сегментация клиентов и продуктовые метрики",
+                "junior backend требования",
+                "работа с БД и SQL",
+                "REST API",
+                "очереди сообщений",
+                "контейнеризация Docker",
             ],
         }
-    return {"role": "Backend разработчик на Python", "seniority": "junior", "domain": "финтех",
-            "sub_queries": ["junior backend требования", "работа с БД и SQL", "REST API",
-                            "очереди сообщений", "контейнеризация Docker"]}
+    )
 
 
 # --------- grounded-поиск -> evidence ---------
@@ -118,52 +346,103 @@ def gather_evidence(sub_queries: list[str]) -> list[Evidence]:
 
 
 # --------- синтез кандидатов (с Блумом и инструментами) ---------
-def synthesize(evidence: list[Evidence], spec: dict) -> list[SkillCandidate]:
+def synthesize_with_coverage(evidence: list[Evidence], spec: dict) -> tuple[list[SkillCandidate], dict[str, object] | None]:
     ev_ids = [e.id for e in evidence]
     if config.USE_LIVE:
         cl = [{"id": e.id, "claim": e.claim, "type": e.source_type} for e in evidence]
-        sys = ("Сгруппируй evidence в навыки-кандидаты. Строгий JSON "
-               "{candidates:[{name,group,indicators:[{text,bloom}],tools,evidence_ids}]}. "
-               "evidence_ids только из предоставленных. Навык без evidence не включай.")
-        data = json.loads(llm.content(llm.chat(config.MODEL_PLAN,
-            [{"role": "system", "content": sys}, {"role": "user", "content": json.dumps({"evidence": cl}, ensure_ascii=False)}],
-            json_mode=True)))
+        spec_context = {
+            "artifact_type": spec.get("artifact_type"),
+            "target_role": spec.get("role"),
+            "target_seniority": spec.get("seniority"),
+            "domain": spec.get("domain"),
+            "operator_role": spec.get("operator_role"),
+            "program_goal": spec.get("program_goal"),
+            "must_include_areas": spec.get("must_include_areas", []),
+        }
+        if str(spec.get("artifact_type") or "").strip() in {"program_brief", "mixed"}:
+            sys = (
+                "Ты строишь skill portrait выпускника образовательной программы. "
+                "Работай coverage-first: сначала посмотри на must_include_areas, затем попытайся закрыть их evidence. "
+                "Верни только строгий JSON вида "
+                "{coverage:[{area,status,rationale,candidate_names,evidence_ids}],"
+                "candidates:[{name,group,coverage_area,indicators:[{text,bloom}],tools,evidence_ids}]}. "
+                "status в coverage: covered|partial|uncovered. "
+                "Кандидаты должны быть только learner-skills/graduate outcomes. "
+                "Название кандидата формулируй как наблюдаемый навык или действие, а не как роль/должность человека. "
+                "Хорошо: 'Проведение проблемных интервью', 'Настройка CI/CD', 'Определение границ MVP'. "
+                "Плохо: 'Исследователь', 'Маркетолог', 'Стратег', 'Инженер MVP'. "
+                "Не включай staffing decisions, преподавателей, бюджет, ресурсы программы, критерии набора, состав когорты, функции команды запуска, outsourcing-решения, роли операторов программы. "
+                "Старайся не концентрироваться только в одной инженерной зоне: распределяй кандидатов по разным must_include_areas. "
+                "На одну область давай 1-2 наиболее важных атомарных skill-кандидата, если evidence это поддерживает. "
+                "evidence_ids разрешены только из предоставленного набора."
+            )
+        else:
+            sys = (
+                "Сгруппируй evidence в навыки-кандидаты выпускника. "
+                "Строгий JSON {candidates:[{name,group,indicators:[{text,bloom}],tools,evidence_ids}]}. "
+                "evidence_ids только из предоставленных. Навык без evidence не включай. "
+                "Важное правило: извлекай только learner-skills и graduate outcomes. "
+                "Название кандидата формулируй как skill/action, а не как роль или должность. "
+                "Не включай staffing decisions, роли команды запуска программы, размер когорты, критерии набора, загрузку преподавателей, бюджет, ресурсы программы, outsourcing-решения. "
+                "Если бриф про образовательную программу, ориентируйся на target_role и must_include_areas выпускника."
+            )
+        data = json.loads(llm.content(llm.chat(
+            config.MODEL_PLAN,
+            [{"role": "system", "content": sys}, {"role": "user", "content": json.dumps({"spec": spec_context, "evidence": cl}, ensure_ascii=False)}],
+            json_mode=True,
+        )))
         items = data.get("candidates", [])
         out = []
         for i, it in enumerate(items, 1):
             ids = [x for x in it.get("evidence_ids", []) if x in ev_ids]
             if not ids:
                 continue
-            out.append(SkillCandidate(tmp_id=f"C{i:02d}", name=it["name"], group=it.get("group", ""),
+            out.append(SkillCandidate(
+                tmp_id=f"C{i:02d}",
+                name=it["name"],
+                group=it.get("group", ""),
+                coverage_area=str(it.get("coverage_area") or "").strip() or None,
                 indicators=[
                     IndicatorSpec(text=ind["text"], bloom=normalize_bloom(ind.get("bloom")))
                     for ind in it.get("indicators", [])
                     if ind.get("text")
                 ],
-                tools=it.get("tools", []), evidence_ids=ids))
-        return out
+                tools=it.get("tools", []),
+                evidence_ids=ids,
+            ))
+        coverage = _build_coverage_audit(spec, out, data.get("coverage"))
+        return out, coverage
     # MOCK: реалистичные кандидаты под бриф (резолв пойдёт против реального каталога)
-    role = spec.get("role", "").lower()
+    role = str(spec.get("role", "")).lower()
     if "предпринимател" in role or "стартап" in role:
         proto = [
-            ("Формулирование и анализ проблемы", "Product Management", [("Формулирует и анализирует проблему", "apply")], []),
-            ("Использование AI-инструментов в маркетинге", "Marketing", [("Применяет AI в маркетинге", "apply")], ["GPT"]),
-            ("Основные бизнес-функции технологического стартапа", "Startup Management", [("Понимает функции стартапа", "understand")], []),
-            ("Анализ и сегментация клиентов, метрики и продуктовый анализ", "Product Management", [("Анализирует клиентов и метрики", "analyze")], []),
+            ("Выявление проблемы клиента", "Customer Discovery", "Выявление проблемы клиента и customer discovery", [("Выявляет проблему клиента через интервью и наблюдение", "apply")], []),
+            ("Проверка продуктовых гипотез", "Customer Discovery", "Проверка продуктовых гипотез", [("Проверяет гипотезы о проблеме и решении", "analyze")], []),
+            ("Формулирование ценностного предложения", "Product Strategy", "Сегментация клиентов и ценностное предложение", [("Формулирует ценностное предложение для сегмента", "apply")], []),
+            ("Определение границ MVP", "Product Strategy", "Определение границ MVP и продуктовая приоритизация", [("Определяет минимальный состав MVP", "apply")], []),
+            ("Продуктовая приоритизация", "Product Strategy", "Определение границ MVP и продуктовая приоритизация", [("Приоритизирует backlog по ценности и рискам", "analyze")], []),
+            ("AI-assisted разработка цифрового продукта", "Product Development", "AI-assisted разработка и архитектурное мышление", [("Использует AI для ускорения разработки продукта", "apply")], ["LLM", "IDE with AI"]),
+            ("Настройка базовой инженерной дисциплины", "Engineering Delivery", "Инженерная дисциплина: репозиторий, CI, тесты, релизы", [("Ведет репозиторий, CI и тесты", "apply")], ["Git", "CI"]),
+            ("Развертывание и наблюдаемость цифрового продукта", "Product Infrastructure", "Инфраструктура: деплой, observability, backup, incidents", [("Разворачивает сервис и настраивает observability", "apply")], ["Cloud", "Monitoring"]),
+            ("Позиционирование и каналы привлечения", "Go-To-Market", "Маркетинг технологического продукта", [("Определяет позиционирование и каналы привлечения", "apply")], []),
+            ("Построение модели монетизации", "Go-To-Market", "Продажи и монетизация", [("Формирует базовую модель монетизации продукта", "apply")], []),
+            ("Поддержка пользователей и сбор обратной связи", "Customer Success", "Поддержка пользователей и feedback loop", [("Организует поддержку и feedback loop", "apply")], []),
+            ("Контроль качества AI и безопасность", "Risk & Compliance", "Контроль качества AI, безопасность и human-in-the-loop", [("Проверяет результаты AI и управляет рисками безопасности", "analyze")], []),
         ]
         out = []
-        for i, (name, grp, inds, tools) in enumerate(proto, 1):
+        for i, (name, grp, area, inds, tools) in enumerate(proto, 1):
             out.append(
                 SkillCandidate(
                     tmp_id=f"C{i:02d}",
                     name=name,
                     group=grp,
+                    coverage_area=area,
                     indicators=[IndicatorSpec(text=text, bloom=bloom) for text, bloom in inds],
                     tools=tools,
                     evidence_ids=ev_ids[:2] or ev_ids[:1],
                 )
             )
-        return out
+        return out, _build_coverage_audit(spec, out)
 
     def by_kw(*kw):
         return [e.id for e in evidence if any(k.lower() in (e.claim + " " + e.snippet).lower() for k in kw)]
@@ -182,7 +461,12 @@ def synthesize(evidence: list[Evidence], spec: dict) -> list[SkillCandidate]:
             continue
         out.append(SkillCandidate(tmp_id=f"C{i:02d}", name=name, group=grp,
             indicators=[IndicatorSpec(text=t, bloom=b) for t, b in inds], tools=tools, evidence_ids=ids))
-    return out
+    return out, _build_coverage_audit(spec, out)
+
+
+def synthesize(evidence: list[Evidence], spec: dict) -> list[SkillCandidate]:
+    candidates, _coverage = synthesize_with_coverage(evidence, spec)
+    return candidates
 
 
 def _confidence(cand: SkillCandidate, evidence: list[Evidence]) -> float:
@@ -209,7 +493,9 @@ def _is_for_resolve(cand: SkillCandidate) -> bool:
     return cand.entity_type == "skill" and cand.atomicity == "atomic"
 
 
-def atomize_candidates(cands: list[SkillCandidate]) -> list[SkillCandidate]:
+def atomize_candidates(cands: list[SkillCandidate], spec: dict | None = None) -> list[SkillCandidate]:
+    if spec:
+        _reclassify_program_artifacts(cands, spec)
     return stage_atomize.run(cands)
 
 
@@ -239,7 +525,24 @@ def run_council(cands: list[SkillCandidate]) -> dict[str, int]:
     }
 
 
-def triage_candidates(cands: list[SkillCandidate]) -> None:
+def _meets_auto_accept_policy(cand: SkillCandidate, spec: dict[str, object] | None = None) -> bool:
+    artifact_type = str((spec or {}).get("artifact_type") or "").strip()
+    # Новый skill в program_brief не публикуем автоматически: сначала нужен human check, иначе каталог быстро загрязняется.
+    if (
+        artifact_type in {"program_brief", "mixed"}
+        and cand.resolution == "new"
+        and not config.AUTO_ACCEPT_NEW_FOR_PROGRAM_BRIEF
+    ):
+        return False
+    return (
+        cand.council_agreement is not None
+        and cand.confidence >= config.AUTO_ACCEPT_CONFIDENCE
+        and cand.council_agreement >= config.AUTO_ACCEPT_COUNCIL_AGREEMENT
+    )
+
+
+def triage_candidates(cands: list[SkillCandidate], spec: dict[str, object] | None = None) -> None:
+    artifact_type = str((spec or {}).get("artifact_type") or "").strip()
     for c in cands:
         if not _is_for_resolve(c):
             continue
@@ -247,6 +550,8 @@ def triage_candidates(cands: list[SkillCandidate]) -> None:
         n = len(set(c.evidence_ids))
         if c.resolution == "new":
             r.append("novel_skill")
+            if artifact_type in {"program_brief", "mixed"} and not config.AUTO_ACCEPT_NEW_FOR_PROGRAM_BRIEF:
+                r.append("program_brief_publication_guardrail")
         if c.resolution == "fuzzy":
             r.append("fuzzy_match_ambiguous")
         if c.confidence < config.TAU_CONFIDENCE:
@@ -255,6 +560,10 @@ def triage_candidates(cands: list[SkillCandidate]) -> None:
             r.append("single_source")
         if c.council_ran and c.council_agreement is not None and c.council_agreement < config.COUNCIL_AGREE_OK:
             r.append("council_split")
+        if _meets_auto_accept_policy(c, spec):
+            c.decision = "accepted"
+            c.reasons = ["auto_accept_policy"]
+            continue
         c.decision = "accepted" if not r else "needs_review"
         c.reasons = r
 
@@ -282,8 +591,10 @@ def build_candidate_metrics(cands: list[SkillCandidate]) -> dict[str, int]:
 def run(brief: str, repo: CatalogRepo) -> tuple[dict, list[Evidence], list[SkillCandidate]]:
     spec = decompose(brief)
     evidence = gather_evidence(spec["sub_queries"])
-    cands = atomize_candidates(synthesize(evidence, spec))
+    cands, _coverage = synthesize_with_coverage(evidence, spec)
+    cands = atomize_candidates(cands, spec)
+    cands, _normalize_report = stage_normalize.run(cands, spec)
     resolve_candidates(cands, evidence, repo)
     run_council(cands)
-    triage_candidates(cands)
+    triage_candidates(cands, spec)
     return spec, evidence, cands

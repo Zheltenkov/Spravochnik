@@ -10,28 +10,26 @@
 
 <section class="filter-panel">
     <form class="admin-form" method="post" action="/intake" enctype="multipart/form-data" id="intake-form">
-        <label>
-            <span>Путь к файлу брифа</span>
-            <input type="text" name="brief_file_path" id="brief-file-path" value="{{ brief_file_path or '' }}" placeholder="Например: C:\Users\zvp\Downloads\brief.csv">
-        </label>
-        <div class="review-actions">
-            <button type="button" class="action-btn action-btn-light" id="native-picker-btn">Подставить путь через Windows</button>
+        <input type="hidden" name="brief_file_path" id="brief-file-path" value="{{ brief_file_path or '' }}">
+        <input type="file" name="brief_file" id="brief-file-input" accept=".txt,.md,.csv,.docx" hidden>
+        <div class="upload-dropzone" id="brief-dropzone" role="button" tabindex="0" aria-controls="brief-file-input">
+            <div class="upload-dropzone-title">Перетащите документ сюда или нажмите для выбора</div>
+            <div class="upload-dropzone-subtitle">Поддерживаются `.txt`, `.md`, `.csv`, `.docx`. После выбора файл сразу уйдёт в обработку.</div>
         </div>
-        <div class="small muted" id="picker-status">
-            Поддерживаются `.txt`, `.md`, `.csv`, `.docx`. Если путь к файлу заполнен, будет обработан файл. Если путь пустой, будет обработан текст ниже.
-        </div>
+        <div class="small muted" id="picker-status">Файл пока не выбран.</div>
         <label>
             <span>Бриф (свободный текст)</span>
             <textarea name="brief" id="brief-text" rows="8" placeholder="Например: подготовить junior backend-разработчика на Python для финтеха…">{{ brief or "" }}</textarea>
         </label>
+        <div class="small muted">Если вставите текст, появится кнопка для обработки текстового брифа.</div>
         {% if upload_name %}
         <div class="small muted">Источник файла: {{ upload_name }}</div>
         {% endif %}
         {% if form_error %}
         <div class="status-badge warn">{{ form_error }}</div>
         {% endif %}
-        <div class="review-actions">
-            <button type="submit" class="action-btn action-btn-primary">Обработать бриф</button>
+        <div class="review-actions" id="brief-submit-wrap" {% if not brief %}hidden{% endif %}>
+            <button type="submit" class="action-btn">Обработать текстовый бриф</button>
         </div>
     </form>
 </section>
@@ -49,6 +47,24 @@
             {% if job.source_name %} · {{ job.source_name }}{% endif %}
             {% if job.created_at %} · создано {{ job.created_at }}{% endif %}
         </div>
+    </div>
+</section>
+
+<section class="intake-progress-card">
+    <div class="intake-progress-head">
+        <div>
+            <div class="intake-progress-title">Прогресс обработки</div>
+            <div class="small muted">Стадии обновляются автоматически во время выполнения intake-задачи.</div>
+        </div>
+        <div class="intake-progress-percent" id="job-progress-percent">0%</div>
+    </div>
+    <div class="intake-progress-track" aria-hidden="true">
+        <div class="intake-progress-fill" id="job-progress-fill"></div>
+    </div>
+    <div class="intake-progress-steps" id="job-progress-steps">
+        {% for step in intake_progress_steps %}
+        <span class="intake-progress-step" data-stage="{{ step.code }}">{{ step.label }}</span>
+        {% endfor %}
     </div>
 </section>
 
@@ -75,7 +91,7 @@
         open review = {{ dag_build_state.open_review_count }}.
     </div>
     <form class="review-actions" method="post" action="/intake/jobs/{{ job.id }}/build-dag">
-        <button type="submit" class="action-btn action-btn-primary">Построить DAG из принятого</button>
+        <button type="submit" class="action-btn action-btn-primary">Пересобрать DAG</button>
     </form>
 </section>
 {% endif %}
@@ -83,30 +99,33 @@
 
 {% if recent_jobs %}
 <section class="table-wrap">
-    <table class="data-table">
-        <thead>
-            <tr>
-                <th>Последние intake-задачи</th>
-                <th>Источник</th>
-                <th>Статус</th>
-                <th>Этап</th>
-                <th>Council</th>
-                <th>Открыть</th>
-            </tr>
-        </thead>
-        <tbody>
-        {% for recent in recent_jobs %}
-            <tr>
-                <td>#{{ recent.id }}<div class="small muted">{{ recent.created_at }}</div></td>
-                <td>{{ recent.source_name or ('Текстовый бриф' if recent.source_kind == 'text' else 'Документ') }}</td>
-                <td><span class="status-badge{% if recent.status == 'failed' %} warn{% endif %}">{{ recent.status_label }}</span></td>
-                <td>{{ recent.current_stage_label }}</td>
-                <td>{{ 'on' if recent.use_council else 'off' }}</td>
-                <td><a href="/intake/jobs/{{ recent.id }}">Открыть</a></td>
-            </tr>
-        {% endfor %}
-        </tbody>
-    </table>
+    <details class="collapse-panel">
+        <summary>Последние intake-задачи ({{ recent_jobs|length }})</summary>
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Последние intake-задачи</th>
+                    <th>Источник</th>
+                    <th>Статус</th>
+                    <th>Этап</th>
+                    <th>Council</th>
+                    <th>Открыть</th>
+                </tr>
+            </thead>
+            <tbody>
+            {% for recent in recent_jobs %}
+                <tr>
+                    <td>#{{ recent.id }}<div class="small muted">{{ recent.created_at }}</div></td>
+                    <td>{{ recent.source_name or ('Текстовый бриф' if recent.source_kind == 'text' else 'Документ') }}</td>
+                    <td><span class="status-badge{% if recent.status == 'failed' %} warn{% endif %}">{{ recent.status_label }}</span></td>
+                    <td>{{ recent.current_stage_label }}</td>
+                    <td>{{ 'on' if recent.use_council else 'off' }}</td>
+                    <td><a href="/intake/jobs/{{ recent.id }}">Открыть</a></td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </details>
 </section>
 {% endif %}
 
@@ -115,10 +134,61 @@
     <div><h1>Декомпозиция</h1></div>
 </section>
 <section class="chips-row">
+    <div class="summary-card"><div class="summary-label">Тип брифа</div><div class="summary-value">{{ result.spec.artifact_type or "—" }}</div></div>
     <div class="summary-card"><div class="summary-label">Роль</div><div class="summary-value">{{ result.spec.role }}</div></div>
     <div class="summary-card"><div class="summary-label">Грейд</div><div class="summary-value">{{ result.spec.seniority }}</div></div>
     <div class="summary-card"><div class="summary-label">Домен</div><div class="summary-value">{{ result.spec.domain }}</div></div>
+    {% if result.spec.operator_role %}
+    <div class="summary-card"><div class="summary-label">Оператор программы</div><div class="summary-value">{{ result.spec.operator_role }}</div></div>
+    {% endif %}
 </section>
+{% if result.spec.program_goal %}
+<section class="filter-panel">
+    <div class="small muted"><strong>Цель программы:</strong> {{ result.spec.program_goal }}</div>
+</section>
+{% endif %}
+{% if result.spec.must_include_areas %}
+<section class="table-wrap">
+    <div class="small muted">Обязательные области для coverage-check:</div>
+    <ul>{% for item in result.spec.must_include_areas %}<li>{{ item }}</li>{% endfor %}</ul>
+</section>
+{% endif %}
+{% if result.coverage and result.coverage.rows %}
+<section class="hero hero-compact">
+    <div>
+        <h1>Coverage по обязательным областям</h1>
+        <p class="small muted">Здесь видно, какие области программа уже закрывает кандидатами, а какие пока не покрыты и требуют доработки пайплайна или ручной методологической проверки.</p>
+    </div>
+</section>
+<section class="chips-row">
+    <div class="summary-card summary-card-soft"><div class="summary-label">Covered</div><div class="summary-value">{{ result.coverage.covered_count }}</div></div>
+    <div class="summary-card"><div class="summary-label">Partial</div><div class="summary-value">{{ result.coverage.partial_count }}</div></div>
+    <div class="summary-card summary-card-warn"><div class="summary-label">Uncovered</div><div class="summary-value">{{ result.coverage.uncovered_count }}</div></div>
+</section>
+<section class="table-wrap">
+    <table class="data-table">
+        <thead><tr><th>Обязательная область</th><th>Статус</th><th>Связанные кандидаты</th><th>Пояснение</th></tr></thead>
+        <tbody>
+        {% for row in result.coverage.rows %}
+            <tr>
+                <td><strong>{{ row.area }}</strong></td>
+                <td>
+                    {% if row.status == 'covered' %}
+                    <span class="status-badge">covered</span>
+                    {% elif row.status == 'partial' %}
+                    <span class="status-badge warn">partial</span>
+                    {% else %}
+                    <span class="status-badge warn">uncovered</span>
+                    {% endif %}
+                </td>
+                <td>{% if row.candidate_names %}{{ row.candidate_names|join(', ') }}{% else %}<span class="small muted">—</span>{% endif %}</td>
+                <td class="small muted">{{ row.rationale }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endif %}
 <section class="table-wrap">
     <div class="small muted">Под-запросы для поиска:</div>
     <ul>{% for q in result.spec.sub_queries %}<li>{{ q }}</li>{% endfor %}</ul>
@@ -174,12 +244,71 @@
 {% endif %}
 {% endif %}
 
-<section class="hero hero-compact"><div><h1>Навыки после атомизации</h1></div></section>
+{% if result.normalize %}
+<section class="hero hero-compact">
+    <div>
+        <h1>Нормализация и дедупликация</h1>
+        <p class="small muted">После атомизации система схлопывает только безопасные exact/near-exact дубли, чтобы очередь review не раздувалась одинаковыми формулировками.</p>
+    </div>
+</section>
+<section class="chips-row">
+    <div class="summary-card"><div class="summary-label">Atomic до merge</div><div class="summary-value">{{ result.normalize.atomic_input_count }}</div></div>
+    <div class="summary-card summary-card-soft"><div class="summary-label">Atomic после merge</div><div class="summary-value">{{ result.normalize.atomic_output_count }}</div></div>
+    <div class="summary-card"><div class="summary-label">Схлопнуто дублей</div><div class="summary-value">{{ result.normalize.merged_count }}</div></div>
+    <div class="summary-card"><div class="summary-label">Убрано пере-дробления</div><div class="summary-value">{{ result.normalize.compacted_count }}</div></div>
+    <div class="summary-card"><div class="summary-label">Exact merge</div><div class="summary-value">{{ result.normalize.exact_merged_count }}</div></div>
+    <div class="summary-card"><div class="summary-label">Near-exact merge</div><div class="summary-value">{{ result.normalize.fuzzy_merged_count }}</div></div>
+</section>
+{% if result.normalize.events %}
+<section class="table-wrap">
+    <table class="data-table">
+        <thead><tr><th>Оставлено</th><th>Поглощено</th><th>Причина</th><th>Score</th><th>Coverage area</th></tr></thead>
+        <tbody>
+        {% for event in result.normalize.events %}
+            <tr>
+                <td><strong>{{ event.kept_name }}</strong></td>
+                <td>{{ event.absorbed_name }}</td>
+                <td class="small muted">{{ event.reason }}</td>
+                <td>{{ event.score }}</td>
+                <td>{% if event.coverage_area %}{{ event.coverage_area }}{% else %}<span class="small muted">—</span>{% endif %}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endif %}
+{% if result.normalize.compaction_events %}
+<section class="table-wrap">
+    <table class="data-table">
+        <thead><tr><th>Coverage area</th><th>Оставлены в review</th><th>Убраны как пере-дробление</th><th>Правило</th></tr></thead>
+        <tbody>
+        {% for event in result.normalize.compaction_events %}
+            <tr>
+                <td><strong>{{ event.coverage_area }}</strong></td>
+                <td>{{ event.kept_names|join(', ') }}</td>
+                <td class="small muted">{{ event.dropped_names|join(', ') }}</td>
+                <td class="small muted">{{ event.reason }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endif %}
+{% endif %}
+
+<section class="hero hero-compact"><div><h1>Навыки после нормализации</h1></div></section>
+<section class="filter-panel">
+    <div class="small muted">
+        `Увер. модели` — уверенность алгоритма сопоставления и триажа. `Согласие жюри` — согласованность panel-проверки между моделями, если спорный кандидат дошёл до council.
+        Если `Увер. модели >= 0.95` и `Согласие жюри = 1.00`, кандидат авто-принимается.
+        Для уже принятой строки доступно отдельное действие `Вернуть на review`, без смешивания с `Отклонить`.
+    </div>
+</section>
 <section class="table-wrap">
     <table class="data-table">
         <thead><tr>
-            <th>Навык</th><th>Группа</th><th>Bloom</th><th>Резолв против каталога</th>
-            <th>Увер.</th><th>Жюри</th><th>Решение</th><th>Причины</th>
+            <th>Навык</th><th>Coverage area</th><th>Группа</th><th>Bloom</th><th>Резолв против каталога</th>
+            <th>Увер. модели</th><th>Согласие жюри</th><th>Решение</th><th>Причины</th><th>Действие</th>
         </tr></thead>
         <tbody>
         {% for c in result.candidates %}
@@ -190,6 +319,7 @@
                     {% if c.parent_name %}<div class="small muted">из декомпозиции: {{ c.parent_name }}</div>{% endif %}
                     {% if c.entity_type != 'skill' %}<div class="small muted">тип: {{ c.entity_type }}</div>{% endif %}
                 </td>
+                <td>{% if c.coverage_area %}{{ c.coverage_area }}{% else %}<span class="small muted">—</span>{% endif %}</td>
                 <td>{{ c.group }}</td>
                 <td>{{ c.bloom }}</td>
                 <td>
@@ -204,6 +334,18 @@
                 <td>{{ c.council_agreement if c.council_agreement is not none else "—" }}</td>
                 <td><span class="status-badge {% if c.decision != 'accepted' %}warn{% endif %}">{{ c.decision }}</span></td>
                 <td class="small muted">{{ c.reasons or "—" }}</td>
+                <td class="candidate-action-cell">
+                    {% if c.can_review_inline and c.suggestion_id %}
+                    <form class="candidate-action-form" method="post" action="/intake/jobs/{{ job.id }}/candidate-decision">
+                        <input type="hidden" name="suggestion_id" value="{{ c.suggestion_id }}">
+                        <button type="submit" name="candidate_action" value="accept" class="action-btn action-btn-primary"{% if c.decision == 'accepted' %} disabled{% endif %}>Добавить</button>
+                        <button type="submit" name="candidate_action" value="review" class="action-btn action-btn-light"{% if c.decision == 'needs_review' %} disabled{% endif %}>Вернуть на review</button>
+                        <button type="submit" name="candidate_action" value="reject" class="action-btn action-btn-danger"{% if c.decision == 'rejected' %} disabled{% endif %}>Отклонить</button>
+                    </form>
+                    {% else %}
+                    <span class="small muted">Нет ручного действия</span>
+                    {% endif %}
+                </td>
             </tr>
         {% endfor %}
         </tbody>
@@ -228,7 +370,7 @@
     </div>
 </section>
 {% endif %}
-<div class="small muted">DAG строится только на узлах с `entity_type=skill`, `atomicity=atomic` и `decision=accepted`.</div>
+<div class="small muted">DAG перестраивается автоматически по текущим узлам с `entity_type=skill`, `atomicity=atomic` и `decision=accepted`.</div>
 
 {% if result.dag.waves %}
 <section class="hero hero-compact">
@@ -361,6 +503,91 @@
 </section>
 {% endif %}
 
+{% if result.curriculum_plan %}
+<section class="hero hero-compact">
+    <div>
+        <h1>Черновик учебного плана</h1>
+        <p>{{ result.curriculum_plan.message }}</p>
+    </div>
+    <div class="review-actions">
+        {% if result.curriculum_plan.plan_id %}
+        <a class="action-btn action-btn-primary" href="/up/plans/{{ result.curriculum_plan.plan_id }}">Открыть УП</a>
+        {% endif %}
+        {% if result.curriculum_plan.rows %}
+        <a class="action-btn action-btn-secondary" href="/up/plans/{{ result.curriculum_plan.plan_id }}/csv">Скачать CSV</a>
+        {% endif %}
+    </div>
+</section>
+<section class="chips-row">
+    <div class="summary-card"><div class="summary-label">Блоков</div><div class="summary-value">{{ result.curriculum_plan.summary.blocks }}</div></div>
+    <div class="summary-card"><div class="summary-label">Проектов</div><div class="summary-value">{{ result.curriculum_plan.summary.projects }}</div></div>
+    <div class="summary-card"><div class="summary-label">Часы</div><div class="summary-value">{{ result.curriculum_plan.summary.total_hours }}</div></div>
+    <div class="summary-card"><div class="summary-label">Дни</div><div class="summary-value">{{ result.curriculum_plan.summary.total_days }}</div></div>
+    <div class="summary-card"><div class="summary-label">XP</div><div class="summary-value">{{ result.curriculum_plan.summary.total_xp }}</div></div>
+</section>
+{% if result.curriculum_plan.blocks %}
+<section class="table-wrap">
+    <table class="data-table">
+        <thead><tr><th>Блок</th><th>Цель</th><th>Проектов</th><th>Часы</th><th>Дни</th></tr></thead>
+        <tbody>
+        {% for block in result.curriculum_plan.blocks %}
+            <tr>
+                <td><strong>{{ block.title }}</strong></td>
+                <td class="small">{{ block.goal }}</td>
+                <td>{{ block.project_count }}</td>
+                <td>{{ block.total_hours }}</td>
+                <td>{{ block.total_days }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endif %}
+{% if result.curriculum_plan.rows %}
+<section class="table-wrap">
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>№</th>
+                <th>Блок</th>
+                <th>Название проекта</th>
+                <th>Образовательные результаты</th>
+                <th>Навыки</th>
+                <th>Инструменты</th>
+                <th>Часы</th>
+                <th>Дни</th>
+                <th>XP</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for row in result.curriculum_plan.rows %}
+            <tr>
+                <td>{{ row.row_number }}</td>
+                <td>{% if row.block_title %}<strong>{{ row.block_title }}</strong>{% else %}<span class="small muted">тот же блок</span>{% endif %}</td>
+                <td>
+                    <strong>{{ row.project_name }}</strong>
+                    <div class="small muted">{{ row.project_summary }}</div>
+                </td>
+                <td class="small">{{ row.learning_outcomes }}</td>
+                <td>{{ row.skills_list }}</td>
+                <td>{{ row.required_tools or "—" }}</td>
+                <td>{{ row.effort_hours }}</td>
+                <td>{{ row.effort_days }}</td>
+                <td>{{ row.xp }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endif %}
+{% if result.curriculum_plan.report and result.curriculum_plan.report.order_violations %}
+<section class="filter-panel">
+    <div class="small"><strong>Проверка порядка:</strong> найдены нарушения topological order.</div>
+    <div class="small muted">{{ result.curriculum_plan.report.order_violations|join(", ") }}</div>
+</section>
+{% endif %}
+{% endif %}
+
 {% if result.meta %}
 <section class="chips-row">
     <div class="summary-card"><div class="summary-label">Режим</div><div class="summary-value">{{ 'LIVE' if result.meta.use_live else 'MOCK' }}</div></div>
@@ -392,7 +619,7 @@
     <div class="small">
         Записано в каталог: бриф #{{ result.brief_id }}, evidence {{ result.persisted.evidence_source }},
         предложений {{ result.persisted.skill_suggestion }}, рёбер {{ result.persisted.skill_prerequisite }},
-        edge-review {{ result.persisted.prerequisite_reviews }}.
+        edge-review {{ result.persisted.prerequisite_reviews }}, строк УП {{ result.persisted.curriculum_plan_rows or 0 }}.
         Открытых записей в очереди проверки: <strong>{{ result.persisted.review_open }}</strong> →
         <a href="/reviews">открыть очередь проверки</a>.
     </div>
@@ -401,15 +628,22 @@
 <script>
 (() => {
     const intakeForm = document.getElementById("intake-form");
-    const pickerButton = document.getElementById("native-picker-btn");
+    const dropzone = document.getElementById("brief-dropzone");
+    const fileInput = document.getElementById("brief-file-input");
     const pathInput = document.getElementById("brief-file-path");
     const briefText = document.getElementById("brief-text");
+    const briefSubmitWrap = document.getElementById("brief-submit-wrap");
     const statusNode = document.getElementById("picker-status");
     const jobStageNode = document.getElementById("job-stage");
     const jobProgressNode = document.getElementById("job-progress");
     const jobStatusNode = document.querySelector(".hero .status-badge");
+    const jobProgressFillNode = document.getElementById("job-progress-fill");
+    const jobProgressPercentNode = document.getElementById("job-progress-percent");
+    const jobProgressStepNodes = Array.from(document.querySelectorAll(".intake-progress-step"));
     const currentJobId = {{ job.id|tojson if job else "null" }};
     const currentJobStatus = {{ job.status|tojson if job else 'null' }};
+    const currentJobStage = {{ job.current_stage|tojson if job else 'null' }};
+    const intakeProgressSteps = {{ intake_progress_steps|tojson }};
     const dagPayload = {{ result.dag|tojson if result and result.dag else "null" }};
     const dagShell = document.getElementById("dag-graph-shell");
     const dagSvg = document.getElementById("dag-edges-layer");
@@ -421,36 +655,126 @@
     const dagExportPngButton = document.getElementById("dag-export-png");
     const dagExportPdfButton = document.getElementById("dag-export-pdf");
 
-    if (!intakeForm || !pickerButton || !pathInput || !briefText || !statusNode) {
+    if (!intakeForm || !dropzone || !fileInput || !pathInput || !briefText || !statusNode) {
         return;
     }
 
-    pickerButton.addEventListener("click", async () => {
-        pickerButton.disabled = true;
-        const originalText = pickerButton.textContent;
-        pickerButton.textContent = "Открываю диалог...";
-        statusNode.textContent = "Ожидается выбор файла в системном окне Windows.";
+    const syncTextSubmitVisibility = () => {
+        if (!briefSubmitWrap) {
+            return;
+        }
+        briefSubmitWrap.hidden = !briefText.value.trim();
+    };
 
-        try {
-            const response = await fetch("/intake/pick-file", { method: "POST" });
-            const payload = await response.json();
-            if (payload.ok && payload.path) {
-                pathInput.value = payload.path;
-                statusNode.textContent = `Выбран файл: ${payload.name}`;
-                return;
-            }
-            if (payload.cancelled) {
-                statusNode.textContent = "Выбор файла отменён.";
-                return;
-            }
-            statusNode.textContent = payload.error || "Не удалось получить путь к файлу.";
-        } catch (_error) {
-            statusNode.textContent = "Не удалось открыть системный диалог. Вставь путь к файлу вручную в поле выше.";
-        } finally {
-            pickerButton.disabled = false;
-            pickerButton.textContent = originalText;
+    const detailedStageOrder = [
+        "queued",
+        "starting",
+        "decompose",
+        "search",
+        "synthesize",
+        "atomize",
+        "normalize",
+        "resolve",
+        "council",
+        "triage",
+        "prerequisites",
+        "persist",
+        "completed",
+    ];
+    const detailedStageRank = new Map(detailedStageOrder.map((stage, index) => [stage, index]));
+    const visibleStageRank = new Map(intakeProgressSteps.map((step) => [step.code, detailedStageRank.get(step.code) ?? 0]));
+
+    const renderJobProgress = (stage, status) => {
+        if (!jobProgressFillNode || !jobProgressPercentNode || !jobProgressStepNodes.length) {
+            return;
+        }
+        let normalizedStage = stage || "queued";
+        if (status === "succeeded") {
+            normalizedStage = "completed";
+        } else if (status === "failed" && !detailedStageRank.has(normalizedStage)) {
+            normalizedStage = "persist";
+        }
+        const currentRank = detailedStageRank.get(normalizedStage) ?? 0;
+        const maxRank = detailedStageOrder.length - 1;
+        const percent = Math.max(4, Math.min(100, Math.round((currentRank / maxRank) * 100)));
+        jobProgressFillNode.style.width = `${percent}%`;
+        jobProgressPercentNode.textContent = `${percent}%`;
+        jobProgressFillNode.classList.toggle("failed", status === "failed");
+        jobProgressStepNodes.forEach((node) => {
+            const stepRank = visibleStageRank.get(node.dataset.stage || "") ?? 0;
+            node.classList.toggle("done", currentRank > stepRank || status === "succeeded");
+            node.classList.toggle("active", currentRank === stepRank && status !== "succeeded");
+            node.classList.toggle("failed", status === "failed" && currentRank <= stepRank);
+        });
+    };
+
+    const submitFileSelection = (files) => {
+        const file = files?.[0];
+        if (!file) {
+            return;
+        }
+        const transfer = new DataTransfer();
+        transfer.items.add(file);
+        fileInput.files = transfer.files;
+        pathInput.value = "";
+        briefText.value = "";
+        syncTextSubmitVisibility();
+        statusNode.textContent = `Загружаю: ${file.name}`;
+        intakeForm.requestSubmit();
+    };
+
+    dropzone.addEventListener("click", () => {
+        fileInput.click();
+    });
+
+    dropzone.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            fileInput.click();
         }
     });
+
+    ["dragenter", "dragover"].forEach((eventName) => {
+        dropzone.addEventListener(eventName, (event) => {
+            event.preventDefault();
+            dropzone.classList.add("dragover");
+        });
+    });
+
+    ["dragleave", "dragend"].forEach((eventName) => {
+        dropzone.addEventListener(eventName, () => {
+            dropzone.classList.remove("dragover");
+        });
+    });
+
+    dropzone.addEventListener("drop", (event) => {
+        event.preventDefault();
+        dropzone.classList.remove("dragover");
+        submitFileSelection(event.dataTransfer?.files);
+    });
+
+    fileInput.addEventListener("change", () => {
+        submitFileSelection(fileInput.files);
+    });
+
+    briefText.addEventListener("input", () => {
+        if (!fileInput.files || fileInput.files.length === 0) {
+            pathInput.value = "";
+            statusNode.textContent = "Файл пока не выбран.";
+        }
+        syncTextSubmitVisibility();
+    });
+
+    intakeForm.addEventListener("submit", () => {
+        const hasSelectedFile = Boolean(fileInput.files && fileInput.files.length > 0);
+        if (!hasSelectedFile && briefText.value.trim()) {
+            pathInput.value = "";
+            statusNode.textContent = "Обрабатываю текстовый бриф.";
+        }
+    });
+
+    syncTextSubmitVisibility();
+    renderJobProgress(currentJobStage, currentJobStatus);
 
     if (currentJobId && jobStageNode && jobProgressNode) {
         const poll = async () => {
@@ -459,6 +783,7 @@
                 const payload = await response.json();
                 jobStageNode.textContent = payload.current_stage_label || payload.current_stage || "Не указан";
                 jobProgressNode.textContent = payload.progress_note || "Задача выполняется.";
+                renderJobProgress(payload.current_stage, payload.status);
                 if (jobStatusNode && payload.status_label) {
                     jobStatusNode.textContent = payload.status_label;
                     jobStatusNode.classList.toggle("warn", payload.status === "failed");

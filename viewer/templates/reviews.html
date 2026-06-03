@@ -9,24 +9,19 @@
 
 <section class="chips-row">
     {% for item in status_totals %}
+    {% if item.status == 'open' %}
     <div class="summary-card {% if item.status != 'open' %}summary-card-soft{% endif %}">
         <div class="summary-label">Статус: {{ item.status_label }}</div>
         <div class="summary-value">{{ item.cnt }}</div>
     </div>
+    {% endif %}
     {% endfor %}
 </section>
 
 <section class="filter-panel">
     <form class="filter-form" method="get" action="/reviews">
-        <label>
-            <span>Статус</span>
-            <select name="status">
-                <option value="open" {% if status_filter == "open" %}selected{% endif %}>Открыто</option>
-                <option value="resolved" {% if status_filter == "resolved" %}selected{% endif %}>Решено</option>
-                <option value="ignored" {% if status_filter == "ignored" %}selected{% endif %}>Пропущено</option>
-                <option value="all" {% if status_filter == "all" %}selected{% endif %}>Все</option>
-            </select>
-        </label>
+        <input type="hidden" name="status" value="open">
+        <div class="filter-note">На странице показываются только открытые вопросы. Решённые и пропущенные кейсы скрываются после обработки.</div>
         <label>
             <span>Критичность</span>
             <select name="severity">
@@ -80,38 +75,39 @@
 </section>
 {% endif %}
 
-<section class="table-wrap">
+<section class="review-list">
     {% if items %}
-    <table class="data-table">
-        <thead>
-            <tr>
-                <th>Критичность</th>
-                <th>Статус</th>
-                <th>Объект</th>
-                <th>Причина</th>
-                <th>Источник</th>
-                <th>Что нужно проверить</th>
-                <th>Решение</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for item in items %}
-            <tr>
-                <td><span class="status-badge {% if item.severity != 'info' %}warn{% endif %}">{{ item.severity_label }}</span></td>
-                <td><span class="pill ghost">{{ item.status_label }}</span></td>
-                <td>
+    {% for item in items %}
+    <article class="review-card">
+        <div class="review-card-header">
+            <span class="status-badge {% if item.severity != 'info' %}warn{% endif %}">{{ item.severity_label }}</span>
+            <span class="pill ghost">{{ item.status_label }}</span>
+        </div>
+        <div class="review-card-grid">
+            <div class="review-card-block">
+                <div class="review-card-label">Объект</div>
+                <div class="review-card-value">
                     <strong>{{ item.entity_type }}</strong>
                     {% if item.entity_id %}
                     <div class="small muted">id {{ item.entity_id }}</div>
                     {% endif %}
-                </td>
-                <td>
+                </div>
+            </div>
+            <div class="review-card-block">
+                <div class="review-card-label">Причина</div>
+                <div class="review-card-value">
                     <div>{{ item.reason_label }}</div>
                     <div class="small muted"><code>{{ item.reason_code }}</code></div>
-                </td>
-                <td><code>{{ item.source_ref }}</code></td>
-                <td>
-                    <div>{{ item.details }}</div>
+                </div>
+            </div>
+            <div class="review-card-block review-card-block-wide">
+                <div class="review-card-label">Источник</div>
+                <div class="review-card-value"><code>{{ item.source_ref }}</code></div>
+            </div>
+            <div class="review-card-block review-card-block-full">
+                <div class="review-card-label">Что нужно проверить</div>
+                <div class="review-details-body">{{ item.details }}</div>
+                <div class="review-card-meta">
                     <div class="small muted">Создано: {{ item.created_at }}</div>
                     {% if item.reviewed_at %}
                     <div class="small muted">Проверено: {{ item.reviewed_at }}</div>
@@ -119,25 +115,25 @@
                     {% if item.resolution_note %}
                     <div class="small"><strong>Комментарий:</strong> {{ item.resolution_note }}</div>
                     {% endif %}
-                </td>
-                <td class="decision-cell">
-                    <form class="review-form" method="post" action="/reviews">
-                        <input type="hidden" name="review_id" value="{{ item.id }}">
-                        <input type="hidden" name="status" value="{{ status_filter }}">
-                        <input type="hidden" name="severity" value="{{ severity_filter }}">
-                        <input type="hidden" name="reason" value="{{ reason_filter }}">
-                        <textarea name="resolution_note" rows="3" placeholder="Коротко: что решили и почему">{{ item.resolution_note or "" }}</textarea>
-                        <div class="review-actions">
-                            <button type="submit" name="new_status" value="resolved" class="action-btn action-btn-primary">Подтвердить решение</button>
-                            <button type="submit" name="new_status" value="ignored" class="action-btn">Отклонить</button>
-                            <button type="submit" name="new_status" value="open" class="action-btn action-btn-light">Вернуть в очередь</button>
-                        </div>
-                    </form>
-                </td>
-            </tr>
-            {% endfor %}
-        </tbody>
-    </table>
+                </div>
+            </div>
+        </div>
+        <div class="decision-cell">
+            <form class="review-form" method="post" action="/reviews">
+                <input type="hidden" name="review_id" value="{{ item.id }}">
+                <input type="hidden" name="status" value="{{ status_filter }}">
+                <input type="hidden" name="severity" value="{{ severity_filter }}">
+                <input type="hidden" name="reason" value="{{ reason_filter }}">
+                <textarea name="resolution_note" rows="3" placeholder="Коротко: что решили и почему">{{ item.resolution_note or "" }}</textarea>
+                <div class="review-actions">
+                    <button type="submit" name="new_status" value="resolved" class="action-btn action-btn-primary">Подтвердить решение</button>
+                    <button type="submit" name="new_status" value="ignored" class="action-btn">Отклонить</button>
+                    <button type="submit" name="new_status" value="open" class="action-btn action-btn-light">Вернуть в очередь</button>
+                </div>
+            </form>
+        </div>
+    </article>
+    {% endfor %}
     {% else %}
     <div class="empty-state">По текущему фильтру в очереди проверки больше нет записей.</div>
     {% endif %}

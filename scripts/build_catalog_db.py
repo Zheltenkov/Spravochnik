@@ -24,6 +24,10 @@ SKIP_SHEETS = {
     "лист10",
 }
 
+EXCLUDED_WORKBOOK_PATTERNS = (
+    "шаблон компетентностного профиля",
+)
+
 LEVEL_HINTS = (
     "junior",
     "middle",
@@ -106,6 +110,11 @@ def workbook_paths(root: Path) -> list[Path]:
         if ".__" in path.name or path.name.startswith("._"):
             continue
         if "__MACOSX" in path.parts:
+            continue
+        normalized_name = normalize_key(path.name).replace("_", " ").replace("/", " ")
+        if any(pattern in normalized_name for pattern in EXCLUDED_WORKBOOK_PATTERNS):
+            continue
+        if "ux" in normalized_name and "ui" in normalized_name and "дизайнер" in normalized_name:
             continue
         files.append(path)
     return sorted(files)

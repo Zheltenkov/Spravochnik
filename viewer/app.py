@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 import csv
 import io
 import json
+from math import isfinite
 import mimetypes
 import sqlite3
 import subprocess
@@ -38,6 +40,8 @@ POWERSHELL_EXE = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
 TARGET_SCHEMA_READY: set[str] = set()
 INTAKE_SCHEMA_READY: set[str] = set()
 INTAKE_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="intake")
+ACTIVE_INTAKE_JOB_IDS: set[int] = set()
+INTAKE_STALE_TIMEOUT_SECONDS = 180
 
 COMPLEXITY_OPTIONS = [
     ("", "Не указано"),
@@ -67,9 +71,11 @@ REVIEW_REASON_LABELS = {
     "low_confidence": "Низкая уверенность модели",
     "single_source": "Недостаточно подтверждающих источников",
     "council_split": "Модели не согласились между собой",
+    "auto_accept_policy": "Автопринято по policy: уверенность >= 0.95 и согласие жюри = 1.00",
     "composite_decomposed": "Кандидат разбит на атомарные части",
     "non_skill:competency_block": "Это блок программы, а не skill",
     "non_skill:curriculum_section": "Это учебный раздел, а не skill",
+    "program_brief_publication_guardrail": "Новый skill из program brief требует методологического подтверждения",
     "needs_review": "Нужна методологическая проверка",
     "cycle_broken": "Цикл в графе был разорван",
     "redundant_transitive": "Ребро признано транзитивно избыточным",
@@ -102,14 +108,27 @@ INTAKE_STAGE_LABELS = {
     "search": "Поиск evidence",
     "synthesize": "Синтез навыков",
     "atomize": "Атомизация кандидатов",
+    "normalize": "Нормализация и дедупликация",
     "resolve": "Резолв против каталога",
     "council": "Экспертное жюри",
     "triage": "Финальный триаж",
     "prerequisites": "Пререквизиты",
     "persist": "Запись в БД",
+    "plan": "Черновик УП",
     "completed": "Завершено",
     "failed": "Ошибка",
 }
+INTAKE_PROGRESS_STEPS = [
+    {"code": "queued", "label": "Очередь"},
+    {"code": "decompose", "label": "Декомпозиция"},
+    {"code": "search", "label": "Поиск"},
+    {"code": "normalize", "label": "Нормализация"},
+    {"code": "resolve", "label": "Резолв"},
+    {"code": "council", "label": "Council"},
+    {"code": "persist", "label": "Запись"},
+    {"code": "plan", "label": "УП"},
+    {"code": "completed", "label": "Готово"},
+]
 
 
 def normalize_search_text(value: object | None) -> str:
@@ -271,17 +290,80 @@ def ensure_runtime_schema(conn: sqlite3.Connection) -> None:
 
 def ensure_intake_runtime_schema(conn: sqlite3.Connection, db_path: Path) -> None:
     resolved = str(db_path.resolve())
-    if resolved in INTAKE_SCHEMA_READY and table_exists(conn, "profile_brief"):
-        return
-    from spravochnik_intake.pipeline import storage as intake_storage
+    schema_ready = (
+        table_exists(conn, "profile_brief")
+        and table_exists(conn, "curriculum_plan")
+        and table_exists(conn, "curriculum_plan_row")
+        and column_exists(conn, "skill_suggestion", "coverage_area")
+        and column_exists(conn, "skill_suggestion", "indicators_json")
+    )
+    if resolved not in INTAKE_SCHEMA_READY or not schema_ready:
+        from spravochnik_intake.pipeline import storage as intake_storage
 
-    intake_storage.apply_migration(conn, str(INTAKE_SCHEMA_SQL))
-    repair_intake_review_links(conn)
-    INTAKE_SCHEMA_READY.add(resolved)
+        intake_storage.apply_migration(conn, str(INTAKE_SCHEMA_SQL))
+        repair_intake_review_links(conn)
+        INTAKE_SCHEMA_READY.add(resolved)
+    repair_stale_intake_jobs(conn)
 
 
 def utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def parse_iso_datetime(value: object | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+
+def repair_stale_intake_jobs(conn: sqlite3.Connection, stale_after_seconds: int = INTAKE_STALE_TIMEOUT_SECONDS) -> int:
+    if not table_exists(conn, "intake_job"):
+        return 0
+
+    now = datetime.now(UTC)
+    rows = conn.execute(
+        """
+        SELECT id, status, current_stage, updated_at, started_at
+        FROM intake_job
+        WHERE status IN ('pending', 'running')
+        """
+    ).fetchall()
+
+    stale_ids: list[int] = []
+    for row in rows:
+        job_id = int(row["id"])
+        if job_id in ACTIVE_INTAKE_JOB_IDS:
+            continue
+        pivot = parse_iso_datetime(row["updated_at"]) or parse_iso_datetime(row["started_at"])
+        if pivot is None:
+            stale_ids.append(job_id)
+            continue
+        age_seconds = (now - pivot).total_seconds()
+        if age_seconds >= stale_after_seconds:
+            stale_ids.append(job_id)
+
+    if not stale_ids:
+        return 0
+
+    finished_at = utc_now_iso()
+    conn.executemany(
+        """
+        UPDATE intake_job
+        SET status = 'failed',
+            current_stage = 'failed',
+            progress_note = 'Обработка была прервана: активный worker не найден.',
+            error_text = 'Фоновая задача была потеряна после перезапуска приложения или сбоя worker-процесса.',
+            updated_at = ?,
+            finished_at = ?
+        WHERE id = ?
+        """,
+        [(finished_at, finished_at, job_id) for job_id in stale_ids],
+    )
+    conn.commit()
+    return len(stale_ids)
 
 
 def create_intake_job(
@@ -565,6 +647,50 @@ def update_jobs_dag_payload(
     conn.commit()
 
 
+def build_deferred_curriculum_plan_payload(message: str, audience_level: str = "Начальный") -> dict[str, object]:
+    return {
+        "status": "deferred",
+        "message": message,
+        "title": "Черновик учебного плана",
+        "audience_level": audience_level,
+        "source_policy": "accepted_only",
+        "summary": {"blocks": 0, "projects": 0, "total_hours": 0, "total_days": 0, "total_xp": 0},
+        "rows": [],
+        "blocks": [],
+        "csv_primary_header": [],
+        "csv_secondary_header": [],
+        "report": {"coverage_ok": False, "order_violations": []},
+    }
+
+
+def update_jobs_curriculum_plan_payload(
+    conn: sqlite3.Connection,
+    brief_id: int,
+    plan_payload: dict[str, object],
+    persisted_update: dict[str, object] | None = None,
+) -> None:
+    rows = conn.execute(
+        """
+        SELECT id, result_payload
+        FROM intake_job
+        WHERE status = 'succeeded'
+          AND json_valid(result_payload)
+          AND json_extract(result_payload, '$.brief_id') = ?
+        """,
+        (brief_id,),
+    ).fetchall()
+    for row in rows:
+        payload = json.loads(row["result_payload"])
+        payload["curriculum_plan"] = plan_payload
+        if persisted_update and isinstance(payload.get("persisted"), dict):
+            payload["persisted"].update(persisted_update)
+        conn.execute(
+            "UPDATE intake_job SET result_payload = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(payload, ensure_ascii=False), utc_now_iso(), row["id"]),
+        )
+    conn.commit()
+
+
 def clear_brief_dag_artifacts(conn: sqlite3.Connection, brief_id: int) -> None:
     if table_exists(conn, "skill_prerequisite") and column_exists(conn, "skill_prerequisite", "brief_id"):
         conn.execute("DELETE FROM skill_prerequisite WHERE brief_id = ?", (brief_id,))
@@ -581,6 +707,20 @@ def clear_brief_dag_artifacts(conn: sqlite3.Connection, brief_id: int) -> None:
     conn.commit()
 
 
+def clear_brief_curriculum_plan_artifacts(conn: sqlite3.Connection, brief_id: int) -> None:
+    if table_exists(conn, "curriculum_plan_row"):
+        conn.execute(
+            """
+            DELETE FROM curriculum_plan_row
+            WHERE plan_id IN (SELECT id FROM curriculum_plan WHERE brief_id = ?)
+            """,
+            (brief_id,),
+        )
+    if table_exists(conn, "curriculum_plan"):
+        conn.execute("DELETE FROM curriculum_plan WHERE brief_id = ?", (brief_id,))
+    conn.commit()
+
+
 def refresh_brief_dag_state(
     conn: sqlite3.Connection,
     brief_id: int,
@@ -591,10 +731,10 @@ def refresh_brief_dag_state(
     state = get_brief_dag_state(conn, brief_id)
     if message is None:
         if state["accepted_atomic_count"]:
-            message = "Граф неактуален после изменений в review. Перестройте DAG по принятым навыкам."
+            message = "Граф будет пересчитан по текущему набору принятых атомарных навыков."
             status = "stale" if state["prerequisite_count"] else status
         else:
-            message = "Граф пока не строится: нет принятых атомарных навыков."
+            message = "Граф пока пуст: нет принятых атомарных навыков."
     dag_payload = build_deferred_dag_payload(state, status=status, message=message)
     update_jobs_dag_payload(
         conn,
@@ -609,6 +749,192 @@ def refresh_brief_dag_state(
     return state
 
 
+def hydrate_job_result_payload(conn: sqlite3.Connection, result: dict[str, object] | None) -> dict[str, object] | None:
+    if not isinstance(result, dict):
+        return result
+    brief_id = result.get("brief_id")
+    if not isinstance(brief_id, int) or not isinstance(result.get("candidates"), list):
+        return result
+    from spravochnik_intake.pipeline import config as intake_config
+
+    suggestion_rows = conn.execute(
+        """
+        SELECT id, suggested_name, group_name, entity_type, atomicity, decision, confidence, council_agreement, resolution
+        FROM skill_suggestion
+        WHERE brief_id = ?
+        ORDER BY id
+        """,
+        (brief_id,),
+    ).fetchall()
+    rows_by_key: dict[tuple[str, str, str, str], list[sqlite3.Row]] = defaultdict(list)
+    id_to_row: dict[int, sqlite3.Row] = {}
+    for row in suggestion_rows:
+        key = (
+            str(row["suggested_name"] or ""),
+            str(row["group_name"] or ""),
+            str(row["entity_type"] or ""),
+            str(row["atomicity"] or ""),
+        )
+        rows_by_key[key].append(row)
+        id_to_row[int(row["id"])] = row
+
+    review_status_by_entity: dict[int, str] = {}
+    for row in conn.execute(
+        """
+        SELECT entity_id, status
+        FROM review_queue
+        WHERE source_ref = ?
+          AND entity_id IS NOT NULL
+        ORDER BY id
+        """,
+        (f"brief:{brief_id}",),
+    ):
+        review_status_by_entity[int(row["entity_id"])] = str(row["status"])
+
+    coverage_by_name: dict[str, str] = {}
+    if isinstance(result.get("coverage"), dict):
+        for row in result["coverage"].get("rows", []):
+            if not isinstance(row, dict):
+                continue
+            area = str(row.get("area") or "").strip()
+            if not area:
+                continue
+            for candidate_name in row.get("candidate_names") or []:
+                name = str(candidate_name or "").strip()
+                if name:
+                    coverage_by_name[name] = area
+
+    for candidate in result["candidates"]:
+        if not isinstance(candidate, dict):
+            continue
+        suggestion_id = candidate.get("suggestion_id")
+        row = id_to_row.get(int(suggestion_id)) if isinstance(suggestion_id, int) else None
+        if row is None:
+            key = (
+                str(candidate.get("name") or ""),
+                str(candidate.get("group") or ""),
+                str(candidate.get("entity_type") or ""),
+                str(candidate.get("atomicity") or ""),
+            )
+            row_list = rows_by_key.get(key)
+            row = row_list.pop(0) if row_list else None
+        if row is None:
+            continue
+        suggestion_id = int(row["id"])
+        candidate["suggestion_id"] = suggestion_id
+        candidate["decision"] = str(row["decision"] or candidate.get("decision") or "pending")
+        confidence_value = float(row["confidence"]) if row["confidence"] is not None else None
+        council_agreement_value = float(row["council_agreement"]) if row["council_agreement"] is not None else None
+        candidate["confidence"] = f"{confidence_value:.2f}" if confidence_value is not None else "—"
+        candidate["council_agreement"] = f"{council_agreement_value:.2f}" if council_agreement_value is not None else None
+        candidate["resolution"] = row["resolution"] or candidate.get("resolution")
+        default_review_status = (
+            "resolved"
+            if candidate["decision"] == "accepted"
+            else ("ignored" if candidate["decision"] == "rejected" else "open")
+        )
+        candidate["review_status"] = review_status_by_entity.get(suggestion_id, default_review_status)
+        candidate["can_review_inline"] = candidate.get("entity_type") == "skill" and candidate.get("atomicity") == "atomic"
+        if not candidate.get("coverage_area"):
+            parent_name = str(candidate.get("parent_name") or "").strip()
+            own_name = str(candidate.get("name") or "").strip()
+            candidate["coverage_area"] = coverage_by_name.get(parent_name) or coverage_by_name.get(own_name)
+        if (
+            candidate["decision"] == "accepted"
+            and confidence_value is not None
+            and confidence_value >= intake_config.AUTO_ACCEPT_CONFIDENCE
+            and council_agreement_value is not None
+            and council_agreement_value >= intake_config.AUTO_ACCEPT_COUNCIL_AGREEMENT
+        ):
+            candidate["reasons"] = review_reason_label("auto_accept_policy")
+
+    if isinstance(result.get("council_metrics"), dict):
+        candidates = [item for item in result["candidates"] if isinstance(item, dict)]
+        resolved_candidates = [
+            item
+            for item in candidates
+            if item.get("entity_type") == "skill" and item.get("atomicity") == "atomic"
+        ]
+        council_candidates = [item for item in resolved_candidates if item.get("council_agreement") not in {None, "", "—"}]
+        result["council_metrics"].update(
+            {
+                "sent_to_council": len(council_candidates),
+                "auto_accepted": len(
+                    [item for item in resolved_candidates if item.get("decision") == "accepted" and item.get("council_agreement") in {None, "", "—"}]
+                ),
+                "accepted_after_council": len(
+                    [item for item in council_candidates if item.get("decision") == "accepted"]
+                ),
+                "review_after_council": len(
+                    [item for item in council_candidates if item.get("decision") == "needs_review"]
+                ),
+                "needs_review_total": len([item for item in candidates if item.get("decision") == "needs_review"]),
+                "accepted_total": len([item for item in resolved_candidates if item.get("decision") == "accepted"]),
+                "matched_total": len([item for item in resolved_candidates if item.get("resolution") == "matched"]),
+                "alias_total": len([item for item in resolved_candidates if item.get("resolution") == "alias"]),
+                "fuzzy_total": len([item for item in resolved_candidates if item.get("resolution") == "fuzzy"]),
+                "new_total": len([item for item in resolved_candidates if item.get("resolution") == "new"]),
+            }
+        )
+
+    if not isinstance(result.get("curriculum_plan"), dict):
+        dag_payload = result.get("dag") if isinstance(result.get("dag"), dict) else None
+        result["curriculum_plan"] = build_curriculum_plan_for_brief(conn, brief_id, dag_payload=dag_payload)
+
+    if isinstance(result.get("persisted"), dict):
+        result["persisted"]["review_open"] = int(get_brief_dag_state(conn, brief_id)["open_review_count"])
+        result["persisted"]["curriculum_plan_rows"] = int(result.get("curriculum_plan", {}).get("row_count", 0) or 0)
+    return result
+
+
+def apply_candidate_decision(
+    conn: sqlite3.Connection,
+    suggestion_id: int,
+    target_decision: str,
+    resolution_note: str | None = None,
+) -> int | None:
+    row = conn.execute(
+        """
+        SELECT id, brief_id
+        FROM skill_suggestion
+        WHERE id = ?
+        """,
+        (suggestion_id,),
+    ).fetchone()
+    if not row:
+        return None
+
+    brief_id = int(row["brief_id"])
+    review_status_map = {
+        "accepted": "resolved",
+        "needs_review": "open",
+        "rejected": "ignored",
+    }
+    review_status = review_status_map.get(target_decision, "open")
+    now = utc_now_iso()
+    reviewed_at = None if review_status == "open" else now
+    conn.execute(
+        "UPDATE skill_suggestion SET decision = ? WHERE id = ?",
+        (target_decision, suggestion_id),
+    )
+    conn.execute(
+        """
+        UPDATE review_queue
+        SET status = ?,
+            resolution_note = COALESCE(?, resolution_note),
+            reviewed_at = ?,
+            updated_at = ?
+        WHERE source_ref = ?
+          AND entity_id = ?
+        """,
+        (review_status, resolution_note, reviewed_at, now, f"brief:{brief_id}", suggestion_id),
+    )
+    clear_brief_dag_artifacts(conn, brief_id)
+    conn.commit()
+    build_dag_for_brief(conn, brief_id)
+    return brief_id
+
+
 def load_accepted_skill_candidates(conn: sqlite3.Connection, brief_id: int):
     from spravochnik_intake.pipeline.models import IndicatorSpec, SkillCandidate
 
@@ -618,7 +944,9 @@ def load_accepted_skill_candidates(conn: sqlite3.Connection, brief_id: int):
             ss.id,
             ss.suggested_name,
             ss.group_name,
+            ss.coverage_area,
             ss.bloom,
+            ss.indicators_json,
             ss.tools,
             ss.evidence_ids,
             ss.resolution,
@@ -642,12 +970,29 @@ def load_accepted_skill_candidates(conn: sqlite3.Connection, brief_id: int):
         bloom_label = str(row["bloom"] or "remember").strip().casefold()
         if bloom_label not in bloom_fallback:
             bloom_label = "remember"
+        raw_indicators = json.loads(row["indicators_json"] or "[]")
+        indicators = []
+        for item in raw_indicators:
+            if not isinstance(item, dict):
+                continue
+            indicator_bloom = str(item.get("bloom") or bloom_label).strip().casefold()
+            if indicator_bloom not in bloom_fallback:
+                indicator_bloom = bloom_label
+            indicators.append(
+                IndicatorSpec(
+                    text=str(item.get("text") or row["suggested_name"]),
+                    bloom=indicator_bloom,
+                )
+            )
+        if not indicators:
+            indicators = [IndicatorSpec(text=row["suggested_name"], bloom=bloom_label)]
         tmp_id = f"S{row['id']}"
         candidate = SkillCandidate(
             tmp_id=tmp_id,
             name=row["suggested_name"],
             group=row["group_name"] or "Без группы",
-            indicators=[IndicatorSpec(text=row["suggested_name"], bloom=bloom_label)],
+            coverage_area=row["coverage_area"],
+            indicators=indicators,
             tools=json.loads(row["tools"] or "[]"),
             evidence_ids=[str(item) for item in json.loads(row["evidence_ids"] or "[]") if item is not None],
             confidence=float(row["confidence"] or 0.0),
@@ -663,17 +1008,70 @@ def load_accepted_skill_candidates(conn: sqlite3.Connection, brief_id: int):
     return cands, tmp_to_db
 
 
+def load_brief_spec_for_plan(conn: sqlite3.Connection, brief_id: int) -> dict[str, object]:
+    row = conn.execute(
+        "SELECT role, seniority, domain FROM profile_brief WHERE id = ?",
+        (brief_id,),
+    ).fetchone()
+    if not row:
+        return {}
+    return {
+        "role": row["role"],
+        "seniority": row["seniority"],
+        "domain": row["domain"],
+    }
+
+
+def build_curriculum_plan_for_brief(
+    conn: sqlite3.Connection,
+    brief_id: int,
+    candidates: list[object] | None = None,
+    dag_payload: dict[str, object] | None = None,
+) -> dict[str, object]:
+    from spravochnik_intake.pipeline import stage_dag_to_up, storage
+
+    clear_brief_curriculum_plan_artifacts(conn, brief_id)
+    accepted_candidates, _tmp_to_db = load_accepted_skill_candidates(conn, brief_id)
+    cands = accepted_candidates if candidates is None else candidates
+    effective_dag_payload = dag_payload or build_deferred_dag_payload(get_brief_dag_state(conn, brief_id), status="deferred", message="DAG не построен")
+    spec = load_brief_spec_for_plan(conn, brief_id)
+    plan_payload = stage_dag_to_up.run(spec, cands, effective_dag_payload)
+    save_meta = storage.save_curriculum_plan(conn, brief_id, plan_payload)
+    plan_payload["plan_id"] = save_meta["plan_id"]
+    plan_payload["row_count"] = save_meta["row_count"]
+    update_jobs_curriculum_plan_payload(
+        conn,
+        brief_id,
+        plan_payload,
+        persisted_update={"curriculum_plan_rows": save_meta["row_count"]},
+    )
+    return plan_payload
+
+
 def build_dag_for_brief(conn: sqlite3.Connection, brief_id: int) -> dict[str, object]:
     from spravochnik_intake.pipeline import stage_catalog_to_dag, storage
 
     clear_brief_dag_artifacts(conn, brief_id)
     cands, tmp_to_db = load_accepted_skill_candidates(conn, brief_id)
     if not cands:
+        clear_brief_curriculum_plan_artifacts(conn, brief_id)
+        plan_payload = build_deferred_curriculum_plan_payload(
+            "Черновик УП пока не строится: ещё нет принятых навыков с валидным DAG."
+        )
+        save_meta = storage.save_curriculum_plan(conn, brief_id, plan_payload)
+        plan_payload["plan_id"] = save_meta["plan_id"]
+        plan_payload["row_count"] = save_meta["row_count"]
         state = refresh_brief_dag_state(
             conn,
             brief_id,
             status="deferred",
-            message="Граф не построен: методолог ещё не подтвердил ни одного атомарного навыка.",
+            message="Граф пока пуст: ещё нет принятых атомарных навыков. Он построится автоматически после первого принятия.",
+        )
+        update_jobs_curriculum_plan_payload(
+            conn,
+            brief_id,
+            plan_payload,
+            persisted_update={"curriculum_plan_rows": 0},
         )
         return {
             "brief_id": brief_id,
@@ -681,18 +1079,20 @@ def build_dag_for_brief(conn: sqlite3.Connection, brief_id: int) -> dict[str, ob
             "dag": build_deferred_dag_payload(
                 state,
                 status="deferred",
-                message="Граф не построен: методолог ещё не подтвердил ни одного атомарного навыка.",
+                message="Граф пока пуст: ещё нет принятых атомарных навыков. Он построится автоматически после первого принятия.",
             ),
+            "curriculum_plan": plan_payload,
         }
 
     edges, dag, removed_cycle, removed_transitive, dag_payload = stage_catalog_to_dag.run(cands)
     prereq_count = storage.save_prerequisites(conn, brief_id, dag, cands, tmp_to_db)
     prereq_review_count = storage.save_prerequisite_reviews(conn, brief_id, dag_payload["edge_review_queue"])
     dag_payload["status"] = "built"
-    dag_payload["message"] = "Граф построен по подтверждённым атомарным навыкам."
+    dag_payload["message"] = "Граф построен по текущему набору принятых атомарных навыков и пересчитывается автоматически."
     dag_payload["accepted_atomic_candidates"] = len(cands)
     dag_payload["prerequisite_rows"] = prereq_count
     dag_payload["prerequisite_review_rows"] = prereq_review_count
+    plan_payload = build_curriculum_plan_for_brief(conn, brief_id, cands, dag_payload)
     update_jobs_dag_payload(
         conn,
         brief_id,
@@ -707,6 +1107,7 @@ def build_dag_for_brief(conn: sqlite3.Connection, brief_id: int) -> dict[str, ob
         "brief_id": brief_id,
         "state": get_brief_dag_state(conn, brief_id),
         "dag": dag_payload,
+        "curriculum_plan": plan_payload,
         "edges": len(edges),
         "removed_cycle": len(removed_cycle),
         "removed_transitive": len(removed_transitive),
@@ -861,20 +1262,35 @@ def load_brief_text_from_path(file_path_raw: str) -> tuple[str, str]:
     return extract_brief_text_from_bytes(data, suffix), file_path.name
 
 
+def normalize_existing_brief_file_path(file_path_raw: str | None) -> str:
+    if not file_path_raw:
+        return ""
+    file_path = Path(file_path_raw.strip().strip('"')).expanduser()
+    if not file_path.exists() or not file_path.is_file():
+        return ""
+    return str(file_path)
+
+
 def load_brief_text(
     form_data: dict[str, str],
     files: dict[str, UploadedFile],
 ) -> tuple[str, str | None, str, str | None]:
-    file_path_raw = form_data.get("brief_file_path", "").strip()
-    if file_path_raw:
-        brief_text, source_name = load_brief_text_from_path(file_path_raw)
-        return brief_text, source_name, "file", file_path_raw
-
     uploaded_file = files.get("brief_file")
     if uploaded_file:
         suffix = Path(uploaded_file.filename).suffix.casefold()
         brief_text = extract_brief_text_from_bytes(uploaded_file.data, suffix)
-        return brief_text, uploaded_file.filename, "file", uploaded_file.filename
+        return brief_text, uploaded_file.filename, "file", None
+
+    file_path_raw = form_data.get("brief_file_path", "").strip()
+    if file_path_raw:
+        try:
+            brief_text, source_name = load_brief_text_from_path(file_path_raw)
+            return brief_text, source_name, "file", file_path_raw
+        except ValueError:
+            brief_text = form_data.get("brief", "").strip()
+            if brief_text:
+                return brief_text, None, "text", None
+            raise
 
     brief_text = form_data.get("brief", "").strip()
     if brief_text:
@@ -889,7 +1305,7 @@ def run_intake_pipeline(
     brief_text: str,
     progress_callback: Callable[[str, str], None] | None = None,
 ) -> dict[str, object]:
-    from spravochnik_intake.pipeline import stage_brief_to_catalog, storage
+    from spravochnik_intake.pipeline import stage_brief_to_catalog, stage_normalize, storage
     from spravochnik_intake.pipeline import config as intake_config
     from spravochnik_intake.pipeline.catalog_repo import CatalogRepo
 
@@ -907,9 +1323,11 @@ def run_intake_pipeline(
         notify("search", "Сбор внешних evidence по подзапросам.")
         evidence = stage_brief_to_catalog.gather_evidence(spec["sub_queries"])
         notify("synthesize", "Синтез навыков-кандидатов и индикаторов по найденным evidence.")
-        raw_candidates = stage_brief_to_catalog.synthesize(evidence, spec)
+        raw_candidates, coverage = stage_brief_to_catalog.synthesize_with_coverage(evidence, spec)
         notify("atomize", "Проверка атомарности кандидатов, разбиение составных формулировок и реклассификация не-навыков.")
-        candidates = stage_brief_to_catalog.atomize_candidates(raw_candidates)
+        atomized_candidates = stage_brief_to_catalog.atomize_candidates(raw_candidates, spec)
+        notify("normalize", "Нормализация названий и безопасное схлопывание дублирующих atomic skills.")
+        candidates, normalize_report = stage_normalize.run(atomized_candidates, spec)
         notify("resolve", "Сопоставление навыков-кандидатов с текущим каталогом.")
         stage_brief_to_catalog.resolve_candidates(candidates, evidence, repo)
         council_metrics_preview = {
@@ -924,7 +1342,7 @@ def run_intake_pipeline(
         else:
             notify("council", "Council не потребовался: спорных навыков для panel нет.")
         notify("triage", "Финальный триаж: что принять автоматически, а что отправить на review.")
-        stage_brief_to_catalog.triage_candidates(candidates)
+        stage_brief_to_catalog.triage_candidates(candidates, spec)
         candidate_metrics = stage_brief_to_catalog.build_candidate_metrics(candidates)
     finally:
         repo.con.close()
@@ -932,20 +1350,16 @@ def run_intake_pipeline(
     notify("persist", "Запись результатов в каталог и очередь проверки.")
     brief_id = storage.save_brief(conn, brief_text, spec)
     evidence_map = storage.save_evidence(conn, brief_id, evidence)
-    storage.save_suggestions(conn, brief_id, candidates, evidence_map)
-    review_open = conn.execute(
-        "SELECT COUNT(*) FROM review_queue WHERE status = 'open' AND source_ref = ?",
-        (f"brief:{brief_id}",),
-    ).fetchone()[0]
+    tmp_to_db = storage.save_suggestions(conn, brief_id, candidates, evidence_map)
     by_tid = {candidate.tmp_id: candidate for candidate in candidates}
     atomize_events = []
-    for candidate in candidates:
+    for candidate in atomized_candidates:
         if candidate.atomicity == "composite":
             atomize_events.append(
                 {
                     "parent_name": candidate.name,
                     "verdict": "composite",
-                    "children": [child.name for child in candidates if child.parent_tmp_id == candidate.tmp_id],
+                    "children": [child.name for child in atomized_candidates if child.parent_tmp_id == candidate.tmp_id],
                     "rationale": candidate.atomize_rationale,
                 }
             )
@@ -960,15 +1374,11 @@ def run_intake_pipeline(
                 }
             )
 
-    dag_payload = build_deferred_dag_payload(
-        {
-            "accepted_atomic_count": candidate_metrics["accepted_total"],
-            "pending_atomic_count": candidate_metrics["atomic_skill_candidates"] - candidate_metrics["accepted_total"],
-            "open_review_count": review_open,
-        },
-        status="deferred",
-        message="Граф пререквизитов строится отдельным шагом после методологического подтверждения принятых атомарных навыков.",
-    )
+    notify("plan", "Сборка DAG и черновика учебного плана по принятым навыкам.")
+    dag_build_result = build_dag_for_brief(conn, brief_id)
+    dag_payload = dag_build_result["dag"]
+    dag_state = dag_build_result["state"]
+    curriculum_plan = dag_build_result.get("curriculum_plan", build_deferred_curriculum_plan_payload("Черновик УП пока не сформирован."))
 
     return {
         "brief_id": brief_id,
@@ -977,9 +1387,15 @@ def run_intake_pipeline(
             {
                 "name": candidate.name,
                 "group": candidate.group,
+                "coverage_area": candidate.coverage_area or (
+                    by_tid[candidate.parent_tmp_id].coverage_area
+                    if candidate.parent_tmp_id and candidate.parent_tmp_id in by_tid
+                    else None
+                ),
                 "bloom": candidate.bloom,
                 "entity_type": candidate.entity_type,
                 "atomicity": candidate.atomicity,
+                "suggestion_id": tmp_to_db.get(candidate.tmp_id),
                 "parent_tmp_id": candidate.parent_tmp_id,
                 "parent_name": by_tid[candidate.parent_tmp_id].name if candidate.parent_tmp_id and candidate.parent_tmp_id in by_tid else None,
                 "resolution": candidate.resolution,
@@ -987,6 +1403,8 @@ def run_intake_pipeline(
                 "confidence": f"{candidate.confidence:.2f}" if candidate.confidence else "—",
                 "council_agreement": None if candidate.council_agreement is None else f"{candidate.council_agreement:.2f}",
                 "decision": candidate.decision,
+                "review_status": "open" if candidate.decision == "needs_review" else ("resolved" if candidate.decision == "accepted" else "ignored"),
+                "can_review_inline": candidate.entity_type == "skill" and candidate.atomicity == "atomic",
                 "reasons": ", ".join(review_reason_label(reason) for reason in candidate.reasons) if candidate.reasons else "",
                 "tools": ", ".join(candidate.tools) if candidate.tools else "—",
             }
@@ -995,18 +1413,22 @@ def run_intake_pipeline(
         ],
         "atomize": {
             "raw_count": len(raw_candidates),
-            "atomic_count": len([candidate for candidate in candidates if candidate.atomicity == "atomic"]),
-            "composite_count": len([candidate for candidate in candidates if candidate.atomicity == "composite"]),
-            "non_skill_count": len([candidate for candidate in candidates if candidate.atomicity == "non_skill"]),
+            "atomic_count": len([candidate for candidate in atomized_candidates if candidate.atomicity == "atomic"]),
+            "composite_count": len([candidate for candidate in atomized_candidates if candidate.atomicity == "composite"]),
+            "non_skill_count": len([candidate for candidate in atomized_candidates if candidate.atomicity == "non_skill"]),
             "events": atomize_events,
         },
+        "normalize": normalize_report,
+        "coverage": coverage,
         "dag": dag_payload,
+        "curriculum_plan": curriculum_plan,
         "persisted": {
             "evidence_source": len(evidence),
             "skill_suggestion": len(candidates),
-            "skill_prerequisite": 0,
-            "prerequisite_reviews": 0,
-            "review_open": review_open,
+            "skill_prerequisite": int(dag_payload.get("prerequisite_rows", 0) or 0),
+            "prerequisite_reviews": int(dag_payload.get("prerequisite_review_rows", 0) or 0),
+            "curriculum_plan_rows": int(curriculum_plan.get("row_count", 0) or 0),
+            "review_open": int(dag_state["open_review_count"]),
         },
         "meta": {
             "use_live": intake_config.USE_LIVE,
@@ -1020,6 +1442,7 @@ def run_intake_pipeline(
 
 
 def execute_intake_job(db_path: Path, job_id: int) -> None:
+    ACTIVE_INTAKE_JOB_IDS.add(job_id)
     conn = open_db(db_path)
     try:
         ensure_intake_runtime_schema(conn, db_path)
@@ -1066,9 +1489,11 @@ def execute_intake_job(db_path: Path, job_id: int) -> None:
         )
     finally:
         conn.close()
+        ACTIVE_INTAKE_JOB_IDS.discard(job_id)
 
 
 def queue_intake_job(db_path: Path, job_id: int) -> None:
+    ACTIVE_INTAKE_JOB_IDS.add(job_id)
     INTAKE_EXECUTOR.submit(execute_intake_job, db_path, job_id)
 
 
@@ -1234,14 +1659,421 @@ def update_review_status(conn: sqlite3.Connection, review_id: int, new_status: s
             (mapped_decision, suggestion_id),
         )
         clear_brief_dag_artifacts(conn, brief_id)
-        refresh_brief_dag_state(conn, brief_id, status="deferred")
     conn.commit()
+    if brief_id is not None:
+        build_dag_for_brief(conn, brief_id)
 
 
 def slugify(value: str) -> str:
     lowered = value.casefold().replace("ё", "е")
     lowered = "-".join(part for part in "".join(ch if ch.isalnum() else "-" for ch in lowered).split("-") if part)
     return lowered or "item"
+
+
+def curriculum_plan_status_label(status: str | None) -> str:
+    mapping = {
+        "draft": "Черновик",
+        "built": "Собран",
+        "deferred": "Отложен",
+    }
+    return mapping.get((status or "").strip().casefold(), "Неизвестно")
+
+
+def curriculum_plan_to_csv_bytes(plan_payload: dict[str, object]) -> bytes:
+    buffer = io.StringIO(newline="")
+    writer = csv.writer(buffer)
+    primary_header = plan_payload.get("csv_primary_header") or []
+    secondary_header = plan_payload.get("csv_secondary_header") or []
+    if isinstance(primary_header, list) and primary_header:
+        writer.writerow(primary_header)
+    if isinstance(secondary_header, list) and secondary_header:
+        writer.writerow(secondary_header)
+    for row in plan_payload.get("rows", []):
+        if not isinstance(row, dict):
+            continue
+        writer.writerow(
+            [
+                row.get("block_title", ""),
+                row.get("block_goal", ""),
+                row.get("row_number", ""),
+                row.get("project_name", ""),
+                row.get("project_summary", ""),
+                row.get("learning_outcomes", ""),
+                row.get("skills_list", ""),
+                row.get("audience_level", ""),
+                row.get("required_tools", ""),
+                row.get("storytelling", ""),
+                row.get("delivery_format", ""),
+                row.get("group_size", ""),
+                row.get("effort_hours", ""),
+                row.get("effort_days", ""),
+                row.get("cumulative_days", ""),
+                row.get("xp", ""),
+                row.get("platform_project_name", ""),
+                row.get("artifact_links", ""),
+            ]
+        )
+    return buffer.getvalue().encode("utf-8-sig")
+
+
+def load_curriculum_plan_rows(conn: sqlite3.Connection, plan_id: int) -> list[dict[str, object]]:
+    if not table_exists(conn, "curriculum_plan_row"):
+        return []
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM curriculum_plan_row
+        WHERE plan_id = ?
+        ORDER BY row_number ASC, id ASC
+        """,
+        (plan_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def build_curriculum_plan_payload_from_rows(
+    plan_meta: dict[str, object],
+    rows: list[dict[str, object]],
+) -> dict[str, object]:
+    from spravochnik_intake.pipeline.stage_dag_to_up import CSV_PRIMARY_HEADER, CSV_SECONDARY_HEADER
+
+    payload = {}
+    if isinstance(plan_meta.get("payload_json"), str) and plan_meta.get("payload_json"):
+        try:
+            payload = json.loads(str(plan_meta["payload_json"]))
+        except json.JSONDecodeError:
+            payload = {}
+
+    total_hours = sum(float(row.get("effort_hours", 0) or 0) for row in rows)
+    total_days = sum(float(row.get("effort_days", 0) or 0) for row in rows)
+    total_xp = sum(int(row.get("xp", 0) or 0) for row in rows)
+
+    rows_by_block: dict[int, list[dict[str, object]]] = {}
+    for row in rows:
+        rows_by_block.setdefault(int(row.get("block_index", 0) or 0), []).append(row)
+
+    block_payloads: list[dict[str, object]] = []
+    for block_index in sorted(rows_by_block):
+        block_rows = sorted(rows_by_block[block_index], key=lambda item: (int(item.get("row_number", 0) or 0), int(item.get("id", 0) or 0)))
+        block_payloads.append(
+            {
+                "block_index": block_index,
+                "title": str(block_rows[0].get("block_title") or f"Блок {block_index or 1}"),
+                "goal": str(block_rows[0].get("block_goal") or ""),
+                "project_count": len(block_rows),
+                "total_hours": sum(float(item.get("effort_hours", 0) or 0) for item in block_rows),
+                "total_days": round(sum(float(item.get("effort_days", 0) or 0) for item in block_rows), 2),
+                "rows": block_rows,
+            }
+        )
+
+    status = str(plan_meta.get("status") or "draft")
+    if rows and status == "deferred":
+        status = "draft"
+    default_message = "Черновик УП доступен для ручной доработки." if rows else "Черновик УП пока не построен."
+    message = str(payload.get("message") or default_message)
+    if rows and "пока не стро" in message.casefold():
+        message = default_message
+
+    built_payload = {
+        "plan_id": int(plan_meta["id"]),
+        "status": status,
+        "status_label": curriculum_plan_status_label(status),
+        "message": message,
+        "title": str(plan_meta.get("title") or payload.get("title") or "Черновик учебного плана"),
+        "audience_level": str(plan_meta.get("audience_level") or payload.get("audience_level") or "Начальный"),
+        "source_policy": str(plan_meta.get("source_policy") or payload.get("source_policy") or "accepted_only"),
+        "summary": {
+            "blocks": len(block_payloads),
+            "projects": len(rows),
+            "total_hours": int(total_hours) if isfinite(total_hours) else 0,
+            "total_days": round(total_days, 2) if isfinite(total_days) else 0.0,
+            "total_xp": int(total_xp),
+        },
+        "rows": rows,
+        "row_count": len(rows),
+        "blocks": block_payloads,
+        "csv_primary_header": payload.get("csv_primary_header") or CSV_PRIMARY_HEADER,
+        "csv_secondary_header": payload.get("csv_secondary_header") or CSV_SECONDARY_HEADER,
+        "report": payload.get("report") if isinstance(payload.get("report"), dict) else {"coverage_ok": False, "order_violations": []},
+    }
+    return built_payload
+
+
+def get_curriculum_plan(conn: sqlite3.Connection, plan_id: int) -> dict[str, object] | None:
+    if not table_exists(conn, "curriculum_plan"):
+        return None
+    row = conn.execute(
+        """
+        SELECT
+            cp.*,
+            pb.role AS brief_role,
+            pb.seniority AS brief_seniority,
+            pb.domain AS brief_domain,
+            (
+                SELECT ij.id
+                FROM intake_job ij
+                WHERE ij.status = 'succeeded'
+                  AND json_valid(ij.result_payload)
+                  AND json_extract(ij.result_payload, '$.brief_id') = cp.brief_id
+                ORDER BY ij.created_at DESC
+                LIMIT 1
+            ) AS latest_job_id
+        FROM curriculum_plan cp
+        LEFT JOIN profile_brief pb ON pb.id = cp.brief_id
+        WHERE cp.id = ?
+        """,
+        (plan_id,),
+    ).fetchone()
+    if not row:
+        return None
+    plan_meta = dict(row)
+    row_records = load_curriculum_plan_rows(conn, plan_id)
+    plan_payload = build_curriculum_plan_payload_from_rows(plan_meta, row_records)
+    plan_payload.update(
+        {
+            "id": int(plan_meta["id"]),
+            "brief_id": plan_meta.get("brief_id"),
+            "updated_at": plan_meta.get("updated_at"),
+            "created_at": plan_meta.get("created_at"),
+            "latest_job_id": plan_meta.get("latest_job_id"),
+            "brief_role": plan_meta.get("brief_role"),
+            "brief_seniority": plan_meta.get("brief_seniority"),
+            "brief_domain": plan_meta.get("brief_domain"),
+        }
+    )
+    return plan_payload
+
+
+def list_curriculum_plans(conn: sqlite3.Connection, limit: int = 50) -> list[dict[str, object]]:
+    if not table_exists(conn, "curriculum_plan"):
+        return []
+    rows = conn.execute(
+        """
+        SELECT
+            cp.id,
+            cp.brief_id,
+            cp.status,
+            cp.title,
+            cp.audience_level,
+            cp.total_blocks,
+            cp.total_projects,
+            cp.total_hours,
+            cp.total_days,
+            cp.total_xp,
+            cp.updated_at,
+            pb.role AS brief_role,
+            pb.domain AS brief_domain,
+            (
+                SELECT ij.id
+                FROM intake_job ij
+                WHERE ij.status = 'succeeded'
+                  AND json_valid(ij.result_payload)
+                  AND json_extract(ij.result_payload, '$.brief_id') = cp.brief_id
+                ORDER BY ij.created_at DESC
+                LIMIT 1
+            ) AS latest_job_id
+        FROM curriculum_plan cp
+        LEFT JOIN profile_brief pb ON pb.id = cp.brief_id
+        ORDER BY cp.updated_at DESC, cp.id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    items: list[dict[str, object]] = []
+    for row in rows:
+        item = dict(row)
+        item["status_label"] = curriculum_plan_status_label(str(item.get("status")))
+        items.append(item)
+    return items
+
+
+def sync_curriculum_plan_payload(conn: sqlite3.Connection, plan_id: int) -> dict[str, object] | None:
+    plan_payload = get_curriculum_plan(conn, plan_id)
+    if not plan_payload:
+        return None
+    summary = plan_payload.get("summary") if isinstance(plan_payload.get("summary"), dict) else {}
+    conn.execute(
+        """
+        UPDATE curriculum_plan
+        SET status = ?,
+            title = ?,
+            audience_level = ?,
+            total_blocks = ?,
+            total_projects = ?,
+            total_hours = ?,
+            total_days = ?,
+            total_xp = ?,
+            payload_json = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (
+            str(plan_payload.get("status") or "draft"),
+            plan_payload.get("title"),
+            plan_payload.get("audience_level"),
+            int(summary.get("blocks", 0) or 0),
+            int(summary.get("projects", 0) or 0),
+            float(summary.get("total_hours", 0) or 0),
+            float(summary.get("total_days", 0) or 0),
+            int(summary.get("total_xp", 0) or 0),
+            json.dumps(plan_payload, ensure_ascii=False),
+            plan_id,
+        ),
+    )
+    conn.commit()
+    brief_id = plan_payload.get("brief_id")
+    if isinstance(brief_id, int):
+        update_jobs_curriculum_plan_payload(
+            conn,
+            brief_id,
+            plan_payload,
+            persisted_update={"curriculum_plan_rows": int(plan_payload.get("row_count", 0) or 0)},
+        )
+    return get_curriculum_plan(conn, plan_id)
+
+
+def create_curriculum_plan_row(conn: sqlite3.Connection, plan_id: int) -> int:
+    plan = get_curriculum_plan(conn, plan_id)
+    if not plan:
+        raise ValueError("Curriculum plan not found")
+    existing_rows = plan.get("rows") if isinstance(plan.get("rows"), list) else []
+    next_row_number = max((int(row.get("row_number", 0) or 0) for row in existing_rows), default=0) + 1
+    next_block_index = max((int(row.get("block_index", 0) or 0) for row in existing_rows), default=0) or 1
+    next_project_index = max((int(row.get("project_index_in_block", 0) or 0) for row in existing_rows if int(row.get("block_index", 0) or 0) == next_block_index), default=0) + 1
+    cur = conn.execute(
+        """
+        INSERT INTO curriculum_plan_row(
+            plan_id, block_index, row_number, project_index_in_block, block_title, block_goal,
+            project_name, project_summary, learning_outcomes, skills_list, audience_level,
+            required_tools, storytelling, delivery_format, group_size, effort_hours, effort_days,
+            cumulative_days, xp, platform_project_name, artifact_links
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            plan_id,
+            next_block_index,
+            next_row_number,
+            next_project_index,
+            f"Блок {next_block_index}",
+            "",
+            f"Новый проект {next_row_number}",
+            "",
+            "",
+            "",
+            plan.get("audience_level", "Начальный"),
+            "",
+            "",
+            "индивидуальный",
+            "",
+            0.0,
+            0.0,
+            0.0,
+            0,
+            f"UP_{next_block_index}_{next_project_index}_{slugify(f'Новый проект {next_row_number}')}",
+            "",
+        ),
+    )
+    conn.commit()
+    sync_curriculum_plan_payload(conn, plan_id)
+    return int(cur.lastrowid)
+
+
+def get_curriculum_plan_row(conn: sqlite3.Connection, plan_id: int, row_id: int) -> dict[str, object] | None:
+    if not table_exists(conn, "curriculum_plan_row"):
+        return None
+    row = conn.execute(
+        "SELECT * FROM curriculum_plan_row WHERE id = ? AND plan_id = ?",
+        (row_id, plan_id),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def parse_optional_float(value: str | None) -> float | None:
+    if value is None:
+        return None
+    cleaned = value.strip().replace(",", ".")
+    if not cleaned:
+        return None
+    return float(cleaned)
+
+
+def parse_optional_int(value: str | None) -> int | None:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    return int(cleaned)
+
+
+def update_curriculum_plan_row(conn: sqlite3.Connection, plan_id: int, row_id: int, form_data: dict[str, str]) -> dict[str, object]:
+    row = get_curriculum_plan_row(conn, plan_id, row_id)
+    if not row:
+        raise ValueError("Curriculum plan row not found")
+    conn.execute(
+        """
+        UPDATE curriculum_plan_row
+        SET block_index = ?,
+            row_number = ?,
+            project_index_in_block = ?,
+            block_title = ?,
+            block_goal = ?,
+            project_name = ?,
+            project_summary = ?,
+            learning_outcomes = ?,
+            skills_list = ?,
+            audience_level = ?,
+            required_tools = ?,
+            storytelling = ?,
+            delivery_format = ?,
+            group_size = ?,
+            effort_hours = ?,
+            effort_days = ?,
+            cumulative_days = ?,
+            xp = ?,
+            platform_project_name = ?,
+            artifact_links = ?
+        WHERE id = ? AND plan_id = ?
+        """,
+        (
+            parse_optional_int(form_data.get("block_index")) or 1,
+            parse_optional_int(form_data.get("row_number")) or 1,
+            parse_optional_int(form_data.get("project_index_in_block")) or 1,
+            form_data.get("block_title", "").strip(),
+            form_data.get("block_goal", "").strip(),
+            form_data.get("project_name", "").strip(),
+            form_data.get("project_summary", "").strip(),
+            form_data.get("learning_outcomes", "").strip(),
+            form_data.get("skills_list", "").strip(),
+            form_data.get("audience_level", "").strip(),
+            form_data.get("required_tools", "").strip(),
+            form_data.get("storytelling", "").strip(),
+            form_data.get("delivery_format", "").strip(),
+            form_data.get("group_size", "").strip(),
+            parse_optional_float(form_data.get("effort_hours")) or 0.0,
+            parse_optional_float(form_data.get("effort_days")) or 0.0,
+            parse_optional_float(form_data.get("cumulative_days")) or 0.0,
+            parse_optional_int(form_data.get("xp")) or 0,
+            form_data.get("platform_project_name", "").strip(),
+            form_data.get("artifact_links", "").strip(),
+            row_id,
+            plan_id,
+        ),
+    )
+    conn.commit()
+    sync_curriculum_plan_payload(conn, plan_id)
+    updated_row = get_curriculum_plan_row(conn, plan_id, row_id)
+    if not updated_row:
+        raise ValueError("Curriculum plan row not found after update")
+    return updated_row
+
+
+def delete_curriculum_plan_row(conn: sqlite3.Connection, plan_id: int, row_id: int) -> None:
+    conn.execute("DELETE FROM curriculum_plan_row WHERE id = ? AND plan_id = ?", (row_id, plan_id))
+    conn.commit()
+    sync_curriculum_plan_payload(conn, plan_id)
 
 
 def list_target_groups(conn: sqlite3.Connection) -> list[dict[str, object]]:
@@ -2519,8 +3351,10 @@ def create_app(db_path: Path, summary_path: Path, target_db_path: Path):
                 {"label": "Архив", "href": "/catalog-admin/archive"},
                 {"label": "Проверка", "href": "/reviews"},
                 {"label": "Бриф", "href": "/intake"},
+                {"label": "УП", "href": "/up"},
             ],
             "complexity_options": COMPLEXITY_OPTIONS,
+            "intake_progress_steps": INTAKE_PROGRESS_STEPS,
             "summary": summary,
             "request_path": context.get("request_path", "/"),
         }
@@ -2805,7 +3639,10 @@ def create_app(db_path: Path, summary_path: Path, target_db_path: Path):
 
                 update_review_status(conn, review_id, new_status, form_data.get("resolution_note", ""))
                 redirect_parts = []
-                for key in ("status", "severity", "reason"):
+                redirect_status = "open" if new_status in {"resolved", "ignored"} else form_data.get("status", "open")
+                if redirect_status:
+                    redirect_parts.append(f"status={redirect_status}")
+                for key in ("severity", "reason"):
                     value = form_data.get(key, "")
                     if value:
                         redirect_parts.append(f"{key}={value}")
@@ -2934,6 +3771,108 @@ def create_app(db_path: Path, summary_path: Path, target_db_path: Path):
                 )
                 return html_response(start_response, html)
 
+            if path == "/up" and method == "GET":
+                ensure_intake_runtime_schema(conn, db_path)
+                html = render(
+                    "up_index.html",
+                    {
+                        "title": "Учебные планы",
+                        "plans": list_curriculum_plans(conn),
+                        "request_path": path,
+                    },
+                )
+                return html_response(start_response, html)
+
+            if path.startswith("/up/plans/"):
+                ensure_intake_runtime_schema(conn, db_path)
+                segments = [part for part in path.strip("/").split("/") if part]
+                if len(segments) >= 3:
+                    try:
+                        plan_id = int(segments[2])
+                    except ValueError:
+                        return not_found(start_response, "Invalid curriculum plan id")
+                else:
+                    return not_found(start_response)
+
+                if len(segments) == 4 and segments[3] == "csv" and method == "GET":
+                    plan_payload = get_curriculum_plan(conn, plan_id)
+                    if not plan_payload:
+                        return not_found(start_response, "Curriculum plan not found")
+                    filename = f"curriculum_plan_{plan_id}.csv"
+                    return response(
+                        start_response,
+                        curriculum_plan_to_csv_bytes(plan_payload),
+                        content_type="text/csv; charset=utf-8",
+                        headers=[("Content-Disposition", f'attachment; filename="{filename}"')],
+                    )
+
+                if len(segments) == 5 and segments[3] == "rows" and segments[4] == "new" and method == "POST":
+                    plan_payload = get_curriculum_plan(conn, plan_id)
+                    if not plan_payload:
+                        return not_found(start_response, "Curriculum plan not found")
+                    row_id = create_curriculum_plan_row(conn, plan_id)
+                    return redirect_response(start_response, f"/up/plans/{plan_id}/rows/{row_id}")
+
+                if len(segments) == 5 and segments[3] == "rows":
+                    try:
+                        row_id = int(segments[4])
+                    except ValueError:
+                        return not_found(start_response, "Invalid curriculum plan row id")
+                    plan_payload = get_curriculum_plan(conn, plan_id)
+                    row_payload = get_curriculum_plan_row(conn, plan_id, row_id)
+                    if not plan_payload or not row_payload:
+                        return not_found(start_response, "Curriculum plan row not found")
+                    if method == "GET":
+                        html = render(
+                            "up_row_edit.html",
+                            {
+                                "title": f"Редактирование строки УП #{row_id}",
+                                "plan": plan_payload,
+                                "row": row_payload,
+                                "request_path": "/up",
+                            },
+                        )
+                        return html_response(start_response, html)
+                    if method == "POST":
+                        form_data = parse_post_data(environ)
+                        try:
+                            update_curriculum_plan_row(conn, plan_id, row_id, form_data)
+                        except ValueError as exc:
+                            html = render(
+                                "up_row_edit.html",
+                                {
+                                    "title": f"Редактирование строки УП #{row_id}",
+                                    "plan": get_curriculum_plan(conn, plan_id),
+                                    "row": {**row_payload, **form_data},
+                                    "form_error": str(exc),
+                                    "request_path": "/up",
+                                },
+                            )
+                            return html_response(start_response, html, status="400 Bad Request")
+                        return redirect_response(start_response, f"/up/plans/{plan_id}")
+
+                if len(segments) == 6 and segments[3] == "rows" and segments[5] == "delete" and method == "POST":
+                    try:
+                        row_id = int(segments[4])
+                    except ValueError:
+                        return not_found(start_response, "Invalid curriculum plan row id")
+                    delete_curriculum_plan_row(conn, plan_id, row_id)
+                    return redirect_response(start_response, f"/up/plans/{plan_id}")
+
+                if len(segments) == 3 and method == "GET":
+                    plan_payload = get_curriculum_plan(conn, plan_id)
+                    if not plan_payload:
+                        return not_found(start_response, "Curriculum plan not found")
+                    html = render(
+                        "up_detail.html",
+                        {
+                            "title": f"УП #{plan_id}",
+                            "plan": plan_payload,
+                            "request_path": path,
+                        },
+                    )
+                    return html_response(start_response, html)
+
             if path == "/intake" and method == "POST":
                 form_data, files = parse_post_form_and_files(environ)
                 try:
@@ -2944,7 +3883,7 @@ def create_app(db_path: Path, summary_path: Path, target_db_path: Path):
                         {
                             "title": "Бриф",
                             "brief": form_data.get("brief", ""),
-                            "brief_file_path": form_data.get("brief_file_path", ""),
+                            "brief_file_path": normalize_existing_brief_file_path(form_data.get("brief_file_path", "")),
                             "job": None,
                             "recent_jobs": list_recent_intake_jobs(conn),
                             "result": None,
@@ -2961,7 +3900,7 @@ def create_app(db_path: Path, summary_path: Path, target_db_path: Path):
                         {
                             "title": "Бриф",
                             "brief": "",
-                            "brief_file_path": form_data.get("brief_file_path", ""),
+                            "brief_file_path": normalize_existing_brief_file_path(form_data.get("brief_file_path", "")),
                             "job": None,
                             "recent_jobs": list_recent_intake_jobs(conn),
                             "result": None,
@@ -3024,6 +3963,59 @@ def create_app(db_path: Path, summary_path: Path, target_db_path: Path):
                 latest_job_id = build_result["state"].get("latest_job_id") or job_id
                 return redirect_response(start_response, f"/intake/jobs/{latest_job_id}")
 
+            if path.startswith("/intake/jobs/") and path.endswith("/candidate-decision") and method == "POST":
+                try:
+                    job_id = int(path.removeprefix("/intake/jobs/").removesuffix("/candidate-decision"))
+                except ValueError:
+                    return not_found(start_response)
+                ensure_intake_runtime_schema(conn, db_path)
+                form_data = parse_post_data(environ)
+                try:
+                    suggestion_id = int(form_data.get("suggestion_id", "0"))
+                except ValueError:
+                    return not_found(start_response, "Invalid suggestion id")
+                action = form_data.get("candidate_action", "")
+                if action not in {"accept", "reject", "review"}:
+                    return not_found(start_response, "Invalid candidate action")
+                target_decision = "needs_review"
+                resolution_note = "Возвращено на review из intake-таблицы."
+                if action == "accept":
+                    target_decision = "accepted"
+                    resolution_note = "Подтверждено из intake-таблицы."
+                elif action == "reject":
+                    target_decision = "rejected"
+                    resolution_note = "Отклонено из intake-таблицы."
+                apply_candidate_decision(
+                    conn,
+                    suggestion_id,
+                    target_decision,
+                    resolution_note,
+                )
+                return redirect_response(start_response, f"/intake/jobs/{job_id}")
+
+            if path.startswith("/intake/jobs/") and path.endswith("/plan.csv") and method == "GET":
+                try:
+                    job_id = int(path.removeprefix("/intake/jobs/").removesuffix("/plan.csv"))
+                except ValueError:
+                    return not_found(start_response)
+                ensure_intake_runtime_schema(conn, db_path)
+                job = get_intake_job(conn, job_id)
+                if not job:
+                    return not_found(start_response, "Intake job not found")
+                result_payload = job.get("result_payload")
+                if not isinstance(result_payload, dict):
+                    return not_found(start_response, "Curriculum plan not found")
+                plan_payload = result_payload.get("curriculum_plan")
+                if not isinstance(plan_payload, dict) or not plan_payload.get("rows"):
+                    return not_found(start_response, "Curriculum plan rows not found")
+                filename = f"curriculum_plan_brief_{result_payload.get('brief_id', job_id)}.csv"
+                return response(
+                    start_response,
+                    curriculum_plan_to_csv_bytes(plan_payload),
+                    content_type="text/csv; charset=utf-8",
+                    headers=[("Content-Disposition", f'attachment; filename="{filename}"')],
+                )
+
             if path.startswith("/intake/jobs/") and method == "GET":
                 try:
                     job_id = int(path.removeprefix("/intake/jobs/"))
@@ -3036,6 +4028,7 @@ def create_app(db_path: Path, summary_path: Path, target_db_path: Path):
                     return not_found(start_response, "Intake job not found")
 
                 result = job.get("result_payload") if job.get("status") == "succeeded" else None
+                result = hydrate_job_result_payload(conn, result)
                 dag_build_state = None
                 if isinstance(result, dict) and isinstance(result.get("brief_id"), int):
                     dag_build_state = get_brief_dag_state(conn, int(result["brief_id"]))
@@ -3044,7 +4037,7 @@ def create_app(db_path: Path, summary_path: Path, target_db_path: Path):
                     {
                         "title": f"Бриф #{job_id}",
                         "brief": job.get("brief_text", ""),
-                        "brief_file_path": job.get("file_path", "") or "",
+                        "brief_file_path": normalize_existing_brief_file_path(job.get("file_path", "")),
                         "job": job,
                         "recent_jobs": list_recent_intake_jobs(conn),
                         "result": result,

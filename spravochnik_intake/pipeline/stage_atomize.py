@@ -136,10 +136,36 @@ def _call_mock(cand: SkillCandidate) -> dict[str, object]:
     return {"verdict": "atomic", "rationale": "по эвристике признаков композитности нет"}
 
 
+def _rule_based_split(cand: SkillCandidate, reason: str) -> dict[str, object] | None:
+    # Очевидные композиции лучше разбирать детерминированно, без лишнего LLM-вызова на каждый кандидат.
+    if reason not in {"conjunction", "commas_in_name"}:
+        return None
+    parts = re.split(r"\s+\+\s+|\s+и\s+|,\s*", cand.name)
+    parts = [part.strip(" -–—") for part in parts if part and part.strip(" -–—")]
+    if len(parts) < 2:
+        return None
+    # Если хотя бы одна часть слишком короткая, это обычно перечисление объекта, а не набор самостоятельных skills.
+    if any(len(part.split()) < 2 for part in parts):
+        return None
+    return {
+        "verdict": "composite",
+        "rationale": f"rule-based split: {reason}",
+        "split_into": [
+            {
+                "name": part,
+                "indicators": [{"text": f"Демонстрирует навык: {part.lower()}", "bloom": "apply"}],
+            }
+            for part in parts
+        ],
+    }
+
+
 def atomize_one(cand: SkillCandidate) -> dict[str, object]:
-    suspicious, _reason = prefilter(cand.name)
+    suspicious, reason = prefilter(cand.name)
     if not suspicious:
         return {"verdict": "atomic", "rationale": "rule-prefilter: признаков композитности нет"}
+    if decision := _rule_based_split(cand, reason):
+        return decision
     return _call_live(cand) if config.USE_LIVE else _call_mock(cand)
 
 
@@ -148,6 +174,7 @@ def _child(parent: SkillCandidate, index: int, item: dict[str, object]) -> Skill
         tmp_id=f"{parent.tmp_id}.{index}",
         name=str(item["name"]),
         group=parent.group,
+        coverage_area=parent.coverage_area,
         indicators=[IndicatorSpec(**indicator) for indicator in item.get("indicators", [])],
         tools=list(item.get("tools", parent.tools)),
         evidence_ids=list(parent.evidence_ids),
@@ -161,6 +188,9 @@ def run(cands: list[SkillCandidate]) -> list[SkillCandidate]:
     """Атомизирует список кандидатов, сохраняя parent для provenance."""
     out: list[SkillCandidate] = []
     for cand in cands:
+        if cand.atomicity == "non_skill" and cand.entity_type != "skill" and cand.decision == "needs_review":
+            out.append(cand)
+            continue
         decision = atomize_one(cand)
         verdict = str(decision.get("verdict", "atomic"))
         cand.atomize_rationale = str(decision.get("rationale", ""))

@@ -27,6 +27,7 @@ class SkillCandidate(BaseModel):
     tmp_id: str
     name: str
     group: str
+    coverage_area: Optional[str] = None
     indicators: list[IndicatorSpec]
     tools: list[str] = Field(default_factory=list)
     evidence_ids: list[str] = Field(default_factory=list)
@@ -45,7 +46,7 @@ class SkillCandidate(BaseModel):
     # жюри/триаж:
     council_agreement: Optional[float] = None
     council_ran: bool = False
-    decision: Optional[Literal["accepted", "needs_review", "superseded"]] = None
+    decision: Optional[Literal["accepted", "needs_review", "rejected", "superseded"]] = None
     reasons: list[str] = Field(default_factory=list)
 
     @property

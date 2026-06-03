@@ -18,8 +18,8 @@
         </nav>
     </header>
 
-    <main class="page-shell">
-        <aside class="summary-panel">
+    <main class="page-shell{% if request_path.startswith('/intake') or request_path.startswith('/up') %} page-shell-intake{% endif %}">
+        <aside class="summary-panel{% if request_path.startswith('/intake') or request_path.startswith('/up') %} summary-panel-intake{% endif %}">
             <div class="summary-card">
                 <div class="summary-label">Профили</div>
                 <div class="summary-value">{{ summary.counts.profiles if summary and summary.counts else "?" }}</div>
@@ -42,7 +42,7 @@
             </div>
         </aside>
 
-        <section class="content-panel">
+        <section class="content-panel{% if request_path.startswith('/intake') or request_path.startswith('/up') %} content-panel-intake{% endif %}">
             {% block content %}{% endblock %}
         </section>
     </main>

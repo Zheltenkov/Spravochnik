@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+    <div>
+        <h1>{{ plan.title }}</h1>
+        <p>{{ plan.message }}</p>
+        <div class="small muted">
+            plan #{{ plan.id }} · brief #{{ plan.brief_id }}{% if plan.updated_at %} · обновлено {{ plan.updated_at }}{% endif %}
+        </div>
+    </div>
+    <div class="review-actions">
+        <span class="status-badge{% if plan.status == 'deferred' %} warn{% endif %}">{{ plan.status_label }}</span>
+        {% if plan.latest_job_id %}
+        <a class="action-btn action-btn-secondary" href="/intake/jobs/{{ plan.latest_job_id }}">Открыть бриф</a>
+        {% endif %}
+        {% if plan.row_count %}
+        <a class="action-btn action-btn-primary" href="/up/plans/{{ plan.id }}/csv">Скачать CSV</a>
+        {% endif %}
+        <form method="post" action="/up/plans/{{ plan.id }}/rows/new">
+            <button type="submit" class="action-btn">Добавить строку</button>
+        </form>
+    </div>
+</section>
+
+<section class="chips-row">
+    <div class="summary-card"><div class="summary-label">Роль</div><div class="summary-value">{{ plan.brief_role or "—" }}</div></div>
+    <div class="summary-card"><div class="summary-label">Уровень</div><div class="summary-value">{{ plan.audience_level or "—" }}</div></div>
+    <div class="summary-card"><div class="summary-label">Блоков</div><div class="summary-value">{{ plan.summary.blocks }}</div></div>
+    <div class="summary-card"><div class="summary-label">Проектов</div><div class="summary-value">{{ plan.summary.projects }}</div></div>
+    <div class="summary-card"><div class="summary-label">Часы</div><div class="summary-value">{{ plan.summary.total_hours }}</div></div>
+    <div class="summary-card"><div class="summary-label">Дни</div><div class="summary-value">{{ plan.summary.total_days }}</div></div>
+    <div class="summary-card"><div class="summary-label">XP</div><div class="summary-value">{{ plan.summary.total_xp }}</div></div>
+</section>
+
+{% if not plan.row_count %}
+<section class="filter-panel">
+    <div class="small">
+        УП пока не заполнен. Это нормально для `deferred`-состояния: либо ещё нет принятых skills, либо план нужно начать вручную.
+        Можно сразу добавить первую строку и редактировать её в формате шаблона.
+    </div>
+</section>
+{% endif %}
+
+<section class="table-wrap table-wrap-scroll">
+    <table class="data-table data-table-wide up-csv-table">
+        <thead>
+            <tr class="up-header-row">
+                {% for head in plan.csv_primary_header %}
+                <th>{{ head or " " }}</th>
+                {% endfor %}
+                <th>Действия</th>
+            </tr>
+            <tr class="up-subhead-row">
+                {% for head in plan.csv_secondary_header %}
+                <th>{{ head or " " }}</th>
+                {% endfor %}
+                <th>Редактирование</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% if plan.rows %}
+            {% for row in plan.rows %}
+            <tr>
+                <td>{{ row.block_title or "—" }}</td>
+                <td class="small">{{ row.block_goal or "—" }}</td>
+                <td>{{ row.row_number }}</td>
+                <td>
+                    <strong>{{ row.project_name }}</strong>
+                    {% if row.project_summary %}
+                    <div class="small muted">{{ row.project_summary }}</div>
+                    {% endif %}
+                </td>
+                <td class="small">{{ row.learning_outcomes or "—" }}</td>
+                <td class="small">{{ row.skills_list or "—" }}</td>
+                <td>{{ row.audience_level or "—" }}</td>
+                <td class="small">{{ row.required_tools or "—" }}</td>
+                <td class="small">{{ row.storytelling or "—" }}</td>
+                <td>{{ row.delivery_format or "—" }}</td>
+                <td>{{ row.group_size or "—" }}</td>
+                <td>{{ row.effort_hours or "—" }}</td>
+                <td>{{ row.effort_days or "—" }}</td>
+                <td>{{ row.cumulative_days or "—" }}</td>
+                <td>{{ row.xp or "—" }}</td>
+                <td>{{ row.platform_project_name or "—" }}</td>
+                <td class="small">{{ row.artifact_links or "—" }}</td>
+                <td class="up-actions-cell">
+                    <div class="review-actions">
+                        <a class="action-btn action-btn-secondary" href="/up/plans/{{ plan.id }}/rows/{{ row.id }}">Редактировать</a>
+                        <form method="post" action="/up/plans/{{ plan.id }}/rows/{{ row.id }}/delete" onsubmit="return confirm('Удалить строку УП?');">
+                            <button type="submit" class="action-btn action-btn-danger">Удалить</button>
+                        </form>
+                    </div>
+                </td>
+            </tr>
+            {% endfor %}
+        {% else %}
+            <tr>
+                <td colspan="{{ plan.csv_primary_header|length + 1 }}" class="small muted">
+                    Таблица пока пустая. Нажмите `Добавить строку`, чтобы открыть редактирование первой записи.
+                </td>
+            </tr>
+        {% endif %}
+        </tbody>
+    </table>
+</section>
+{% endblock %}

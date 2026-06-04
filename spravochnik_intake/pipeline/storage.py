@@ -1,7 +1,10 @@
 """Персистентность: применяет миграцию недостающих таблиц и пишет результаты."""
 from __future__ import annotations
 import json
+import re
 import sqlite3
+import unicodedata
+from datetime import UTC, datetime
 from pathlib import Path
 from .models import Evidence, PrereqEdge, SkillCandidate
 
@@ -19,6 +22,12 @@ _REQUIRED_COLS = {
         ("src_suggestion_id", "INTEGER"),
         ("dst_suggestion_id", "INTEGER"),
     ],
+    "curriculum_plan_row": [
+        ("outcomes_know", "TEXT"),
+        ("outcomes_can", "TEXT"),
+        ("outcomes_skills", "TEXT"),
+        ("materials", "TEXT"),
+    ],
 }
 
 _REVIEW_QUEUE_ENTITY_TYPE_MAP = {
@@ -30,6 +39,13 @@ _REVIEW_QUEUE_ENTITY_TYPE_MAP = {
 
 def _existing_cols(con: sqlite3.Connection, table: str) -> set[str]:
     return {row[1] for row in con.execute(f"PRAGMA table_info({table})")}
+
+
+def _table_exists(con: sqlite3.Connection, table: str) -> bool:
+    return con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone() is not None
 
 
 def _supports_superseded(con: sqlite3.Connection) -> bool:
@@ -56,6 +72,367 @@ def apply_migration(con: sqlite3.Connection, sql_path: str) -> None:
     if _existing_cols(con, "review_queue"):
         con.execute("CREATE INDEX IF NOT EXISTS idx_review_queue_source_ref ON review_queue(source_ref, status)")
     con.commit()
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _normalize_catalog_key(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value).lower().strip()
+    normalized = re.sub(r"[^0-9a-zа-яё+ ]", " ", normalized)
+    return re.sub(r"\s+", " ", normalized)
+
+
+def _slug_catalog_key(value: str) -> str:
+    normalized = _normalize_catalog_key(value)
+    slug = "-".join(part for part in normalized.split() if part)
+    return slug or "item"
+
+
+def _ensure_skill_group(con: sqlite3.Connection, group_name: str | None) -> int | None:
+    if not _table_exists(con, "skill_group"):
+        return None
+    name = (group_name or "Прочие навыки").strip() or "Прочие навыки"
+    code = f"group-{_slug_catalog_key(name)}"
+    row = con.execute(
+        "SELECT id FROM skill_group WHERE code = ? OR name = ? ORDER BY id LIMIT 1",
+        (code, name),
+    ).fetchone()
+    if row:
+        return int(row["id"])
+    max_order = con.execute("SELECT COALESCE(MAX(sort_order), 0) FROM skill_group").fetchone()[0] or 0
+    cursor = con.execute(
+        """
+        INSERT INTO skill_group(code, name, sort_order, status, source, updated_at)
+        VALUES (?, ?, ?, 'active', 'derived', ?)
+        """,
+        (code, name, int(max_order) + 10, _utc_now_iso()),
+    )
+    return int(cursor.lastrowid)
+
+
+def _load_skill_suggestion_row(con: sqlite3.Connection, suggestion_id: int) -> sqlite3.Row | None:
+    return con.execute(
+        """
+        SELECT id, brief_id, suggested_name, group_name, coverage_area, resolution, canonical_skill_id, decision, entity_type, atomicity
+        FROM skill_suggestion
+        WHERE id = ?
+        """,
+        (suggestion_id,),
+    ).fetchone()
+
+
+def _find_skill_by_id(con: sqlite3.Connection, skill_id: int) -> sqlite3.Row | None:
+    return con.execute(
+        "SELECT id, normalized_name, canonical_name, skill_type, status FROM skill WHERE id = ?",
+        (skill_id,),
+    ).fetchone()
+
+
+def _find_skill_by_normalized_name(con: sqlite3.Connection, normalized_name: str) -> sqlite3.Row | None:
+    return con.execute(
+        "SELECT id, normalized_name, canonical_name, skill_type, status FROM skill WHERE normalized_name = ?",
+        (normalized_name,),
+    ).fetchone()
+
+
+def _ensure_skill_alias(con: sqlite3.Connection, skill_id: int, alias: str, source: str) -> bool:
+    normalized_alias = _normalize_catalog_key(alias)
+    exists = con.execute(
+        "SELECT 1 FROM skill_alias WHERE skill_id = ? AND normalized_alias = ?",
+        (skill_id, normalized_alias),
+    ).fetchone()
+    if exists:
+        return False
+    con.execute(
+        """
+        INSERT INTO skill_alias(skill_id, alias, normalized_alias, source)
+        VALUES (?, ?, ?, ?)
+        """,
+        (skill_id, alias.strip(), normalized_alias, source),
+    )
+    return True
+
+
+def _existing_promotion(con: sqlite3.Connection, suggestion_id: int) -> sqlite3.Row | None:
+    if "skill_promotion_log" not in {row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}:
+        return None
+    return con.execute(
+        """
+        SELECT id, suggestion_id, skill_id, alias, normalized_alias, created_skill, created_alias, status
+        FROM skill_promotion_log
+        WHERE suggestion_id = ?
+        """,
+        (suggestion_id,),
+    ).fetchone()
+
+
+def promote_suggestion_to_catalog(con: sqlite3.Connection, suggestion_id: int) -> dict[str, object]:
+    row = _load_skill_suggestion_row(con, suggestion_id)
+    if not row:
+        return {"status": "missing_suggestion", "suggestion_id": suggestion_id}
+    if row["entity_type"] != "skill" or row["atomicity"] != "atomic":
+        return {"status": "skipped_non_atomic", "suggestion_id": suggestion_id}
+    if row["decision"] != "accepted":
+        return {"status": "skipped_not_accepted", "suggestion_id": suggestion_id}
+
+    existing_promotion = _existing_promotion(con, suggestion_id)
+    normalized_name = _normalize_catalog_key(str(row["suggested_name"] or ""))
+    if not normalized_name:
+        return {"status": "skipped_empty_name", "suggestion_id": suggestion_id}
+
+    skill_cols = _existing_cols(con, "skill")
+    group_id = _ensure_skill_group(con, row["group_name"] or row["coverage_area"])
+    skill_row = None
+    created_skill = False
+    if row["canonical_skill_id"] is not None:
+        skill_row = _find_skill_by_id(con, int(row["canonical_skill_id"]))
+    if skill_row is None:
+        skill_row = _find_skill_by_normalized_name(con, normalized_name)
+    if skill_row is None:
+        columns = ["normalized_name", "canonical_name", "skill_type", "status"]
+        values: list[object] = [normalized_name, str(row["suggested_name"]).strip(), "unknown", "active"]
+        if "group_id" in skill_cols and group_id is not None:
+            columns.append("group_id")
+            values.append(group_id)
+        if "code" in skill_cols:
+            columns.append("code")
+            values.append(f"skill-{_slug_catalog_key(str(row['suggested_name']))}")
+        if "name" in skill_cols:
+            columns.append("name")
+            values.append(str(row["suggested_name"]).strip())
+        if "resolution_status" in skill_cols:
+            columns.append("resolution_status")
+            values.append("manual")
+        if "is_active" in skill_cols:
+            columns.append("is_active")
+            values.append(1)
+        if "created_at" in skill_cols:
+            columns.append("created_at")
+            values.append(_utc_now_iso())
+        if "updated_at" in skill_cols:
+            columns.append("updated_at")
+            values.append(_utc_now_iso())
+        placeholders = ", ".join("?" for _ in columns)
+        cur = con.execute(
+            f"INSERT INTO skill({', '.join(columns)}) VALUES ({placeholders})",
+            tuple(values),
+        )
+        skill_id = int(cur.lastrowid)
+        skill_row = _find_skill_by_id(con, skill_id)
+        created_skill = True
+    else:
+        skill_id = int(skill_row["id"])
+        if str(skill_row["status"] or "active") != "active":
+            con.execute("UPDATE skill SET status = 'active' WHERE id = ?", (skill_id,))
+        updates = []
+        params: list[object] = []
+        if "is_active" in skill_cols:
+            updates.append("is_active = 1")
+        if "group_id" in skill_cols and group_id is not None:
+            updates.append("group_id = COALESCE(group_id, ?)")
+            params.append(group_id)
+        if "name" in skill_cols:
+            updates.append("name = COALESCE(NULLIF(name, ''), ?)")
+            params.append(str(row["suggested_name"]).strip())
+        if "updated_at" in skill_cols:
+            updates.append("updated_at = ?")
+            params.append(_utc_now_iso())
+        if updates:
+            params.append(skill_id)
+            con.execute(f"UPDATE skill SET {', '.join(updates)} WHERE id = ?", tuple(params))
+
+    created_alias = _ensure_skill_alias(con, skill_id, str(row["suggested_name"]), "intake_accept")
+    canonical_name = str(skill_row["canonical_name"] if skill_row else row["suggested_name"])
+    resolution_after = "matched" if _normalize_catalog_key(canonical_name) == normalized_name else "alias"
+    con.execute(
+        """
+        UPDATE skill_suggestion
+        SET canonical_skill_id = ?, resolution = ?, decision = 'accepted'
+        WHERE id = ?
+        """,
+        (skill_id, resolution_after, suggestion_id),
+    )
+    if existing_promotion:
+        con.execute(
+            """
+            UPDATE skill_promotion_log
+            SET skill_id = ?,
+                alias = ?,
+                normalized_alias = ?,
+                resolution_after_promotion = ?,
+                created_skill = CASE WHEN created_skill = 1 OR ? = 1 THEN 1 ELSE 0 END,
+                created_alias = CASE WHEN created_alias = 1 OR ? = 1 THEN 1 ELSE 0 END,
+                status = 'active',
+                reverted_at = NULL
+            WHERE suggestion_id = ?
+            """,
+            (
+                skill_id,
+                str(row["suggested_name"]).strip(),
+                normalized_name,
+                resolution_after,
+                1 if created_skill else 0,
+                1 if created_alias else 0,
+                suggestion_id,
+            ),
+        )
+    else:
+        con.execute(
+            """
+            INSERT INTO skill_promotion_log(
+                suggestion_id, skill_id, alias, normalized_alias, resolution_after_promotion,
+                created_skill, created_alias, status, source
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 'intake_accept')
+            """,
+            (
+                suggestion_id,
+                skill_id,
+                str(row["suggested_name"]).strip(),
+                normalized_name,
+                resolution_after,
+                1 if created_skill else 0,
+                1 if created_alias else 0,
+            ),
+        )
+    con.commit()
+    return {
+        "status": "promoted",
+        "suggestion_id": suggestion_id,
+        "skill_id": skill_id,
+        "created_skill": created_skill,
+        "created_alias": created_alias,
+        "resolution_after": resolution_after,
+    }
+
+
+def revert_suggestion_promotion(con: sqlite3.Connection, suggestion_id: int) -> dict[str, object]:
+    row = _load_skill_suggestion_row(con, suggestion_id)
+    promotion = _existing_promotion(con, suggestion_id)
+    if not row or not promotion or str(promotion["status"]) != "active":
+        return {"status": "noop", "suggestion_id": suggestion_id}
+
+    skill_id = int(promotion["skill_id"])
+    normalized_alias = str(promotion["normalized_alias"] or "")
+
+    if int(promotion["created_alias"] or 0) == 1 and normalized_alias:
+        con.execute(
+            "DELETE FROM skill_alias WHERE skill_id = ? AND normalized_alias = ?",
+            (skill_id, normalized_alias),
+        )
+
+    should_disable_skill = False
+    if int(promotion["created_skill"] or 0) == 1:
+        active_promotions = int(
+            con.execute(
+                """
+                SELECT COUNT(*)
+                FROM skill_promotion_log
+                WHERE skill_id = ?
+                  AND status = 'active'
+                  AND suggestion_id <> ?
+                """,
+                (skill_id, suggestion_id),
+            ).fetchone()[0]
+        )
+        other_accepted_refs = int(
+            con.execute(
+                """
+                SELECT COUNT(*)
+                FROM skill_suggestion
+                WHERE canonical_skill_id = ?
+                  AND entity_type = 'skill'
+                  AND atomicity = 'atomic'
+                  AND decision = 'accepted'
+                  AND id <> ?
+                """,
+                (skill_id, suggestion_id),
+            ).fetchone()[0]
+        )
+        if active_promotions == 0 and other_accepted_refs == 0:
+            should_disable_skill = True
+
+    if should_disable_skill:
+        skill_cols = _existing_cols(con, "skill")
+        if "is_active" in skill_cols:
+            con.execute("UPDATE skill SET status = 'candidate', is_active = 0 WHERE id = ?", (skill_id,))
+        else:
+            con.execute("UPDATE skill SET status = 'candidate' WHERE id = ?", (skill_id,))
+
+    resolution_after = "new"
+    canonical_skill_id: int | None = None
+    fallback_skill = _find_skill_by_normalized_name(con, _normalize_catalog_key(str(row["suggested_name"] or "")))
+    if fallback_skill and int(fallback_skill["id"]) != skill_id and str(fallback_skill["status"] or "active") == "active":
+        canonical_skill_id = int(fallback_skill["id"])
+        fallback_canonical = _normalize_catalog_key(str(fallback_skill["canonical_name"] or ""))
+        resolution_after = "matched" if fallback_canonical == _normalize_catalog_key(str(row["suggested_name"] or "")) else "alias"
+
+    con.execute(
+        """
+        UPDATE skill_suggestion
+        SET canonical_skill_id = ?, resolution = ?
+        WHERE id = ?
+        """,
+        (canonical_skill_id, resolution_after, suggestion_id),
+    )
+    con.execute(
+        """
+        UPDATE skill_promotion_log
+        SET status = 'reverted',
+            reverted_at = ?
+        WHERE suggestion_id = ?
+        """,
+        (_utc_now_iso(), suggestion_id),
+    )
+    con.commit()
+    return {
+        "status": "reverted",
+        "suggestion_id": suggestion_id,
+        "skill_id": skill_id,
+        "disabled_skill": should_disable_skill,
+        "resolution_after": resolution_after,
+    }
+
+
+def sync_promotions_for_brief(con: sqlite3.Connection, brief_id: int) -> dict[str, int]:
+    promoted = 0
+    reverted = 0
+    accepted_rows = con.execute(
+        """
+        SELECT id
+        FROM skill_suggestion
+        WHERE brief_id = ?
+          AND entity_type = 'skill'
+          AND atomicity = 'atomic'
+          AND decision = 'accepted'
+        ORDER BY id
+        """,
+        (brief_id,),
+    ).fetchall()
+    for row in accepted_rows:
+        result = promote_suggestion_to_catalog(con, int(row["id"]))
+        if result.get("status") == "promoted":
+            promoted += 1
+
+    active_rows = con.execute(
+        """
+        SELECT spl.suggestion_id
+        FROM skill_promotion_log spl
+        JOIN skill_suggestion ss ON ss.id = spl.suggestion_id
+        WHERE ss.brief_id = ?
+          AND spl.status = 'active'
+          AND (ss.decision IS NULL OR ss.decision <> 'accepted')
+        """,
+        (brief_id,),
+    ).fetchall()
+    for row in active_rows:
+        result = revert_suggestion_promotion(con, int(row["suggestion_id"]))
+        if result.get("status") == "reverted":
+            reverted += 1
+
+    return {"promoted": promoted, "reverted": reverted}
 
 
 def save_brief(con: sqlite3.Connection, raw: str, spec: dict) -> int:
@@ -246,15 +623,19 @@ def save_curriculum_plan(
     for row in plan_payload.get("rows", []):
         if not isinstance(row, dict):
             continue
+        effort_days = None if row.get("effort_days") in (None, "") else float(row.get("effort_days", 0) or 0)
+        cumulative_days = None if row.get("cumulative_days") in (None, "") else float(row.get("cumulative_days", 0) or 0)
+        xp = None if row.get("xp") in (None, "") else int(row.get("xp", 0) or 0)
         con.execute(
             """
             INSERT INTO curriculum_plan_row(
                 plan_id, block_index, row_number, project_index_in_block, block_title, block_goal,
-                project_name, project_summary, learning_outcomes, skills_list, audience_level,
-                required_tools, storytelling, delivery_format, group_size, effort_hours, effort_days,
+                project_name, project_summary, outcomes_know, outcomes_can, outcomes_skills,
+                learning_outcomes, skills_list, audience_level, required_tools, materials,
+                storytelling, delivery_format, group_size, effort_hours, effort_days,
                 cumulative_days, xp, platform_project_name, artifact_links
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 plan_id,
@@ -265,17 +646,21 @@ def save_curriculum_plan(
                 row.get("block_goal"),
                 row.get("project_name"),
                 row.get("project_summary"),
+                row.get("outcomes_know"),
+                row.get("outcomes_can"),
+                row.get("outcomes_skills"),
                 row.get("learning_outcomes"),
                 row.get("skills_list"),
                 row.get("audience_level"),
                 row.get("required_tools"),
+                row.get("materials"),
                 row.get("storytelling"),
                 row.get("delivery_format"),
                 row.get("group_size"),
                 float(row.get("effort_hours", 0) or 0),
-                float(row.get("effort_days", 0) or 0),
-                float(row.get("cumulative_days", 0) or 0),
-                int(row.get("xp", 0) or 0),
+                effort_days,
+                cumulative_days,
+                xp,
                 row.get("platform_project_name"),
                 row.get("artifact_links"),
             ),

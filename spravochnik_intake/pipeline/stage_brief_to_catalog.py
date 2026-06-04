@@ -1,12 +1,15 @@
 """Стадия 1->2: бриф -> навыки-кандидаты справочника.
 
-decompose -> grounded-поиск -> evidence -> синтез -> резолв (репозиторий)
--> жюри по серой зоне -> триаж.
+Новый порядок экономит внешний поиск: сначала делаем draft skills из брифа,
+резолвим их против канона, затем запускаем grounded-поиск только для серой зоны.
 """
 from __future__ import annotations
+import hashlib
 import json
 import re
+import sqlite3
 from datetime import date
+from datetime import UTC, datetime, timedelta
 from . import config, llm
 from . import stage_atomize
 from . import stage_normalize
@@ -240,6 +243,14 @@ def _build_coverage_audit(
     }
 
 
+def build_coverage_audit(
+    spec: dict[str, object],
+    cands: list[SkillCandidate],
+    coverage_rows: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    return _build_coverage_audit(spec, cands, coverage_rows)
+
+
 # --------- decompose ---------
 def decompose(brief: str) -> dict:
     if config.USE_LIVE:
@@ -291,13 +302,104 @@ def decompose(brief: str) -> dict:
     )
 
 
+def _normalize_evidence_query(query: str) -> str:
+    return " ".join(query.casefold().replace("ё", "е").split())
+
+
+def _evidence_cache_key(query: str) -> str:
+    return hashlib.sha256(_normalize_evidence_query(query).encode("utf-8")).hexdigest()
+
+
+def ensure_evidence_cache_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS evidence_query_cache (
+            cache_key TEXT PRIMARY KEY,
+            normalized_query TEXT NOT NULL,
+            query TEXT NOT NULL,
+            model TEXT NOT NULL,
+            response_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_evidence_query_cache_updated ON evidence_query_cache(updated_at)")
+    conn.commit()
+
+
+def _load_cached_search(cache_conn: sqlite3.Connection | None, query: str) -> list[dict] | None:
+    if cache_conn is None:
+        return None
+    ensure_evidence_cache_table(cache_conn)
+    row = cache_conn.execute(
+        "SELECT response_json, updated_at FROM evidence_query_cache WHERE cache_key = ? AND model = ?",
+        (_evidence_cache_key(query), config.MODEL_SEARCH),
+    ).fetchone()
+    if not row:
+        return None
+    try:
+        updated_at = datetime.fromisoformat(str(row["updated_at"]))
+    except ValueError:
+        return None
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=UTC)
+    if datetime.now(UTC) - updated_at > timedelta(days=config.EVIDENCE_CACHE_TTL_DAYS):
+        return None
+    try:
+        payload = json.loads(str(row["response_json"]))
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, list) else None
+
+
+def _store_cached_search(cache_conn: sqlite3.Connection | None, query: str, items: list[dict]) -> None:
+    if cache_conn is None:
+        return
+    ensure_evidence_cache_table(cache_conn)
+    now = datetime.now(UTC).isoformat()
+    cache_conn.execute(
+        """
+        INSERT INTO evidence_query_cache(cache_key, normalized_query, query, model, response_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(cache_key) DO UPDATE SET
+            normalized_query = excluded.normalized_query,
+            query = excluded.query,
+            model = excluded.model,
+            response_json = excluded.response_json,
+            updated_at = excluded.updated_at
+        """,
+        (
+            _evidence_cache_key(query),
+            _normalize_evidence_query(query),
+            query,
+            config.MODEL_SEARCH,
+            json.dumps(items, ensure_ascii=False),
+            now,
+            now,
+        ),
+    )
+    cache_conn.commit()
+
+
 # --------- grounded-поиск -> evidence ---------
-def search(query: str) -> list[dict]:
+def search(query: str, cache_conn: sqlite3.Connection | None = None) -> list[dict]:
+    cached = _load_cached_search(cache_conn, query)
+    if cached is not None:
+        return cached
     if config.USE_LIVE:
-        sys = ("Найди требуемые навыки. JSON-массив {claim, source_type, url, snippet}. "
-               "source_type: vacancy|framework|syllabus.")
+        sys = (
+            "Найди подтверждающие источники по навыкам. "
+            "Верни компактный JSON-массив объектов {claim, source_type, url, snippet}. "
+            "source_type: vacancy|framework|syllabus|other. "
+            "snippet должен быть коротким, без длинных цитат."
+        )
         try:
-            resp = llm.chat(config.MODEL_SEARCH, [{"role": "system", "content": sys}, {"role": "user", "content": query}])
+            resp = llm.chat(
+                config.MODEL_SEARCH,
+                [{"role": "system", "content": sys}, {"role": "user", "content": query}],
+                max_tokens=config.MODEL_SEARCH_MAX_TOKENS,
+            )
             items = json.loads(llm.content(resp))
         except Exception:
             items = []
@@ -306,6 +408,7 @@ def search(query: str) -> list[dict]:
             it.setdefault("url", cits[0] if cits else "")
             it.setdefault("snippet", "")
             it.setdefault("retrieved_at", date.today().isoformat())
+        _store_cached_search(cache_conn, query, items)
         return items
     today = date.today().isoformat()
     DB = {
@@ -327,13 +430,14 @@ def search(query: str) -> list[dict]:
         if key.lower() in ql:
             for claim, st, url, snip in items:
                 out.append({"claim": claim, "source_type": st, "url": url, "snippet": snip, "retrieved_at": today})
+    _store_cached_search(cache_conn, query, out)
     return out
 
 
-def gather_evidence(sub_queries: list[str]) -> list[Evidence]:
+def gather_evidence(sub_queries: list[str], cache_conn: sqlite3.Connection | None = None) -> list[Evidence]:
     ev, n = [], 0
     for q in sub_queries:
-        for h in search(q):
+        for h in search(q, cache_conn=cache_conn):
             n += 1
             ev.append(Evidence(id=f"E{n:02d}", **{k: h[k] for k in ("claim", "source_type", "url", "snippet", "retrieved_at")}))
     # дедуп по (claim,url)
@@ -343,6 +447,158 @@ def gather_evidence(sub_queries: list[str]) -> list[Evidence]:
         if k not in seen:
             seen.add(k); out.append(e)
     return out
+
+
+def _candidate_source_text(candidate: SkillCandidate) -> str:
+    parts = [
+        candidate.name,
+        candidate.group,
+        candidate.coverage_area or "",
+        " ".join(candidate.tools),
+        " ".join(indicator.text for indicator in candidate.indicators),
+    ]
+    return " ".join(part for part in parts if part)
+
+
+def synthesize_draft_from_brief(brief: str, spec: dict) -> tuple[list[SkillCandidate], dict[str, object] | None]:
+    """Генерирует первичный shortlist из самого брифа без внешнего поиска.
+
+    Этот draft нужен для дешёвого pre-match against canon: если навык уже есть в каталоге,
+    Perplexity для него не вызывается.
+    """
+    if config.USE_LIVE:
+        spec_context = {
+            "artifact_type": spec.get("artifact_type"),
+            "target_role": spec.get("role"),
+            "target_seniority": spec.get("seniority"),
+            "domain": spec.get("domain"),
+            "operator_role": spec.get("operator_role"),
+            "program_goal": spec.get("program_goal"),
+            "must_include_areas": spec.get("must_include_areas", []),
+        }
+        if str(spec.get("artifact_type") or "").strip() in {"program_brief", "mixed"}:
+            sys = (
+                "Ты строишь первичный skill portrait выпускника образовательной программы только по тексту брифа, без внешнего поиска. "
+                "Работай coverage-first по must_include_areas. "
+                "Верни только строгий JSON вида "
+                "{coverage:[{area,status,rationale,candidate_names}],"
+                "candidates:[{name,group,coverage_area,indicators:[{text,bloom}],tools}]}. "
+                "status в coverage: covered|partial|uncovered. "
+                "Кандидаты должны быть learner-skills/graduate outcomes, а не роли, staffing, бюджет, ресурсы программы или решения команды запуска. "
+                "На одну область дай 1-2 наиболее важных skill-кандидата. "
+                "Название формулируй как наблюдаемый навык/action."
+            )
+        else:
+            sys = (
+                "Ты строишь первичный skill portrait обучаемого только по тексту брифа, без внешнего поиска. "
+                "Верни строгий JSON {candidates:[{name,group,coverage_area,indicators:[{text,bloom}],tools}]}. "
+                "Извлекай только learner-skills и graduate outcomes. Название формулируй как skill/action."
+            )
+        data = json.loads(llm.content(llm.chat(
+            config.MODEL_PLAN,
+            [
+                {"role": "system", "content": sys},
+                {"role": "user", "content": json.dumps({"spec": spec_context, "brief": brief}, ensure_ascii=False)},
+            ],
+            json_mode=True,
+        )))
+        out: list[SkillCandidate] = []
+        for i, it in enumerate(data.get("candidates", []), 1):
+            name = str(it.get("name") or "").strip()
+            if not name:
+                continue
+            out.append(SkillCandidate(
+                tmp_id=f"C{i:02d}",
+                name=name,
+                group=str(it.get("group") or "").strip(),
+                coverage_area=str(it.get("coverage_area") or "").strip() or None,
+                indicators=[
+                    IndicatorSpec(text=ind["text"], bloom=normalize_bloom(ind.get("bloom")))
+                    for ind in it.get("indicators", [])
+                    if ind.get("text")
+                ],
+                tools=[str(tool).strip() for tool in it.get("tools", []) if str(tool).strip()],
+                evidence_ids=[],
+            ))
+        return out, _build_coverage_audit(spec, out, data.get("coverage"))
+
+    # Offline/mock режим: сохраняем существующие демо-кандидаты, но без обязательного evidence.
+    out, coverage = synthesize_with_coverage([], spec)
+    if out:
+        return out, coverage
+    areas = [str(area).strip() for area in spec.get("must_include_areas") or [] if str(area).strip()]
+    fallback: list[SkillCandidate] = []
+    for i, area in enumerate(areas[:8], 1):
+        fallback.append(SkillCandidate(
+            tmp_id=f"C{i:02d}",
+            name=area,
+            group=str(spec.get("domain") or ""),
+            coverage_area=area,
+            indicators=[IndicatorSpec(text=f"Применяет навык в области: {area}", bloom="apply")],
+            tools=[],
+            evidence_ids=[],
+        ))
+    return fallback, _build_coverage_audit(spec, fallback)
+
+
+def _needs_evidence_enrichment(candidate: SkillCandidate) -> bool:
+    if not _is_for_resolve(candidate):
+        return False
+    if candidate.resolution in {"matched", "alias"} and candidate.confidence >= config.TAU_CONFIDENCE:
+        return False
+    return candidate.resolution in {"new", "fuzzy"} or candidate.confidence < config.TAU_CONFIDENCE
+
+
+def select_evidence_enrichment_candidates(cands: list[SkillCandidate]) -> list[SkillCandidate]:
+    return [cand for cand in cands if _needs_evidence_enrichment(cand)]
+
+
+def gather_evidence_for_gray_zone(
+    cands: list[SkillCandidate],
+    spec: dict,
+    cache_conn: sqlite3.Connection | None = None,
+) -> list[Evidence]:
+    """Ищет evidence только для кандидатов, которые не закрылись каноном."""
+    grouped: dict[str, list[SkillCandidate]] = {}
+    for cand in cands:
+        if not _needs_evidence_enrichment(cand):
+            continue
+        key = (cand.coverage_area or cand.group or cand.name).strip()
+        if not key:
+            key = cand.name
+        grouped.setdefault(key, []).append(cand)
+
+    evidence: list[Evidence] = []
+    seen: dict[tuple[str, str], str] = {}
+    role = str(spec.get("role") or "").strip()
+    domain = str(spec.get("domain") or "").strip()
+    max_queries = max(config.GRAY_SEARCH_MAX_QUERIES, 0)
+    for group_index, (area, area_candidates) in enumerate(grouped.items()):
+        if group_index >= max_queries:
+            break
+        skill_names = ", ".join(candidate.name for candidate in area_candidates[:4])
+        query = (
+            f"Навыки выпускника для роли {role} в домене {domain}. "
+            f"Область: {area}. Кандидаты: {skill_names}. "
+            "Найди подтверждающие frameworks, syllabus или вакансии."
+        )
+        group_evidence_ids: list[str] = []
+        for hit in search(query, cache_conn=cache_conn):
+            key = (str(hit.get("claim", "")).casefold(), str(hit.get("url", "")))
+            evidence_id = seen.get(key)
+            if evidence_id is None:
+                evidence_id = f"E{len(evidence) + 1:02d}"
+                seen[key] = evidence_id
+                evidence.append(Evidence(
+                    id=evidence_id,
+                    **{k: hit[k] for k in ("claim", "source_type", "url", "snippet", "retrieved_at")},
+                ))
+            group_evidence_ids.append(evidence_id)
+        if not group_evidence_ids:
+            continue
+        for cand in area_candidates:
+            cand.evidence_ids = list(dict.fromkeys([*cand.evidence_ids, *group_evidence_ids]))
+    return evidence
 
 
 # --------- синтез кандидатов (с Блумом и инструментами) ---------
@@ -472,7 +728,15 @@ def synthesize(evidence: list[Evidence], spec: dict) -> list[SkillCandidate]:
 def _confidence(cand: SkillCandidate, evidence: list[Evidence]) -> float:
     evs = [e for e in evidence if e.id in cand.evidence_ids]
     fw = any(e.source_type in ("framework", "syllabus") for e in evs)
-    return round(min(min(0.5 + 0.2 * len(evs), 0.95) + (0.1 if fw else 0.0), 0.97), 2)
+    evidence_confidence = min(min(0.5 + 0.2 * len(evs), 0.95) + (0.1 if fw else 0.0), 0.97)
+    match_confidence = 0.0
+    if cand.resolution in {"matched", "alias"}:
+        match_confidence = 0.98
+    elif cand.resolution == "fuzzy":
+        match_confidence = min(max((cand.match_score or 0.0) / 100.0, 0.55), 0.93)
+    elif cand.resolution == "new":
+        match_confidence = 0.5
+    return round(max(evidence_confidence if evs else 0.0, match_confidence), 2)
 
 
 # --------- жюри по серой зоне + триаж ---------
@@ -503,8 +767,8 @@ def resolve_candidates(cands: list[SkillCandidate], evidence: list[Evidence], re
     for cand in cands:
         if not _is_for_resolve(cand):
             continue
-        cand.confidence = _confidence(cand, evidence)
         repo.resolve(cand)
+        cand.confidence = _confidence(cand, evidence)
 
 
 def select_council_candidates(cands: list[SkillCandidate]) -> list[SkillCandidate]:
@@ -556,7 +820,7 @@ def triage_candidates(cands: list[SkillCandidate], spec: dict[str, object] | Non
             r.append("fuzzy_match_ambiguous")
         if c.confidence < config.TAU_CONFIDENCE:
             r.append("low_confidence")
-        if n < config.MIN_SOURCES:
+        if n < config.MIN_SOURCES and c.resolution not in {"matched", "alias"}:
             r.append("single_source")
         if c.council_ran and c.council_agreement is not None and c.council_agreement < config.COUNCIL_AGREE_OK:
             r.append("council_split")
@@ -590,10 +854,12 @@ def build_candidate_metrics(cands: list[SkillCandidate]) -> dict[str, int]:
 
 def run(brief: str, repo: CatalogRepo) -> tuple[dict, list[Evidence], list[SkillCandidate]]:
     spec = decompose(brief)
-    evidence = gather_evidence(spec["sub_queries"])
-    cands, _coverage = synthesize_with_coverage(evidence, spec)
+    cands, _coverage = synthesize_draft_from_brief(brief, spec)
     cands = atomize_candidates(cands, spec)
     cands, _normalize_report = stage_normalize.run(cands, spec)
+    evidence: list[Evidence] = []
+    resolve_candidates(cands, evidence, repo)
+    evidence = gather_evidence_for_gray_zone(cands, spec)
     resolve_candidates(cands, evidence, repo)
     run_council(cands)
     triage_candidates(cands, spec)

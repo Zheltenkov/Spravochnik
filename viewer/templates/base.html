@@ -13,10 +13,29 @@
         </div>
         <nav class="nav">
             {% for item in nav %}
-            <a href="{{ item.href }}" class="nav-link{% if request_path == item.href or request_path.startswith(item.href ~ '/') %} active{% endif %}">{{ item.label }}</a>
+            {% set state = namespace(active=false) %}
+            {% for prefix in item.prefixes or [item.href] %}
+                {% if request_path == prefix or request_path.startswith(prefix ~ '/') %}
+                    {% set state.active = true %}
+                {% endif %}
+            {% endfor %}
+            <a href="{{ item.href }}" class="nav-link{% if state.active %} active{% endif %}">{{ item.label }}</a>
             {% endfor %}
         </nav>
     </header>
+    {% if secondary_nav %}
+    <nav class="secondary-nav">
+        {% for item in secondary_nav %}
+        {% set state = namespace(active=false) %}
+        {% for prefix in item.prefixes or [item.href] %}
+            {% if request_path == prefix or request_path.startswith(prefix ~ '/') %}
+                {% set state.active = true %}
+            {% endif %}
+        {% endfor %}
+        <a href="{{ item.href }}" class="secondary-nav-link{% if state.active %} active{% endif %}">{{ item.label }}</a>
+        {% endfor %}
+    </nav>
+    {% endif %}
 
     <main class="page-shell{% if request_path.startswith('/intake') or request_path.startswith('/up') %} page-shell-intake{% endif %}">
         <aside class="summary-panel{% if request_path.startswith('/intake') or request_path.startswith('/up') %} summary-panel-intake{% endif %}">

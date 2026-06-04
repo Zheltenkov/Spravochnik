@@ -82,6 +82,19 @@
         <div class="summary-value">{{ 'включен' if job.use_council else 'выключен' }}</div>
     </div>
 </section>
+{% if workflow_steps %}
+<section class="workflow-stepper" aria-label="Маршрут брифа">
+    {% for step in workflow_steps %}
+    <a class="workflow-step workflow-step-{{ step.status }}" href="{{ step.href }}">
+        <span class="workflow-step-index">{{ loop.index }}</span>
+        <span class="workflow-step-body">
+            <span class="workflow-step-label">{{ step.label }}</span>
+            <span class="workflow-step-description">{{ step.description }}</span>
+        </span>
+    </a>
+    {% endfor %}
+</section>
+{% endif %}
 {% if dag_build_state %}
 <section class="filter-panel">
     <div class="small muted">
@@ -130,6 +143,70 @@
 {% endif %}
 
 {% if result %}
+<section class="hero hero-compact workflow-focus">
+    <div>
+        <h1>Проверка кандидатов</h1>
+        <p class="small muted">
+            Главный рабочий блок методолога. `Увер. модели` — уверенность резолва и триажа,
+            `Согласие жюри` — panel agreement. При `Увер. модели >= 0.95` и `Согласие жюри = 1.00`
+            skill принимается автоматически, но его можно вернуть на review.
+        </p>
+    </div>
+    <div class="review-actions">
+        <a class="action-btn action-btn-secondary" href="/reviews">Открыть очередь</a>
+        <a class="action-btn action-btn-primary" href="/catalog-admin/groups">Открыть справочник</a>
+    </div>
+</section>
+<section class="table-wrap primary-workspace">
+    <table class="data-table data-table-wide">
+        <thead><tr>
+            <th>Навык</th><th>Coverage area</th><th>Группа</th><th>Bloom</th><th>Резолв против каталога</th>
+            <th>Увер.</th><th>Жюри</th><th>Решение</th><th>Причины</th><th>Действие</th>
+        </tr></thead>
+        <tbody>
+        {% for c in result.candidates %}
+            <tr>
+                <td>
+                    <strong>{{ c.name }}</strong>
+                    <div class="small muted">инструменты: {{ c.tools }}</div>
+                    {% if c.parent_name %}<div class="small muted">из декомпозиции: {{ c.parent_name }}</div>{% endif %}
+                    {% if c.entity_type != 'skill' %}<div class="small muted">тип: {{ c.entity_type }}</div>{% endif %}
+                </td>
+                <td>{% if c.coverage_area %}{{ c.coverage_area }}{% else %}<span class="small muted">—</span>{% endif %}</td>
+                <td>{{ c.group }}</td>
+                <td>{{ c.bloom }}</td>
+                <td>
+                    {% if c.resolution %}
+                    <span class="pill {% if c.resolution in ('matched','alias') %}ghost{% endif %}">{{ c.resolution }}</span>
+                    {% else %}
+                    —
+                    {% endif %}
+                    {% if c.canonical_name %}<div class="small muted">→ {{ c.canonical_name }}</div>{% endif %}
+                </td>
+                <td>{{ c.confidence }}</td>
+                <td>{{ c.council_agreement if c.council_agreement is not none else "—" }}</td>
+                <td><span class="status-badge {% if c.decision != 'accepted' %}warn{% endif %}">{{ c.decision }}</span></td>
+                <td class="small muted">{{ c.reasons or "—" }}</td>
+                <td class="candidate-action-cell">
+                    {% if c.can_review_inline and c.suggestion_id %}
+                    <form class="candidate-action-form" method="post" action="/intake/jobs/{{ job.id }}/candidate-decision">
+                        <input type="hidden" name="suggestion_id" value="{{ c.suggestion_id }}">
+                        <button type="submit" name="candidate_action" value="accept" class="action-btn action-btn-primary"{% if c.decision == 'accepted' %} disabled{% endif %}>Добавить</button>
+                        <button type="submit" name="candidate_action" value="review" class="action-btn action-btn-light"{% if c.decision == 'needs_review' %} disabled{% endif %}>Вернуть на review</button>
+                        <button type="submit" name="candidate_action" value="reject" class="action-btn action-btn-danger"{% if c.decision == 'rejected' %} disabled{% endif %}>Отклонить</button>
+                    </form>
+                    {% else %}
+                    <span class="small muted">Нет ручного действия</span>
+                    {% endif %}
+                </td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</section>
+
+<details class="collapse-panel technical-details">
+<summary>Технические детали декомпозиции и нормализации</summary>
 <section class="hero hero-compact">
     <div><h1>Декомпозиция</h1></div>
 </section>
@@ -295,62 +372,7 @@
 </section>
 {% endif %}
 {% endif %}
-
-<section class="hero hero-compact"><div><h1>Навыки после нормализации</h1></div></section>
-<section class="filter-panel">
-    <div class="small muted">
-        `Увер. модели` — уверенность алгоритма сопоставления и триажа. `Согласие жюри` — согласованность panel-проверки между моделями, если спорный кандидат дошёл до council.
-        Если `Увер. модели >= 0.95` и `Согласие жюри = 1.00`, кандидат авто-принимается.
-        Для уже принятой строки доступно отдельное действие `Вернуть на review`, без смешивания с `Отклонить`.
-    </div>
-</section>
-<section class="table-wrap">
-    <table class="data-table">
-        <thead><tr>
-            <th>Навык</th><th>Coverage area</th><th>Группа</th><th>Bloom</th><th>Резолв против каталога</th>
-            <th>Увер. модели</th><th>Согласие жюри</th><th>Решение</th><th>Причины</th><th>Действие</th>
-        </tr></thead>
-        <tbody>
-        {% for c in result.candidates %}
-            <tr>
-                <td>
-                    <strong>{{ c.name }}</strong>
-                    <div class="small muted">инструменты: {{ c.tools }}</div>
-                    {% if c.parent_name %}<div class="small muted">из декомпозиции: {{ c.parent_name }}</div>{% endif %}
-                    {% if c.entity_type != 'skill' %}<div class="small muted">тип: {{ c.entity_type }}</div>{% endif %}
-                </td>
-                <td>{% if c.coverage_area %}{{ c.coverage_area }}{% else %}<span class="small muted">—</span>{% endif %}</td>
-                <td>{{ c.group }}</td>
-                <td>{{ c.bloom }}</td>
-                <td>
-                    {% if c.resolution %}
-                    <span class="pill {% if c.resolution in ('matched','alias') %}ghost{% endif %}">{{ c.resolution }}</span>
-                    {% else %}
-                    —
-                    {% endif %}
-                    {% if c.canonical_name %}<div class="small muted">→ {{ c.canonical_name }}</div>{% endif %}
-                </td>
-                <td>{{ c.confidence }}</td>
-                <td>{{ c.council_agreement if c.council_agreement is not none else "—" }}</td>
-                <td><span class="status-badge {% if c.decision != 'accepted' %}warn{% endif %}">{{ c.decision }}</span></td>
-                <td class="small muted">{{ c.reasons or "—" }}</td>
-                <td class="candidate-action-cell">
-                    {% if c.can_review_inline and c.suggestion_id %}
-                    <form class="candidate-action-form" method="post" action="/intake/jobs/{{ job.id }}/candidate-decision">
-                        <input type="hidden" name="suggestion_id" value="{{ c.suggestion_id }}">
-                        <button type="submit" name="candidate_action" value="accept" class="action-btn action-btn-primary"{% if c.decision == 'accepted' %} disabled{% endif %}>Добавить</button>
-                        <button type="submit" name="candidate_action" value="review" class="action-btn action-btn-light"{% if c.decision == 'needs_review' %} disabled{% endif %}>Вернуть на review</button>
-                        <button type="submit" name="candidate_action" value="reject" class="action-btn action-btn-danger"{% if c.decision == 'rejected' %} disabled{% endif %}>Отклонить</button>
-                    </form>
-                    {% else %}
-                    <span class="small muted">Нет ручного действия</span>
-                    {% endif %}
-                </td>
-            </tr>
-        {% endfor %}
-        </tbody>
-    </table>
-</section>
+</details>
 
 <section class="hero hero-compact"><div><h1>Граф пререквизитов</h1></div></section>
 <section class="chips-row">
@@ -461,6 +483,9 @@
 </section>
 {% endif %}
 
+{% if result.dag.final_edges or result.dag.edge_review_queue %}
+<details class="collapse-panel technical-details">
+<summary>Технические детали рёбер DAG</summary>
 {% if result.dag.final_edges %}
 <section class="hero hero-compact"><div><h1>Финальные рёбра DAG</h1></div></section>
 <section class="table-wrap">
@@ -502,6 +527,8 @@
     </table>
 </section>
 {% endif %}
+</details>
+{% endif %}
 
 {% if result.curriculum_plan %}
 <section class="hero hero-compact">
@@ -521,14 +548,12 @@
 <section class="chips-row">
     <div class="summary-card"><div class="summary-label">Блоков</div><div class="summary-value">{{ result.curriculum_plan.summary.blocks }}</div></div>
     <div class="summary-card"><div class="summary-label">Проектов</div><div class="summary-value">{{ result.curriculum_plan.summary.projects }}</div></div>
-    <div class="summary-card"><div class="summary-label">Часы</div><div class="summary-value">{{ result.curriculum_plan.summary.total_hours }}</div></div>
-    <div class="summary-card"><div class="summary-label">Дни</div><div class="summary-value">{{ result.curriculum_plan.summary.total_days }}</div></div>
-    <div class="summary-card"><div class="summary-label">XP</div><div class="summary-value">{{ result.curriculum_plan.summary.total_xp }}</div></div>
+    <div class="summary-card"><div class="summary-label">Астр. часы</div><div class="summary-value">{{ result.curriculum_plan.summary.total_hours }}</div></div>
 </section>
 {% if result.curriculum_plan.blocks %}
 <section class="table-wrap">
     <table class="data-table">
-        <thead><tr><th>Блок</th><th>Цель</th><th>Проектов</th><th>Часы</th><th>Дни</th></tr></thead>
+        <thead><tr><th>Блок</th><th>Цель</th><th>Проектов</th><th>Астр. часы</th></tr></thead>
         <tbody>
         {% for block in result.curriculum_plan.blocks %}
             <tr>
@@ -536,7 +561,6 @@
                 <td class="small">{{ block.goal }}</td>
                 <td>{{ block.project_count }}</td>
                 <td>{{ block.total_hours }}</td>
-                <td>{{ block.total_days }}</td>
             </tr>
         {% endfor %}
         </tbody>
@@ -554,9 +578,7 @@
                 <th>Образовательные результаты</th>
                 <th>Навыки</th>
                 <th>Инструменты</th>
-                <th>Часы</th>
-                <th>Дни</th>
-                <th>XP</th>
+                <th>Астр. часы</th>
             </tr>
         </thead>
         <tbody>
@@ -572,8 +594,6 @@
                 <td>{{ row.skills_list }}</td>
                 <td>{{ row.required_tools or "—" }}</td>
                 <td>{{ row.effort_hours }}</td>
-                <td>{{ row.effort_days }}</td>
-                <td>{{ row.xp }}</td>
             </tr>
         {% endfor %}
         </tbody>
@@ -588,12 +608,50 @@
 {% endif %}
 {% endif %}
 
+{% if result.meta or (llm_usage and llm_usage.rows) or result.council_metrics or result.persisted %}
+<details class="collapse-panel technical-details">
+<summary>Наблюдаемость и служебные метрики</summary>
 {% if result.meta %}
 <section class="chips-row">
     <div class="summary-card"><div class="summary-label">Режим</div><div class="summary-value">{{ 'LIVE' if result.meta.use_live else 'MOCK' }}</div></div>
     <div class="summary-card"><div class="summary-label">Council</div><div class="summary-value">{{ 'включен' if result.meta.use_council else 'выключен' }}</div></div>
     <div class="summary-card"><div class="summary-label">Plan model</div><div class="summary-value">{{ result.meta.model_plan }}</div></div>
     <div class="summary-card"><div class="summary-label">Search model</div><div class="summary-value">{{ result.meta.model_search }}</div></div>
+</section>
+{% endif %}
+
+{% if llm_usage and llm_usage.rows %}
+<section class="hero hero-compact"><div><h1>LLM usage</h1></div></section>
+<section class="chips-row">
+    <div class="summary-card"><div class="summary-label">Total tokens</div><div class="summary-value">{{ llm_usage.total_tokens }}</div></div>
+    <div class="summary-card"><div class="summary-label">Prompt</div><div class="summary-value">{{ llm_usage.prompt_tokens }}</div></div>
+    <div class="summary-card"><div class="summary-label">Completion</div><div class="summary-value">{{ llm_usage.completion_tokens }}</div></div>
+</section>
+<section class="table-wrap">
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Stage</th>
+                <th>Model</th>
+                <th>Calls</th>
+                <th>Prompt</th>
+                <th>Completion</th>
+                <th>Total</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for row in llm_usage.rows %}
+            <tr>
+                <td>{{ row.stage }}</td>
+                <td>{{ row.model }}</td>
+                <td>{{ row.calls }}</td>
+                <td>{{ row.prompt_tokens }}</td>
+                <td>{{ row.completion_tokens }}</td>
+                <td>{{ row.total_tokens }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
 </section>
 {% endif %}
 
@@ -619,11 +677,14 @@
     <div class="small">
         Записано в каталог: бриф #{{ result.brief_id }}, evidence {{ result.persisted.evidence_source }},
         предложений {{ result.persisted.skill_suggestion }}, рёбер {{ result.persisted.skill_prerequisite }},
-        edge-review {{ result.persisted.prerequisite_reviews }}, строк УП {{ result.persisted.curriculum_plan_rows or 0 }}.
+        edge-review {{ result.persisted.prerequisite_reviews }}, строк УП {{ result.persisted.curriculum_plan_rows or 0 }},
+        промоций в канон {{ result.persisted.catalog_promoted or 0 }}, откатов {{ result.persisted.catalog_reverted or 0 }}.
         Открытых записей в очереди проверки: <strong>{{ result.persisted.review_open }}</strong> →
         <a href="/reviews">открыть очередь проверки</a>.
     </div>
 </section>
+{% endif %}
+</details>
 {% endif %}
 <script>
 (() => {
@@ -670,11 +731,11 @@
         "queued",
         "starting",
         "decompose",
-        "search",
-        "synthesize",
+        "draft",
         "atomize",
         "normalize",
         "resolve",
+        "search",
         "council",
         "triage",
         "prerequisites",

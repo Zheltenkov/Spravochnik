@@ -80,6 +80,72 @@
 </section>
 
 <section class="filter-panel">
+    <h2>Алиасы и слияние дублей</h2>
+    <div class="admin-grid">
+        <div class="admin-span-2">
+            <h3>Алиасы</h3>
+            {% if aliases %}
+            <div class="alias-list">
+                {% for alias in aliases %}
+                <form class="alias-row" method="post" action="/catalog-admin/skills/{{ skill.id }}">
+                    <input type="hidden" name="action" value="remove_alias">
+                    <input type="hidden" name="alias_id" value="{{ alias.id }}">
+                    <span class="pill">{{ alias.alias }}</span>
+                    <span class="small muted">{{ alias.source or "manual" }}</span>
+                    <button type="submit" class="action-btn action-btn-light">Убрать</button>
+                </form>
+                {% endfor %}
+            </div>
+            {% else %}
+            <p class="muted">Алиасы пока не заданы.</p>
+            {% endif %}
+
+            <form class="admin-form admin-form-inline" method="post" action="/catalog-admin/skills/{{ skill.id }}">
+                <input type="hidden" name="action" value="add_alias">
+                <label>
+                    <span>Новый alias</span>
+                    <input type="text" name="alias" placeholder="Синоним или исходная формулировка">
+                </label>
+                <button type="submit" class="action-btn action-btn-primary">Добавить alias</button>
+            </form>
+        </div>
+
+        <div class="admin-span-2">
+            <h3>Слияние дублей</h3>
+            <form class="admin-form admin-form-inline" method="get" action="/catalog-admin/skills/{{ skill.id }}">
+                <label>
+                    <span>Найти целевой skill</span>
+                    <input type="text" name="merge_query" value="{{ merge_query or '' }}" placeholder="SQL, Docker, Customer Discovery">
+                </label>
+                <button type="submit" class="action-btn">Найти</button>
+            </form>
+
+            {% if merge_query and not merge_candidates %}
+            <p class="muted">Ничего не найдено.</p>
+            {% endif %}
+
+            {% if merge_candidates %}
+            <div class="merge-candidates">
+                {% for candidate in merge_candidates %}
+                <form class="merge-row" method="post" action="/catalog-admin/skills/{{ skill.id }}" onsubmit="return confirm('Слить текущий skill в выбранный? Исходный skill будет архивирован.');">
+                    <input type="hidden" name="action" value="merge_skill">
+                    <input type="hidden" name="target_skill_id" value="{{ candidate.id }}">
+                    <div>
+                        <strong>{{ candidate.name or candidate.canonical_name }}</strong>
+                        <div class="small muted">
+                            #{{ candidate.id }} · {{ candidate.group_name or "без группы" }} · {{ candidate.indicator_count }} индикаторов · {{ candidate.alias_count }} aliases
+                        </div>
+                    </div>
+                    <button type="submit" class="action-btn action-btn-danger">Слить сюда</button>
+                </form>
+                {% endfor %}
+            </div>
+            {% endif %}
+        </div>
+    </div>
+</section>
+
+<section class="filter-panel">
     <form class="admin-form" method="post" action="/catalog-admin/skills/{{ skill.id }}">
         <input type="hidden" name="action" value="create_indicator">
         <div class="admin-grid">

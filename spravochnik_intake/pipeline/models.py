@@ -64,3 +64,26 @@ class PrereqEdge(BaseModel):
     bloom_violation: bool = False
     decision: Optional[str] = None
     reasons: list[str] = Field(default_factory=list)
+
+
+class UPProjectRow(BaseModel):
+    block: str = ""
+    block_goal: str = ""
+    order: int
+    title: str
+    description: str = ""
+    outcomes_know: str = ""
+    outcomes_can: str = ""
+    outcomes_skills: str = ""
+    software: str = ""
+    materials: str = ""
+    storytelling: str = ""
+    format: str = "индивидуальный"
+    group_size: int = 1
+    hours_astro: float = 0.0
+
+
+class UPSkeleton(BaseModel):
+    status: Literal["built", "deferred", "draft"] = "draft"
+    title: str = "Черновик учебного плана"
+    rows: list[UPProjectRow] = Field(default_factory=list)

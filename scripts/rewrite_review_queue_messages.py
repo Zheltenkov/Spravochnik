@@ -10,7 +10,6 @@ from review_queue_messages import humanize_review_details
 
 DEFAULT_DBS = [
     Path("artifacts/skills_catalog.sqlite"),
-    Path("artifacts/target_catalog.sqlite"),
 ]
 
 

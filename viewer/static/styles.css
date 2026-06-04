@@ -82,6 +82,32 @@ code {
     background: var(--panel-muted);
 }
 
+.secondary-nav {
+    position: sticky;
+    top: 73px;
+    z-index: 19;
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 8px 28px;
+    background: rgba(244, 241, 234, 0.82);
+    backdrop-filter: blur(14px);
+    border-bottom: 1px solid rgba(217, 207, 191, 0.55);
+}
+
+.secondary-nav-link {
+    padding: 7px 11px;
+    border-radius: 999px;
+    color: var(--ink-soft);
+    font-size: 0.88rem;
+}
+
+.secondary-nav-link:hover,
+.secondary-nav-link.active {
+    color: var(--accent);
+    background: rgba(14, 143, 111, 0.08);
+}
+
 .page-shell {
     display: grid;
     grid-template-columns: 280px minmax(0, 1fr);
@@ -545,6 +571,81 @@ details[open] > summary .toggle-glyph::before {
     flex-wrap: wrap;
 }
 
+.workflow-stepper {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 12px;
+}
+
+.workflow-step {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 12px;
+    align-items: start;
+    min-height: 104px;
+    padding: 16px;
+    border: 1px solid rgba(217, 207, 191, 0.88);
+    border-radius: 18px;
+    background: rgba(255, 253, 250, 0.84);
+    box-shadow: var(--shadow);
+}
+
+.workflow-step-index {
+    display: inline-grid;
+    place-items: center;
+    width: 30px;
+    height: 30px;
+    border-radius: 999px;
+    background: var(--panel-muted);
+    color: var(--ink-soft);
+    font-weight: 700;
+}
+
+.workflow-step-body {
+    display: grid;
+    gap: 5px;
+    min-width: 0;
+}
+
+.workflow-step-label {
+    font-size: 1.02rem;
+    font-weight: 650;
+}
+
+.workflow-step-description {
+    color: var(--ink-soft);
+    font-size: 0.88rem;
+    line-height: 1.45;
+}
+
+.workflow-step-done {
+    border-color: rgba(14, 143, 111, 0.24);
+    background: linear-gradient(180deg, rgba(216, 242, 234, 0.65), rgba(255, 253, 250, 0.92));
+}
+
+.workflow-step-done .workflow-step-index {
+    background: var(--accent-soft);
+    color: var(--accent);
+}
+
+.workflow-step-active {
+    border-color: rgba(14, 143, 111, 0.45);
+    background: linear-gradient(180deg, rgba(14, 143, 111, 0.12), rgba(255, 253, 250, 0.96));
+}
+
+.workflow-step-warn {
+    border-color: rgba(184, 92, 56, 0.38);
+    background: linear-gradient(180deg, rgba(251, 229, 220, 0.72), rgba(255, 253, 250, 0.96));
+}
+
+.workflow-focus {
+    border-color: rgba(14, 143, 111, 0.3);
+}
+
+.primary-workspace {
+    border-color: rgba(14, 143, 111, 0.24);
+}
+
 .filter-panel {
     padding: 18px 20px;
     background: var(--panel);
@@ -554,12 +655,16 @@ details[open] > summary .toggle-glyph::before {
 }
 
 .collapse-panel {
-    border-radius: var(--radius-sm);
+    padding: 16px 18px;
+    border: 1px solid rgba(217, 207, 191, 0.76);
+    border-radius: var(--radius);
+    background: rgba(255, 253, 250, 0.72);
+    box-shadow: 0 12px 26px rgba(44, 42, 37, 0.05);
 }
 
 .collapse-panel > summary {
     cursor: pointer;
-    font-weight: 700;
+    font-weight: 650;
     list-style: none;
     color: var(--ink);
 }
@@ -570,6 +675,10 @@ details[open] > summary .toggle-glyph::before {
 
 .collapse-panel[open] > summary {
     margin-bottom: 16px;
+}
+
+.technical-details > summary {
+    color: var(--ink-soft);
 }
 
 .filter-form {
@@ -638,6 +747,26 @@ details[open] > summary .toggle-glyph::before {
 
 .admin-grid-compact {
     grid-template-columns: repeat(3, minmax(180px, 1fr));
+}
+
+.alias-list,
+.merge-candidates {
+    display: grid;
+    gap: 10px;
+}
+
+.alias-row,
+.merge-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--line);
+}
+
+.merge-row {
+    align-items: flex-start;
 }
 
 .admin-form label {
@@ -974,6 +1103,12 @@ details[open] > summary .toggle-glyph::before {
 
 .action-btn-light {
     background: var(--panel-muted);
+}
+
+.action-btn-secondary {
+    background: rgba(14, 143, 111, 0.08);
+    border-color: rgba(14, 143, 111, 0.2);
+    color: var(--accent);
 }
 
 .action-btn-danger {
@@ -1316,6 +1451,10 @@ details[open] > summary .toggle-glyph::before {
         grid-template-columns: 1fr;
     }
 
+    .workflow-stepper {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
     .summary-panel {
         grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
     }
@@ -1336,8 +1475,19 @@ details[open] > summary .toggle-glyph::before {
         align-items: stretch;
     }
 
+    .secondary-nav {
+        position: static;
+        justify-content: flex-start;
+        overflow-x: auto;
+        padding: 8px 18px;
+    }
+
     .page-shell {
         padding: 18px;
+    }
+
+    .workflow-stepper {
+        grid-template-columns: 1fr;
     }
 
     .summary-panel-intake {

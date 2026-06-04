@@ -15,6 +15,14 @@ viewer/server.log
 viewer/server.err
 artifacts/viewer_*_stdout.log
 artifacts/viewer_*_stderr.log
+artifacts/*.before_unified_*.sqlite
+artifacts/*_backup*.sqlite
+artifacts/llm_usage.jsonl
+artifacts/local-skill-names.json
 
 .pytest_cache/
+pytest-cache-files-*/
 .tmp/
+test_tmp/
+test_cache/
+test_runtime/

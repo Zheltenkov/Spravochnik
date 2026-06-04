@@ -58,8 +58,8 @@
                 <input type="text" name="project_name" value="{{ row.project_name or '' }}">
             </label>
             <label>
-                <span>Название проекта на платформе / в GitLab</span>
-                <input type="text" name="platform_project_name" value="{{ row.platform_project_name or '' }}">
+                <span>Трудоёмкость, астр. часы</span>
+                <input type="text" name="effort_hours" value="{{ row.effort_hours or 0 }}">
             </label>
         </div>
 
@@ -69,8 +69,18 @@
         </label>
 
         <label>
-            <span>Образовательные результаты</span>
-            <textarea name="learning_outcomes" rows="5">{{ row.learning_outcomes or '' }}</textarea>
+            <span>Обр. результаты — что узнает (ЗНАТЬ)</span>
+            <textarea name="outcomes_know" rows="4">{{ row.outcomes_know or '' }}</textarea>
+        </label>
+
+        <label>
+            <span>Обр. результаты — что умеет (УМЕТЬ)</span>
+            <textarea name="outcomes_can" rows="4">{{ row.outcomes_can or '' }}</textarea>
+        </label>
+
+        <label>
+            <span>Обр. результаты — какой навык (НАВЫКИ)</span>
+            <textarea name="outcomes_skills" rows="4">{{ row.outcomes_skills or '' }}</textarea>
         </label>
 
         <label>
@@ -84,12 +94,17 @@
                 <textarea name="required_tools" rows="3">{{ row.required_tools or '' }}</textarea>
             </label>
             <label>
-                <span>Сторителлинг / кейс</span>
-                <textarea name="storytelling" rows="3">{{ row.storytelling or '' }}</textarea>
+                <span>Доп. материалы для генерации</span>
+                <textarea name="materials" rows="3">{{ row.materials or '' }}</textarea>
             </label>
         </div>
 
-        <div class="form-grid-3">
+        <label>
+            <span>Сторителлинг / кейс</span>
+            <textarea name="storytelling" rows="3">{{ row.storytelling or '' }}</textarea>
+        </label>
+
+        <div class="form-grid-2">
             <label>
                 <span>Формат</span>
                 <input type="text" name="delivery_format" value="{{ row.delivery_format or '' }}">
@@ -98,31 +113,7 @@
                 <span>Кол-во в группе</span>
                 <input type="text" name="group_size" value="{{ row.group_size or '' }}">
             </label>
-            <label>
-                <span>XP</span>
-                <input type="number" name="xp" value="{{ row.xp or 0 }}">
-            </label>
         </div>
-
-        <div class="form-grid-3">
-            <label>
-                <span>Трудоемкость, часы</span>
-                <input type="text" name="effort_hours" value="{{ row.effort_hours or 0 }}">
-            </label>
-            <label>
-                <span>Трудоемкость, дни</span>
-                <input type="text" name="effort_days" value="{{ row.effort_days or 0 }}">
-            </label>
-            <label>
-                <span>Общая трудоемкость, дни</span>
-                <input type="text" name="cumulative_days" value="{{ row.cumulative_days or 0 }}">
-            </label>
-        </div>
-
-        <label>
-            <span>Ссылки на GitLab / Google Docs</span>
-            <textarea name="artifact_links" rows="3">{{ row.artifact_links or '' }}</textarea>
-        </label>
 
         <div class="review-actions">
             <button type="submit" class="action-btn action-btn-primary">Сохранить строку</button>

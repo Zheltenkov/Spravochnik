@@ -15,46 +15,31 @@ from . import config
 from .models import SkillCandidate
 
 CSV_PRIMARY_HEADER = [
-    "Название всего блока (если делим на блоки)",
+    "Тематический блок",
     "Цели блока",
     "№",
-    "Название проекта",
-    "Краткое описание проекта",
-    "Образовательные результаты (знает, понимает, умеет)",
-    "Список навыков",
-    "Уровень аудитории",
-    "Обязательные инструменты (через запятую)",
+    "Название контентной единицы (проекта)",
+    "Краткое описание",
+    "Обр. результаты — что узнает (ЗНАТЬ)",
+    "Обр. результаты — что умеет (УМЕТЬ)",
+    "Обр. результаты — какой навык (НАВЫКИ)",
+    "Необходимое ПО",
+    "Доп. материалы для генерации",
     "Сторителлинг",
     "Формат",
     "Кол-во в группе",
-    "Трудоемкость, астр.часы",
-    "Трудоемкость, дни",
-    "Общая трудоемкость, дни",
+    "Трудоёмкость, астр. часы",
+    "Трудоёмкость, дни",
+    "Общая трудоёмкость, дни",
     "XP за проект",
-    "Название проекта на платформе и в Gitlab",
-    "Ссылки на GitLab/Google docs",
+    "% прохождения проекта",
+    "Количество p2p проверок",
+    "Список навыков (развесовка)",
+    "Название на платформе / Gitlab",
+    "Ссылки на GitLab",
 ]
 
-CSV_SECONDARY_HEADER = [
-    "Название всего блока (если делим на блоки)",
-    "- цели всего блока (чему научим)",
-    "",
-    "Название проекта",
-    "Краткое описание, что представляет собой проект и задания в нем",
-    "что узнает и чему научится участник конкретно в этом проекте,\nиспользуем таксономию Блума",
-    "список навыков, которые осваивает пир в этом проекте",
-    "Уровень подготовки участника",
-    "Инструменты, обязательные для выполнения проекта",
-    "Кейс, роль, рабочая ситуация и ограничения проекта",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "очень важно придерживаться правил именования проектов (конфля)",
-    "ссылки на готовые проекты - идеально ссылки на репы в гитлабе",
-]
+CSV_SECONDARY_HEADER = [""] * len(CSV_PRIMARY_HEADER)
 
 
 @dataclass(frozen=True)
@@ -66,7 +51,9 @@ class PlanNode:
     group: str
     block_key: str
     bloom: int
-    outcomes: tuple[str, ...]
+    outcomes_know: tuple[str, ...]
+    outcomes_can: tuple[str, ...]
+    outcomes_skills: tuple[str, ...]
     tools: tuple[str, ...]
 
 
@@ -83,10 +70,27 @@ def _display_group(candidate: SkillCandidate) -> str:
 
 
 def _node_from_candidate(candidate: SkillCandidate) -> PlanNode:
-    # Для outcomes берем индикаторы кандидата, а не только name, чтобы Блум не потерялся.
-    outcomes = tuple(indicator.text.strip() for indicator in candidate.indicators if indicator.text.strip())
-    if not outcomes:
-        outcomes = (_display_name(candidate),)
+    # Для ЗУН раскладываем индикаторы строго по Bloom-бакетам F/G/H.
+    outcomes_know: list[str] = []
+    outcomes_can: list[str] = []
+    outcomes_skills: list[str] = []
+    for indicator in candidate.indicators:
+        text = indicator.text.strip()
+        if not text:
+            continue
+        if indicator.bloom in config.UP_BLOOM_KNOW:
+            outcomes_know.append(text)
+        elif indicator.bloom in config.UP_BLOOM_CAN:
+            outcomes_can.append(text)
+        else:
+            outcomes_skills.append(text)
+    if not outcomes_know and not outcomes_can and not outcomes_skills:
+        if candidate.bloom <= 2:
+            outcomes_know.append(_display_name(candidate))
+        elif candidate.bloom <= 4:
+            outcomes_can.append(_display_name(candidate))
+        else:
+            outcomes_skills.append(_display_name(candidate))
     tools = tuple(sorted({tool.strip() for tool in candidate.tools if tool.strip()}))
     return PlanNode(
         tmp_id=candidate.tmp_id,
@@ -94,7 +98,9 @@ def _node_from_candidate(candidate: SkillCandidate) -> PlanNode:
         group=candidate.canonical_group or candidate.group or "Без группы",
         block_key=_display_group(candidate),
         bloom=candidate.bloom,
-        outcomes=outcomes,
+        outcomes_know=tuple(dict.fromkeys(outcomes_know)),
+        outcomes_can=tuple(dict.fromkeys(outcomes_can)),
+        outcomes_skills=tuple(dict.fromkeys(outcomes_skills)),
         tools=tools,
     )
 
@@ -152,6 +158,11 @@ def _project_storytelling(nodes: list[PlanNode], role: str, block_key: str) -> s
         f"Ты работаешь как {role} и решаешь учебный кейс по теме «{block_key}». "
         f"Нужно применить навыки {names} в ограниченном прикладном сценарии и защитить результат."
     )
+
+
+def _default_group_size(delivery_format: str) -> int:
+    bounds = config.UP_FORMAT_GROUP_SIZES.get(delivery_format, (1, 1))
+    return int(bounds[0])
 
 
 def _build_block_graph(nodes: list[PlanNode], dag_payload: dict[str, object]) -> tuple[nx.DiGraph, dict[str, int]]:
@@ -237,11 +248,9 @@ def _pack_projects(nodes: list[PlanNode], dag_payload: dict[str, object]) -> lis
 
 
 def _format_rows(blocks: list[list[list[PlanNode]]], spec: dict[str, object] | None) -> list[dict[str, object]]:
-    audience_level = _audience_label(spec)
     role = str((spec or {}).get("role") or "участник программы").strip()
     rows: list[dict[str, object]] = []
     row_number = 0
-    cumulative_days = 0.0
     for block_index, block in enumerate(blocks, start=1):
         block_keys = sorted({project[0].block_key for project in block if project})
         block_title = f"Блок {block_index}. " + " / ".join(block_keys)
@@ -250,14 +259,13 @@ def _format_rows(blocks: list[list[list[PlanNode]]], spec: dict[str, object] | N
         for project_index, project_nodes in enumerate(block, start=1):
             row_number += 1
             effort_hours = _estimate_project_hours(project_nodes)
-            effort_days = round(effort_hours / config.UP_HOURS_PER_DAY, 2) if config.UP_HOURS_PER_DAY else 0.0
-            cumulative_days = round(cumulative_days + effort_days, 2)
             required_tools = ", ".join(sorted({tool for node in project_nodes for tool in node.tools}))
-            learning_outcomes = "\n".join(
-                dict.fromkeys(outcome for node in project_nodes for outcome in node.outcomes)
-            )
+            outcomes_know = "\n".join(dict.fromkeys(outcome for node in project_nodes for outcome in node.outcomes_know))
+            outcomes_can = "\n".join(dict.fromkeys(outcome for node in project_nodes for outcome in node.outcomes_can))
+            outcomes_skills = "\n".join(dict.fromkeys(outcome for node in project_nodes for outcome in node.outcomes_skills))
             project_name = _project_name(project_nodes, block_index, project_index)
             block_key = project_nodes[0].block_key if project_nodes else "Общее"
+            delivery_format = config.UP_DEFAULT_FORMAT
             rows.append(
                 {
                     "block_index": block_index,
@@ -267,18 +275,25 @@ def _format_rows(blocks: list[list[list[PlanNode]]], spec: dict[str, object] | N
                     "block_goal": block_goal,
                     "project_name": project_name,
                     "project_summary": _project_summary(project_nodes, role),
-                    "learning_outcomes": learning_outcomes,
+                    "outcomes_know": outcomes_know,
+                    "outcomes_can": outcomes_can,
+                    "outcomes_skills": outcomes_skills,
+                    "learning_outcomes": "\n".join(item for item in [outcomes_know, outcomes_can, outcomes_skills] if item),
                     "skills_list": ", ".join(node.name for node in project_nodes),
-                    "audience_level": audience_level,
+                    "audience_level": _audience_label(spec),
                     "required_tools": required_tools,
+                    "materials": "",
                     "storytelling": _project_storytelling(project_nodes, role, block_key),
-                    "delivery_format": "индивидуальный",
-                    "group_size": "",
+                    "delivery_format": delivery_format,
+                    "group_size": _default_group_size(delivery_format),
                     "effort_hours": effort_hours,
-                    "effort_days": effort_days,
-                    "cumulative_days": cumulative_days,
-                    "xp": effort_hours * config.UP_XP_PER_HOUR,
-                    "platform_project_name": f"UP_{block_index}_{project_index}_{_slugify(project_name)}",
+                    "effort_days": "",
+                    "cumulative_days": "",
+                    "xp": "",
+                    "completion_percent": "",
+                    "p2p_checks": "",
+                    "weighted_skills": "",
+                    "platform_project_name": "",
                     "artifact_links": "",
                 }
             )

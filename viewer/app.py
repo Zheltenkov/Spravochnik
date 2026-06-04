@@ -32,12 +32,11 @@ PROJECT_ROOT = BASE_DIR.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 DEFAULT_DB = BASE_DIR.parent / "artifacts" / "skills_catalog.sqlite"
-DEFAULT_TARGET_DB = BASE_DIR.parent / "artifacts" / "target_catalog.sqlite"
 DEFAULT_SUMMARY = BASE_DIR.parent / "artifacts" / "catalog_summary.json"
 DEFAULT_COMPARE_REPORT = BASE_DIR.parent / "artifacts" / "live_catalog_comparison.json"
 INTAKE_SCHEMA_SQL = BASE_DIR.parent / "spravochnik_intake" / "sql" / "new_tables.sql"
 POWERSHELL_EXE = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
-TARGET_SCHEMA_READY: set[str] = set()
+CATALOG_ADMIN_SCHEMA_READY: set[str] = set()
 INTAKE_SCHEMA_READY: set[str] = set()
 INTAKE_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="intake")
 ACTIVE_INTAKE_JOB_IDS: set[int] = set()
@@ -105,11 +104,11 @@ INTAKE_STAGE_LABELS = {
     "queued": "Постановка в очередь",
     "starting": "Запуск",
     "decompose": "Декомпозиция брифа",
-    "search": "Поиск evidence",
-    "synthesize": "Синтез навыков",
+    "draft": "Черновик навыков",
     "atomize": "Атомизация кандидатов",
     "normalize": "Нормализация и дедупликация",
     "resolve": "Резолв против каталога",
+    "search": "Поиск evidence по серой зоне",
     "council": "Экспертное жюри",
     "triage": "Финальный триаж",
     "prerequisites": "Пререквизиты",
@@ -121,9 +120,10 @@ INTAKE_STAGE_LABELS = {
 INTAKE_PROGRESS_STEPS = [
     {"code": "queued", "label": "Очередь"},
     {"code": "decompose", "label": "Декомпозиция"},
-    {"code": "search", "label": "Поиск"},
+    {"code": "draft", "label": "Draft"},
     {"code": "normalize", "label": "Нормализация"},
     {"code": "resolve", "label": "Резолв"},
+    {"code": "search", "label": "Поиск"},
     {"code": "council", "label": "Council"},
     {"code": "persist", "label": "Запись"},
     {"code": "plan", "label": "УП"},
@@ -135,6 +135,14 @@ def normalize_search_text(value: object | None) -> str:
     if value is None:
         return ""
     return " ".join(str(value).casefold().replace("ё", "е").split())
+
+
+def normalize_catalog_key(value: object | None) -> str:
+    if value is None:
+        return ""
+    text = str(value).casefold().replace("ё", "е")
+    normalized = "".join(char if char.isalnum() or char in {"+", " "} else " " for char in text)
+    return " ".join(normalized.split())
 
 
 def review_reason_label(reason_code: str | None) -> str:
@@ -168,28 +176,54 @@ def intake_stage_label(stage: str | None) -> str:
 
 
 def open_db(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.create_function("search_norm", 1, normalize_search_text)
-    ensure_runtime_schema(conn)
-    return conn
-
-
-def open_target_db(db_path: Path) -> sqlite3.Connection:
     resolved = str(Path(db_path).resolve())
     conn = sqlite3.connect(db_path, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.create_function("search_norm", 1, normalize_search_text)
-    if resolved not in TARGET_SCHEMA_READY:
-        ensure_target_runtime_schema(conn)
-        TARGET_SCHEMA_READY.add(resolved)
+    ensure_runtime_schema(conn)
+    if resolved not in CATALOG_ADMIN_SCHEMA_READY:
+        ensure_catalog_admin_runtime_schema(conn)
+        CATALOG_ADMIN_SCHEMA_READY.add(resolved)
     return conn
 
 
 def load_summary(summary_path: Path) -> dict[str, object]:
     if not summary_path.exists():
         return {}
-    return json.loads(summary_path.read_text(encoding="utf-8"))
+    try:
+        return json.loads(summary_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def refresh_summary_counts(summary: dict[str, object], db_path: Path) -> dict[str, object]:
+    refreshed = dict(summary or {})
+    counts = dict(refreshed.get("counts") or {})
+    try:
+        conn = sqlite3.connect(db_path, timeout=30)
+        conn.row_factory = sqlite3.Row
+        counts.update(
+            {
+                "profiles": int(conn.execute("SELECT COUNT(*) FROM profile").fetchone()[0]) if table_exists(conn, "profile") else counts.get("profiles", 0),
+                "competencies": (
+                    int(conn.execute("SELECT COUNT(*) FROM competency").fetchone()[0])
+                    if table_exists(conn, "competency")
+                    else (
+                        int(conn.execute("SELECT COUNT(*) FROM profile_competency").fetchone()[0])
+                        if table_exists(conn, "profile_competency")
+                        else counts.get("competencies", 0)
+                    )
+                ),
+                "skills": int(conn.execute("SELECT COUNT(*) FROM skill WHERE status = 'active'").fetchone()[0]) if table_exists(conn, "skill") else counts.get("skills", 0),
+                "indicator_rows": int(conn.execute("SELECT COUNT(*) FROM indicator_row").fetchone()[0]) if table_exists(conn, "indicator_row") else counts.get("indicator_rows", 0),
+                "open_reviews": int(conn.execute("SELECT COUNT(*) FROM review_queue WHERE status = 'open'").fetchone()[0]) if table_exists(conn, "review_queue") else counts.get("open_reviews", 0),
+            }
+        )
+        conn.close()
+    except sqlite3.Error:
+        pass
+    refreshed["counts"] = counts
+    return refreshed
 
 
 def fetch_one(conn: sqlite3.Connection, query: str, params: tuple = ()) -> dict[str, object] | None:
@@ -302,8 +336,28 @@ def ensure_intake_runtime_schema(conn: sqlite3.Connection, db_path: Path) -> Non
 
         intake_storage.apply_migration(conn, str(INTAKE_SCHEMA_SQL))
         repair_intake_review_links(conn)
+        backfill_catalog_promotions(conn)
         INTAKE_SCHEMA_READY.add(resolved)
     repair_stale_intake_jobs(conn)
+
+
+def backfill_catalog_promotions(conn: sqlite3.Connection) -> None:
+    from spravochnik_intake.pipeline import storage as intake_storage
+
+    if not table_exists(conn, "skill_suggestion"):
+        return
+    rows = conn.execute(
+        """
+        SELECT DISTINCT brief_id
+        FROM skill_suggestion
+        WHERE entity_type = 'skill'
+          AND atomicity = 'atomic'
+          AND decision = 'accepted'
+        ORDER BY brief_id
+        """
+    ).fetchall()
+    for row in rows:
+        intake_storage.sync_promotions_for_brief(conn, int(row["brief_id"]))
 
 
 def utc_now_iso() -> str:
@@ -887,12 +941,93 @@ def hydrate_job_result_payload(conn: sqlite3.Connection, result: dict[str, objec
     return result
 
 
+def build_intake_workflow_steps(
+    job: dict[str, object] | None,
+    result: dict[str, object] | None,
+    dag_build_state: dict[str, object] | None,
+) -> list[dict[str, object]]:
+    if not job:
+        return []
+
+    job_status = str(job.get("status") or "")
+    candidates = result.get("candidates") if isinstance(result, dict) else []
+    candidates = candidates if isinstance(candidates, list) else []
+    accepted_count = len([item for item in candidates if isinstance(item, dict) and item.get("decision") == "accepted"])
+    review_count = len([item for item in candidates if isinstance(item, dict) and item.get("decision") == "needs_review"])
+
+    persisted = result.get("persisted") if isinstance(result, dict) and isinstance(result.get("persisted"), dict) else {}
+    if isinstance(persisted, dict) and persisted.get("review_open") is not None:
+        try:
+            review_count = int(persisted.get("review_open") or 0)
+        except (TypeError, ValueError):
+            pass
+    promoted_count = int(persisted.get("catalog_promoted") or 0) if isinstance(persisted, dict) else 0
+
+    dag_payload = result.get("dag") if isinstance(result, dict) and isinstance(result.get("dag"), dict) else {}
+    curriculum_plan = result.get("curriculum_plan") if isinstance(result, dict) and isinstance(result.get("curriculum_plan"), dict) else {}
+    dag_nodes = int(dag_payload.get("nodes") or 0) if isinstance(dag_payload, dict) else 0
+    plan_id = curriculum_plan.get("plan_id") if isinstance(curriculum_plan, dict) else None
+
+    if job_status in {"pending", "running"}:
+        review_status = "active"
+        catalog_status = "pending"
+        up_status = "pending"
+    elif job_status == "failed":
+        review_status = "warn"
+        catalog_status = "pending"
+        up_status = "pending"
+    else:
+        review_status = "active" if review_count else "done"
+        catalog_status = "done" if promoted_count or accepted_count else ("active" if not review_count else "pending")
+        up_status = "done" if plan_id else ("active" if dag_nodes and not review_count else "pending")
+
+    accepted_atomic = dag_build_state.get("accepted_atomic_count") if isinstance(dag_build_state, dict) else accepted_count
+    open_review = dag_build_state.get("open_review_count") if isinstance(dag_build_state, dict) else review_count
+
+    return [
+        {
+            "key": "brief",
+            "label": "Бриф",
+            "status": "done",
+            "description": "Текст или документ принят в обработку.",
+            "href": f"/intake/jobs/{job['id']}",
+        },
+        {
+            "key": "review",
+            "label": "Проверка",
+            "status": review_status,
+            "description": (
+                f"Открыто вопросов: {open_review}."
+                if review_status == "active"
+                else ("Intake завершился ошибкой." if review_status == "warn" else "Кандидаты проверены.")
+            ),
+            "href": "/reviews" if review_count else f"/intake/jobs/{job['id']}",
+        },
+        {
+            "key": "catalog",
+            "label": "Справочник пополнен",
+            "status": catalog_status,
+            "description": f"Принято: {accepted_atomic or accepted_count}, промоций: {promoted_count}.",
+            "href": "/catalog-admin/groups",
+        },
+        {
+            "key": "up",
+            "label": "УП",
+            "status": up_status,
+            "description": "Черновик доступен." if plan_id else "Появится после принятия навыков и DAG.",
+            "href": f"/up/plans/{plan_id}" if plan_id else "/up",
+        },
+    ]
+
+
 def apply_candidate_decision(
     conn: sqlite3.Connection,
     suggestion_id: int,
     target_decision: str,
     resolution_note: str | None = None,
 ) -> int | None:
+    from spravochnik_intake.pipeline import storage
+
     row = conn.execute(
         """
         SELECT id, brief_id
@@ -929,6 +1064,10 @@ def apply_candidate_decision(
         """,
         (review_status, resolution_note, reviewed_at, now, f"brief:{brief_id}", suggestion_id),
     )
+    if target_decision == "accepted":
+        storage.promote_suggestion_to_catalog(conn, suggestion_id)
+    else:
+        storage.revert_suggestion_promotion(conn, suggestion_id)
     clear_brief_dag_artifacts(conn, brief_id)
     conn.commit()
     build_dag_for_brief(conn, brief_id)
@@ -1049,8 +1188,10 @@ def build_curriculum_plan_for_brief(
 
 
 def build_dag_for_brief(conn: sqlite3.Connection, brief_id: int) -> dict[str, object]:
+    from spravochnik_intake.pipeline import llm as intake_llm
     from spravochnik_intake.pipeline import stage_catalog_to_dag, storage
 
+    storage.sync_promotions_for_brief(conn, brief_id)
     clear_brief_dag_artifacts(conn, brief_id)
     cands, tmp_to_db = load_accepted_skill_candidates(conn, brief_id)
     if not cands:
@@ -1084,7 +1225,11 @@ def build_dag_for_brief(conn: sqlite3.Connection, brief_id: int) -> dict[str, ob
             "curriculum_plan": plan_payload,
         }
 
-    edges, dag, removed_cycle, removed_transitive, dag_payload = stage_catalog_to_dag.run(cands)
+    intake_llm.set_usage_context(stage="dag", brief_id=brief_id)
+    try:
+        edges, dag, removed_cycle, removed_transitive, dag_payload = stage_catalog_to_dag.run(cands)
+    finally:
+        intake_llm.set_usage_context(stage=None)
     prereq_count = storage.save_prerequisites(conn, brief_id, dag, cands, tmp_to_db)
     prereq_review_count = storage.save_prerequisite_reviews(conn, brief_id, dag_payload["edge_review_queue"])
     dag_payload["status"] = "built"
@@ -1132,13 +1277,60 @@ def list_dag_build_options(conn: sqlite3.Connection) -> list[dict[str, object]]:
     return options
 
 
-def ensure_target_runtime_schema(conn: sqlite3.Connection) -> None:
+def ensure_catalog_admin_runtime_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS skill_group (
+            id INTEGER PRIMARY KEY,
+            code TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL UNIQUE,
+            sort_order INTEGER NOT NULL DEFAULT 999,
+            status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'candidate', 'deprecated')),
+            source TEXT NOT NULL DEFAULT 'derived' CHECK (source IN ('live_snapshot', 'manual', 'derived')),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS indicator (
+            id INTEGER PRIMARY KEY,
+            skill_id INTEGER NOT NULL REFERENCES skill(id) ON DELETE CASCADE,
+            indicator_type TEXT NOT NULL,
+            text TEXT NOT NULL,
+            normalized_text TEXT NOT NULL,
+            sort_order INTEGER NOT NULL DEFAULT 999,
+            complexity_band TEXT,
+            complexity_label TEXT,
+            complexity_sort_order INTEGER,
+            source_indicator_row_id INTEGER,
+            source_profile_name TEXT,
+            source_scale_title TEXT,
+            is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT,
+            UNIQUE (skill_id, indicator_type, normalized_text)
+        )
+        """
+    )
     skill_columns = {
+        "group_id": "INTEGER REFERENCES skill_group(id) ON DELETE SET NULL",
+        "code": "TEXT",
+        "name": "TEXT",
         "sort_order": "INTEGER NOT NULL DEFAULT 999",
         "complexity_min_band": "TEXT",
         "complexity_max_band": "TEXT",
         "complexity_summary": "TEXT",
         "source_scale_title": "TEXT",
+        "description": "TEXT",
+        "source_skill_id": "INTEGER",
+        "source_skill_name": "TEXT",
+        "resolution_status": "TEXT NOT NULL DEFAULT 'matched'",
+        "match_note": "TEXT",
+        "is_active": "INTEGER NOT NULL DEFAULT 1",
+        "created_at": "TEXT",
+        "updated_at": "TEXT",
     }
     indicator_columns = {
         "complexity_band": "TEXT",
@@ -1146,6 +1338,9 @@ def ensure_target_runtime_schema(conn: sqlite3.Connection) -> None:
         "complexity_sort_order": "INTEGER",
         "source_scale_title": "TEXT",
     }
+
+    if table_exists(conn, "skill") and not column_exists(conn, "skill", "group_id"):
+        conn.execute("ALTER TABLE skill ADD COLUMN group_id INTEGER REFERENCES skill_group(id) ON DELETE SET NULL")
 
     if table_exists(conn, "skill") and not column_exists(conn, "skill", "sort_order"):
         conn.execute("ALTER TABLE skill ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 999")
@@ -1172,6 +1367,14 @@ def ensure_target_runtime_schema(conn: sqlite3.Connection) -> None:
             if not column_exists(conn, "skill", column_name):
                 conn.execute(f"ALTER TABLE skill ADD COLUMN {column_name} {column_type}")
 
+        fallback_group_id = ensure_catalog_group(conn, "uncategorized", "Прочие навыки", 9999, "active", "derived")
+        if column_exists(conn, "skill", "canonical_name"):
+            conn.execute("UPDATE skill SET name = canonical_name WHERE name IS NULL OR TRIM(name) = ''")
+        conn.execute("UPDATE skill SET code = 'skill-' || id WHERE code IS NULL OR TRIM(code) = ''")
+        conn.execute("UPDATE skill SET group_id = ? WHERE group_id IS NULL", (fallback_group_id,))
+        conn.execute("UPDATE skill SET is_active = CASE WHEN status = 'deprecated' THEN 0 ELSE 1 END WHERE is_active IS NULL")
+        conn.execute("UPDATE skill SET resolution_status = 'matched' WHERE resolution_status IS NULL OR TRIM(resolution_status) = ''")
+
     if table_exists(conn, "indicator"):
         for column_name, column_type in indicator_columns.items():
             if not column_exists(conn, "indicator", column_name):
@@ -1184,11 +1387,56 @@ def ensure_target_runtime_schema(conn: sqlite3.Connection) -> None:
             ON skill (group_id, is_active, sort_order, name)
             """
         )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_skill_code ON skill(code)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_skill_active_status ON skill(status, is_active)")
 
     if table_exists(conn, "skill") and table_exists(conn, "indicator"):
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_indicator_skill_active
+            ON indicator(skill_id, is_active, sort_order)
+            """
+        )
         for row in conn.execute("SELECT id FROM skill ORDER BY id"):
-            refresh_target_skill_complexity(conn, row["id"], commit=False)
+            refresh_catalog_skill_complexity(conn, row["id"], commit=False)
     conn.commit()
+
+
+def ensure_catalog_group(
+    conn: sqlite3.Connection,
+    code: str,
+    name: str,
+    sort_order: int,
+    status: str = "active",
+    source: str = "derived",
+) -> int:
+    row = conn.execute(
+        "SELECT id FROM skill_group WHERE code = ? OR name = ? ORDER BY id LIMIT 1",
+        (code, name),
+    ).fetchone()
+    if row:
+        conn.execute(
+            """
+            UPDATE skill_group
+            SET code = ?,
+                name = ?,
+                sort_order = ?,
+                status = ?,
+                source = COALESCE(NULLIF(source, ''), ?),
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (code, name, sort_order, status, source, utc_now_iso(), int(row["id"])),
+        )
+        return int(row["id"])
+    cursor = conn.execute(
+        """
+        INSERT INTO skill_group(code, name, sort_order, status, source, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (code, name, sort_order, status, source, utc_now_iso()),
+    )
+    return int(cursor.lastrowid)
 
 
 def decode_uploaded_text(data: bytes) -> str:
@@ -1303,8 +1551,10 @@ def run_intake_pipeline(
     conn: sqlite3.Connection,
     db_path: Path,
     brief_text: str,
+    intake_job_id: int | None = None,
     progress_callback: Callable[[str, str], None] | None = None,
 ) -> dict[str, object]:
+    from spravochnik_intake.pipeline import llm as intake_llm
     from spravochnik_intake.pipeline import stage_brief_to_catalog, stage_normalize, storage
     from spravochnik_intake.pipeline import config as intake_config
     from spravochnik_intake.pipeline.catalog_repo import CatalogRepo
@@ -1318,22 +1568,44 @@ def run_intake_pipeline(
 
     repo = CatalogRepo(str(db_path))
     try:
+        intake_llm.set_usage_context(job_id=intake_job_id, brief_id=None, stage="decompose")
         notify("decompose", "Декомпозиция свободного брифа в роль, уровень и поисковые подзапросы.")
         spec = stage_brief_to_catalog.decompose(brief_text)
-        notify("search", "Сбор внешних evidence по подзапросам.")
-        evidence = stage_brief_to_catalog.gather_evidence(spec["sub_queries"])
-        notify("synthesize", "Синтез навыков-кандидатов и индикаторов по найденным evidence.")
-        raw_candidates, coverage = stage_brief_to_catalog.synthesize_with_coverage(evidence, spec)
+
+        intake_llm.set_usage_context(job_id=intake_job_id, brief_id=None, stage="draft")
+        notify("draft", "Черновик навыков из брифа без внешнего поиска.")
+        raw_candidates, coverage = stage_brief_to_catalog.synthesize_draft_from_brief(brief_text, spec)
+
+        intake_llm.set_usage_context(job_id=intake_job_id, brief_id=None, stage="atomize")
         notify("atomize", "Проверка атомарности кандидатов, разбиение составных формулировок и реклассификация не-навыков.")
         atomized_candidates = stage_brief_to_catalog.atomize_candidates(raw_candidates, spec)
+
+        intake_llm.set_usage_context(job_id=intake_job_id, brief_id=None, stage="normalize")
         notify("normalize", "Нормализация названий и безопасное схлопывание дублирующих atomic skills.")
         candidates, normalize_report = stage_normalize.run(atomized_candidates, spec)
+
+        intake_llm.set_usage_context(job_id=intake_job_id, brief_id=None, stage="resolve")
         notify("resolve", "Сопоставление навыков-кандидатов с текущим каталогом.")
+        evidence = []
         stage_brief_to_catalog.resolve_candidates(candidates, evidence, repo)
+
+        gray_candidates = stage_brief_to_catalog.select_evidence_enrichment_candidates(candidates)
+        if gray_candidates:
+            intake_llm.set_usage_context(job_id=intake_job_id, brief_id=None, stage="search")
+            notify("search", f"Сбор external evidence только для серой зоны: {len(gray_candidates)} кандидатов.")
+            evidence = stage_brief_to_catalog.gather_evidence_for_gray_zone(candidates, spec, cache_conn=conn)
+            intake_llm.set_usage_context(job_id=intake_job_id, brief_id=None, stage="resolve")
+            notify("resolve", "Повторный резолв после evidence enrichment серой зоны.")
+            stage_brief_to_catalog.resolve_candidates(candidates, evidence, repo)
+        else:
+            notify("search", "Внешний поиск не потребовался: кандидаты закрылись текущим каталогом.")
+
+        coverage = stage_brief_to_catalog.build_coverage_audit(spec, candidates)
         council_metrics_preview = {
             "sent_to_council": len(stage_brief_to_catalog.select_council_candidates(candidates)),
         }
         if intake_config.USE_COUNCIL and council_metrics_preview["sent_to_council"] > 0:
+            intake_llm.set_usage_context(job_id=intake_job_id, brief_id=None, stage="council")
             notify(
                 "council",
                 f"Экспертное жюри проверяет спорные навыки: {council_metrics_preview['sent_to_council']} кандидатов.",
@@ -1341,16 +1613,19 @@ def run_intake_pipeline(
             stage_brief_to_catalog.run_council(candidates)
         else:
             notify("council", "Council не потребовался: спорных навыков для panel нет.")
+        intake_llm.set_usage_context(job_id=intake_job_id, brief_id=None, stage="triage")
         notify("triage", "Финальный триаж: что принять автоматически, а что отправить на review.")
         stage_brief_to_catalog.triage_candidates(candidates, spec)
         candidate_metrics = stage_brief_to_catalog.build_candidate_metrics(candidates)
     finally:
-        repo.con.close()
+        intake_llm.clear_usage_context()
+        repo.close()
 
     notify("persist", "Запись результатов в каталог и очередь проверки.")
     brief_id = storage.save_brief(conn, brief_text, spec)
     evidence_map = storage.save_evidence(conn, brief_id, evidence)
     tmp_to_db = storage.save_suggestions(conn, brief_id, candidates, evidence_map)
+    promotion_stats = storage.sync_promotions_for_brief(conn, brief_id)
     by_tid = {candidate.tmp_id: candidate for candidate in candidates}
     atomize_events = []
     for candidate in atomized_candidates:
@@ -1375,7 +1650,9 @@ def run_intake_pipeline(
             )
 
     notify("plan", "Сборка DAG и черновика учебного плана по принятым навыкам.")
+    intake_llm.set_usage_context(job_id=intake_job_id, brief_id=brief_id, stage="dag")
     dag_build_result = build_dag_for_brief(conn, brief_id)
+    intake_llm.clear_usage_context()
     dag_payload = dag_build_result["dag"]
     dag_state = dag_build_result["state"]
     curriculum_plan = dag_build_result.get("curriculum_plan", build_deferred_curriculum_plan_payload("Черновик УП пока не сформирован."))
@@ -1429,6 +1706,8 @@ def run_intake_pipeline(
             "prerequisite_reviews": int(dag_payload.get("prerequisite_review_rows", 0) or 0),
             "curriculum_plan_rows": int(curriculum_plan.get("row_count", 0) or 0),
             "review_open": int(dag_state["open_review_count"]),
+            "catalog_promoted": int(promotion_stats.get("promoted", 0) or 0),
+            "catalog_reverted": int(promotion_stats.get("reverted", 0) or 0),
         },
         "meta": {
             "use_live": intake_config.USE_LIVE,
@@ -1467,7 +1746,13 @@ def execute_intake_job(db_path: Path, job_id: int) -> None:
             finally:
                 worker_conn.close()
 
-        result = run_intake_pipeline(conn, db_path, str(job["brief_text"]), progress_callback=progress)
+        result = run_intake_pipeline(
+            conn,
+            db_path,
+            str(job["brief_text"]),
+            intake_job_id=job_id,
+            progress_callback=progress,
+        )
         update_intake_job(
             conn,
             job_id,
@@ -1558,7 +1843,7 @@ def build_complexity_summary(
     return f"{left} -> {right}"
 
 
-def refresh_target_skill_complexity(conn: sqlite3.Connection, skill_id: int, commit: bool = True) -> None:
+def refresh_catalog_skill_complexity(conn: sqlite3.Connection, skill_id: int, commit: bool = True) -> None:
     rows = conn.execute(
         """
         SELECT
@@ -1622,6 +1907,8 @@ def refresh_target_skill_complexity(conn: sqlite3.Connection, skill_id: int, com
 
 
 def update_review_status(conn: sqlite3.Connection, review_id: int, new_status: str, resolution_note: str) -> None:
+    from spravochnik_intake.pipeline import storage
+
     repair_intake_review_links(conn)
     review_row = conn.execute(
         """
@@ -1658,6 +1945,10 @@ def update_review_status(conn: sqlite3.Connection, review_id: int, new_status: s
             "UPDATE skill_suggestion SET decision = ? WHERE id = ?",
             (mapped_decision, suggestion_id),
         )
+        if mapped_decision == "accepted":
+            storage.promote_suggestion_to_catalog(conn, suggestion_id)
+        else:
+            storage.revert_suggestion_promotion(conn, suggestion_id)
         clear_brief_dag_artifacts(conn, brief_id)
     conn.commit()
     if brief_id is not None:
@@ -1698,22 +1989,65 @@ def curriculum_plan_to_csv_bytes(plan_payload: dict[str, object]) -> bytes:
                 row.get("row_number", ""),
                 row.get("project_name", ""),
                 row.get("project_summary", ""),
-                row.get("learning_outcomes", ""),
-                row.get("skills_list", ""),
-                row.get("audience_level", ""),
+                row.get("outcomes_know", ""),
+                row.get("outcomes_can", ""),
+                row.get("outcomes_skills", ""),
                 row.get("required_tools", ""),
+                row.get("materials", ""),
                 row.get("storytelling", ""),
                 row.get("delivery_format", ""),
                 row.get("group_size", ""),
                 row.get("effort_hours", ""),
-                row.get("effort_days", ""),
-                row.get("cumulative_days", ""),
-                row.get("xp", ""),
-                row.get("platform_project_name", ""),
-                row.get("artifact_links", ""),
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
             ]
         )
     return buffer.getvalue().encode("utf-8-sig")
+
+
+def load_llm_usage_summary(job_id: int) -> dict[str, object]:
+    from spravochnik_intake.pipeline import config as intake_config
+
+    path = Path(intake_config.LLM_USAGE_LOG_PATH)
+    if not path.exists():
+        return {"total_tokens": 0, "prompt_tokens": 0, "completion_tokens": 0, "rows": []}
+    aggregate: dict[tuple[str, str], dict[str, object]] = {}
+    totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if int(record.get("job_id") or 0) != job_id:
+                continue
+            stage = str(record.get("stage") or "unknown")
+            model = str(record.get("model") or "unknown")
+            key = (stage, model)
+            row = aggregate.setdefault(
+                key,
+                {
+                    "stage": stage,
+                    "model": model,
+                    "calls": 0,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                },
+            )
+            row["calls"] = int(row["calls"]) + 1
+            for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                value = int(record.get(field) or 0)
+                row[field] = int(row[field]) + value
+                totals[field] += value
+    rows = sorted(aggregate.values(), key=lambda item: (str(item["stage"]), str(item["model"])))
+    return {**totals, "rows": rows}
 
 
 def load_curriculum_plan_rows(conn: sqlite3.Connection, plan_id: int) -> list[dict[str, object]]:
@@ -1743,6 +2077,15 @@ def build_curriculum_plan_payload_from_rows(
             payload = json.loads(str(plan_meta["payload_json"]))
         except json.JSONDecodeError:
             payload = {}
+
+    normalized_rows: list[dict[str, object]] = []
+    for source_row in rows:
+        row = dict(source_row)
+        if not any(row.get(key) for key in ("outcomes_know", "outcomes_can", "outcomes_skills")) and row.get("learning_outcomes"):
+            row["outcomes_can"] = row.get("learning_outcomes")
+        row.setdefault("materials", "")
+        normalized_rows.append(row)
+    rows = normalized_rows
 
     total_hours = sum(float(row.get("effort_hours", 0) or 0) for row in rows)
     total_days = sum(float(row.get("effort_days", 0) or 0) for row in rows)
@@ -1945,11 +2288,12 @@ def create_curriculum_plan_row(conn: sqlite3.Connection, plan_id: int) -> int:
         """
         INSERT INTO curriculum_plan_row(
             plan_id, block_index, row_number, project_index_in_block, block_title, block_goal,
-            project_name, project_summary, learning_outcomes, skills_list, audience_level,
-            required_tools, storytelling, delivery_format, group_size, effort_hours, effort_days,
+            project_name, project_summary, outcomes_know, outcomes_can, outcomes_skills,
+            learning_outcomes, skills_list, audience_level, required_tools, materials,
+            storytelling, delivery_format, group_size, effort_hours, effort_days,
             cumulative_days, xp, platform_project_name, artifact_links
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             plan_id,
@@ -1962,16 +2306,20 @@ def create_curriculum_plan_row(conn: sqlite3.Connection, plan_id: int) -> int:
             "",
             "",
             "",
+            "",
+            "",
+            "",
             plan.get("audience_level", "Начальный"),
             "",
             "",
-            "индивидуальный",
             "",
+            "индивидуальный",
+            1,
             0.0,
-            0.0,
-            0.0,
-            0,
-            f"UP_{next_block_index}_{next_project_index}_{slugify(f'Новый проект {next_row_number}')}",
+            None,
+            None,
+            None,
+            "",
             "",
         ),
     )
@@ -2012,6 +2360,10 @@ def update_curriculum_plan_row(conn: sqlite3.Connection, plan_id: int, row_id: i
     row = get_curriculum_plan_row(conn, plan_id, row_id)
     if not row:
         raise ValueError("Curriculum plan row not found")
+    outcomes_know = form_data.get("outcomes_know", "").strip()
+    outcomes_can = form_data.get("outcomes_can", "").strip()
+    outcomes_skills = form_data.get("outcomes_skills", "").strip()
+    learning_outcomes = "\n".join(item for item in [outcomes_know, outcomes_can, outcomes_skills] if item)
     conn.execute(
         """
         UPDATE curriculum_plan_row
@@ -2022,10 +2374,14 @@ def update_curriculum_plan_row(conn: sqlite3.Connection, plan_id: int, row_id: i
             block_goal = ?,
             project_name = ?,
             project_summary = ?,
+            outcomes_know = ?,
+            outcomes_can = ?,
+            outcomes_skills = ?,
             learning_outcomes = ?,
             skills_list = ?,
             audience_level = ?,
             required_tools = ?,
+            materials = ?,
             storytelling = ?,
             delivery_format = ?,
             group_size = ?,
@@ -2045,19 +2401,23 @@ def update_curriculum_plan_row(conn: sqlite3.Connection, plan_id: int, row_id: i
             form_data.get("block_goal", "").strip(),
             form_data.get("project_name", "").strip(),
             form_data.get("project_summary", "").strip(),
-            form_data.get("learning_outcomes", "").strip(),
+            outcomes_know,
+            outcomes_can,
+            outcomes_skills,
+            learning_outcomes,
             form_data.get("skills_list", "").strip(),
             form_data.get("audience_level", "").strip(),
             form_data.get("required_tools", "").strip(),
+            form_data.get("materials", "").strip(),
             form_data.get("storytelling", "").strip(),
             form_data.get("delivery_format", "").strip(),
             form_data.get("group_size", "").strip(),
             parse_optional_float(form_data.get("effort_hours")) or 0.0,
-            parse_optional_float(form_data.get("effort_days")) or 0.0,
-            parse_optional_float(form_data.get("cumulative_days")) or 0.0,
-            parse_optional_int(form_data.get("xp")) or 0,
-            form_data.get("platform_project_name", "").strip(),
-            form_data.get("artifact_links", "").strip(),
+            None,
+            None,
+            None,
+            "",
+            "",
             row_id,
             plan_id,
         ),
@@ -2076,7 +2436,7 @@ def delete_curriculum_plan_row(conn: sqlite3.Connection, plan_id: int, row_id: i
     sync_curriculum_plan_payload(conn, plan_id)
 
 
-def list_target_groups(conn: sqlite3.Connection) -> list[dict[str, object]]:
+def list_catalog_groups(conn: sqlite3.Connection) -> list[dict[str, object]]:
     return fetch_all(
         conn,
         """
@@ -2109,7 +2469,7 @@ def list_target_groups(conn: sqlite3.Connection) -> list[dict[str, object]]:
     )
 
 
-def get_target_group(conn: sqlite3.Connection, group_id: int) -> dict[str, object] | None:
+def get_catalog_group(conn: sqlite3.Connection, group_id: int) -> dict[str, object] | None:
     return fetch_one(
         conn,
         """
@@ -2142,7 +2502,7 @@ def get_target_group(conn: sqlite3.Connection, group_id: int) -> dict[str, objec
     )
 
 
-def list_target_group_skills(conn: sqlite3.Connection, group_id: int) -> list[dict[str, object]]:
+def list_catalog_group_skills(conn: sqlite3.Connection, group_id: int) -> list[dict[str, object]]:
     return fetch_all(
         conn,
         """
@@ -2174,7 +2534,7 @@ def list_target_group_skills(conn: sqlite3.Connection, group_id: int) -> list[di
     )
 
 
-def get_target_skill(conn: sqlite3.Connection, skill_id: int) -> dict[str, object] | None:
+def get_catalog_skill(conn: sqlite3.Connection, skill_id: int) -> dict[str, object] | None:
     return fetch_one(
         conn,
         """
@@ -2194,6 +2554,7 @@ def get_target_skill(conn: sqlite3.Connection, skill_id: int) -> dict[str, objec
             s.resolution_status,
             s.match_note,
             s.is_active,
+            s.status,
             (
                 SELECT COUNT(*)
                 FROM indicator i_all
@@ -2208,7 +2569,7 @@ def get_target_skill(conn: sqlite3.Connection, skill_id: int) -> dict[str, objec
     )
 
 
-def get_target_indicator(conn: sqlite3.Connection, indicator_id: int) -> dict[str, object] | None:
+def get_catalog_indicator(conn: sqlite3.Connection, indicator_id: int) -> dict[str, object] | None:
     return fetch_one(
         conn,
         """
@@ -2231,7 +2592,7 @@ def get_target_indicator(conn: sqlite3.Connection, indicator_id: int) -> dict[st
     )
 
 
-def list_target_indicators(conn: sqlite3.Connection, skill_id: int) -> list[dict[str, object]]:
+def list_catalog_indicators(conn: sqlite3.Connection, skill_id: int) -> list[dict[str, object]]:
     return fetch_all(
         conn,
         """
@@ -2253,6 +2614,240 @@ def list_target_indicators(conn: sqlite3.Connection, skill_id: int) -> list[dict
         """,
         (skill_id,),
     )
+
+
+def list_skill_aliases(conn: sqlite3.Connection, skill_id: int) -> list[dict[str, object]]:
+    return fetch_all(
+        conn,
+        """
+        SELECT id, alias, normalized_alias, source
+        FROM skill_alias
+        WHERE skill_id = ?
+        ORDER BY source, alias, id
+        """,
+        (skill_id,),
+    )
+
+
+def find_alias_owner(conn: sqlite3.Connection, normalized_alias: str, exclude_skill_id: int | None = None) -> dict[str, object] | None:
+    params: list[object] = [normalized_alias]
+    exclude_clause = ""
+    if exclude_skill_id is not None:
+        exclude_clause = "AND s.id <> ?"
+        params.append(exclude_skill_id)
+    return fetch_one(
+        conn,
+        f"""
+        SELECT s.id, s.name, s.canonical_name, s.is_active, s.status
+        FROM skill_alias sa
+        JOIN skill s ON s.id = sa.skill_id
+        WHERE sa.normalized_alias = ?
+          {exclude_clause}
+          AND COALESCE(s.is_active, 1) = 1
+          AND COALESCE(s.status, 'active') = 'active'
+        ORDER BY s.id
+        LIMIT 1
+        """,
+        tuple(params),
+    )
+
+
+def add_skill_alias(conn: sqlite3.Connection, skill_id: int, alias: str, source: str = "manual") -> str:
+    cleaned = alias.strip()
+    normalized_alias = normalize_catalog_key(cleaned)
+    if not cleaned or not normalized_alias:
+        return "empty"
+    skill = get_catalog_skill(conn, skill_id)
+    if not skill:
+        return "missing_skill"
+    conflict = find_alias_owner(conn, normalized_alias, exclude_skill_id=skill_id)
+    if conflict:
+        return "conflict"
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO skill_alias(skill_id, alias, normalized_alias, source)
+        VALUES (?, ?, ?, ?)
+        """,
+        (skill_id, cleaned, normalized_alias, source),
+    )
+    conn.commit()
+    return "added"
+
+
+def remove_skill_alias(conn: sqlite3.Connection, skill_id: int, alias_id: int) -> str:
+    row = fetch_one(
+        conn,
+        "SELECT id FROM skill_alias WHERE id = ? AND skill_id = ?",
+        (alias_id, skill_id),
+    )
+    if not row:
+        return "missing"
+    conn.execute("DELETE FROM skill_alias WHERE id = ? AND skill_id = ?", (alias_id, skill_id))
+    conn.commit()
+    return "removed"
+
+
+def search_catalog_skills(
+    conn: sqlite3.Connection,
+    query: str,
+    exclude_skill_id: int | None = None,
+    limit: int = 15,
+) -> list[dict[str, object]]:
+    normalized_query = normalize_search_text(query)
+    if not normalized_query:
+        return []
+    params: list[object] = [normalized_query, normalized_query, normalized_query, normalized_query]
+    exclude_clause = ""
+    if exclude_skill_id is not None:
+        exclude_clause = "AND s.id <> ?"
+        params.append(exclude_skill_id)
+    params.append(limit)
+    return fetch_all(
+        conn,
+        f"""
+        SELECT
+            s.id,
+            s.name,
+            s.canonical_name,
+            s.normalized_name,
+            s.group_id,
+            sg.name AS group_name,
+            s.is_active,
+            s.status,
+            COUNT(DISTINCT i.id) AS indicator_count,
+            COUNT(DISTINCT sa.id) AS alias_count
+        FROM skill s
+        LEFT JOIN skill_group sg ON sg.id = s.group_id
+        LEFT JOIN indicator i ON i.skill_id = s.id AND i.is_active = 1
+        LEFT JOIN skill_alias sa ON sa.skill_id = s.id
+        WHERE (
+            instr(search_norm(COALESCE(s.name, '')), ?) > 0
+            OR instr(search_norm(COALESCE(s.canonical_name, '')), ?) > 0
+            OR instr(search_norm(COALESCE(s.normalized_name, '')), ?) > 0
+            OR EXISTS (
+                SELECT 1
+                FROM skill_alias sa2
+                WHERE sa2.skill_id = s.id
+                  AND instr(search_norm(sa2.alias), ?) > 0
+            )
+        )
+        {exclude_clause}
+        GROUP BY s.id, s.name, s.canonical_name, s.normalized_name, s.group_id, sg.name, s.is_active, s.status
+        ORDER BY COALESCE(s.is_active, 1) DESC, s.name
+        LIMIT ?
+        """,
+        tuple(params),
+    )
+
+
+def merge_catalog_skills(conn: sqlite3.Connection, source_skill_id: int, target_skill_id: int) -> dict[str, int | str]:
+    if source_skill_id == target_skill_id:
+        return {"status": "same_skill"}
+    source = get_catalog_skill(conn, source_skill_id)
+    target = get_catalog_skill(conn, target_skill_id)
+    if not source or not target:
+        return {"status": "missing_skill"}
+
+    moved_aliases = 0
+    moved_indicators = 0
+    archived_duplicate_indicators = 0
+    now = datetime.now(UTC).isoformat()
+
+    # Preserve the source canonical label as an alias of the merge target.
+    for alias in [source.get("name"), source.get("canonical_name"), source.get("source_skill_name")]:
+        if alias and add_skill_alias(conn, target_skill_id, str(alias), source="merge") == "added":
+            moved_aliases += 1
+
+    for alias_row in list_skill_aliases(conn, source_skill_id):
+        alias = str(alias_row["alias"] or "").strip()
+        normalized_alias = str(alias_row["normalized_alias"] or "").strip() or normalize_catalog_key(alias)
+        if not alias or not normalized_alias:
+            continue
+        conflict = find_alias_owner(conn, normalized_alias, exclude_skill_id=source_skill_id)
+        if conflict and int(conflict["id"]) != target_skill_id:
+            continue
+        inserted = conn.execute(
+            """
+            INSERT OR IGNORE INTO skill_alias(skill_id, alias, normalized_alias, source)
+            VALUES (?, ?, ?, ?)
+            """,
+            (target_skill_id, alias, normalized_alias, str(alias_row["source"] or "merge")),
+        ).rowcount
+        moved_aliases += max(int(inserted or 0), 0)
+
+    for indicator in fetch_all(conn, "SELECT * FROM indicator WHERE skill_id = ? ORDER BY sort_order, id", (source_skill_id,)):
+        duplicate = fetch_one(
+            conn,
+            """
+            SELECT id
+            FROM indicator
+            WHERE skill_id = ?
+              AND indicator_type = ?
+              AND normalized_text = ?
+            """,
+            (target_skill_id, indicator["indicator_type"], indicator["normalized_text"]),
+        )
+        if duplicate:
+            conn.execute(
+                """
+                UPDATE indicator
+                SET is_active = 0,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now, indicator["id"]),
+            )
+            archived_duplicate_indicators += 1
+            continue
+        conn.execute(
+            """
+            UPDATE indicator
+            SET skill_id = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (target_skill_id, now, indicator["id"]),
+        )
+        moved_indicators += 1
+
+    if table_exists(conn, "skill_suggestion"):
+        conn.execute(
+            """
+            UPDATE skill_suggestion
+            SET canonical_skill_id = ?,
+                resolution = 'alias'
+            WHERE canonical_skill_id = ?
+            """,
+            (target_skill_id, source_skill_id),
+        )
+    if table_exists(conn, "skill_promotion_log"):
+        conn.execute("UPDATE skill_promotion_log SET skill_id = ? WHERE skill_id = ?", (target_skill_id, source_skill_id))
+    if table_exists(conn, "skill_prerequisite"):
+        conn.execute("UPDATE skill_prerequisite SET src_skill_id = ? WHERE src_skill_id = ?", (target_skill_id, source_skill_id))
+        conn.execute("UPDATE skill_prerequisite SET dst_skill_id = ? WHERE dst_skill_id = ?", (target_skill_id, source_skill_id))
+    if table_exists(conn, "competency_skill"):
+        conn.execute("UPDATE competency_skill SET skill_id = ? WHERE skill_id = ?", (target_skill_id, source_skill_id))
+
+    conn.execute(
+        """
+        UPDATE skill
+        SET is_active = 0,
+            status = 'deprecated',
+            match_note = COALESCE(match_note || char(10), '') || ?,
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (f"Merged into skill #{target_skill_id}: {target.get('name') or target.get('canonical_name')}", now, source_skill_id),
+    )
+    refresh_catalog_skill_complexity(conn, target_skill_id, commit=False)
+    refresh_catalog_skill_complexity(conn, source_skill_id, commit=False)
+    conn.commit()
+    return {
+        "status": "merged",
+        "moved_aliases": moved_aliases,
+        "moved_indicators": moved_indicators,
+        "archived_duplicate_indicators": archived_duplicate_indicators,
+    }
 
 
 def list_archived_groups(conn: sqlite3.Connection, query: str = "") -> list[dict[str, object]]:
@@ -2361,7 +2956,7 @@ def list_archived_indicators(conn: sqlite3.Connection, query: str = "") -> list[
     return fetch_all(conn, sql, tuple(params))
 
 
-def create_target_group(conn: sqlite3.Connection, name: str, sort_order: int, status: str) -> int:
+def create_catalog_group(conn: sqlite3.Connection, name: str, sort_order: int, status: str) -> int:
     cursor = conn.execute(
         """
         INSERT INTO skill_group (code, name, sort_order, status, source, updated_at)
@@ -2373,7 +2968,7 @@ def create_target_group(conn: sqlite3.Connection, name: str, sort_order: int, st
     return int(cursor.lastrowid)
 
 
-def update_target_group(conn: sqlite3.Connection, group_id: int, name: str, sort_order: int, status: str) -> None:
+def update_catalog_group(conn: sqlite3.Connection, group_id: int, name: str, sort_order: int, status: str) -> None:
     conn.execute(
         """
         UPDATE skill_group
@@ -2385,7 +2980,7 @@ def update_target_group(conn: sqlite3.Connection, group_id: int, name: str, sort
     conn.commit()
 
 
-def remove_target_group(conn: sqlite3.Connection, group_id: int) -> str:
+def remove_catalog_group(conn: sqlite3.Connection, group_id: int) -> str:
     row = fetch_one(
         conn,
         """
@@ -2421,8 +3016,8 @@ def remove_target_group(conn: sqlite3.Connection, group_id: int) -> str:
     return "deleted"
 
 
-def restore_target_group(conn: sqlite3.Connection, group_id: int) -> str:
-    group = get_target_group(conn, group_id)
+def restore_catalog_group(conn: sqlite3.Connection, group_id: int) -> str:
+    group = get_catalog_group(conn, group_id)
     if not group and not fetch_one(conn, "SELECT id FROM skill_group WHERE id = ?", (group_id,)):
         return "missing"
     conn.execute(
@@ -2438,7 +3033,7 @@ def restore_target_group(conn: sqlite3.Connection, group_id: int) -> str:
     return "restored"
 
 
-def create_target_skill(
+def create_catalog_skill(
     conn: sqlite3.Connection,
     group_id: int,
     name: str,
@@ -2454,23 +3049,29 @@ def create_target_skill(
         INSERT INTO skill (
             group_id,
             code,
+            canonical_name,
             name,
             normalized_name,
+            skill_type,
+            status,
             sort_order,
             description,
             source_skill_name,
             resolution_status,
             match_note,
             is_active,
+            created_at,
             updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, 'unknown', ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             group_id,
             f"skill-{slugify(name)}-{group_id}",
             name.strip(),
-            name.casefold().replace("ё", "е").strip(),
+            name.strip(),
+            normalize_catalog_key(name),
+            "active" if is_active else "candidate",
             sort_order,
             description.strip() or None,
             source_skill_name.strip() or None,
@@ -2478,13 +3079,14 @@ def create_target_skill(
             match_note.strip() or None,
             is_active,
             datetime.now(UTC).isoformat(),
+            datetime.now(UTC).isoformat(),
         ),
     )
     conn.commit()
     return int(cursor.lastrowid)
 
 
-def update_target_skill(
+def update_catalog_skill(
     conn: sqlite3.Connection,
     skill_id: int,
     name: str,
@@ -2495,15 +3097,17 @@ def update_target_skill(
     match_note: str,
     is_active: int,
 ) -> None:
-    skill = get_target_skill(conn, skill_id)
+    skill = get_catalog_skill(conn, skill_id)
     if not skill:
         return
     conn.execute(
         """
         UPDATE skill
         SET code = ?,
+            canonical_name = ?,
             name = ?,
             normalized_name = ?,
+            status = ?,
             sort_order = ?,
             description = ?,
             source_skill_name = ?,
@@ -2516,7 +3120,9 @@ def update_target_skill(
         (
             f"skill-{slugify(name)}-{skill['group_id']}",
             name.strip(),
-            name.casefold().replace("ё", "е").strip(),
+            name.strip(),
+            normalize_catalog_key(name),
+            "active" if is_active else "candidate",
             sort_order,
             description.strip() or None,
             source_skill_name.strip() or None,
@@ -2530,8 +3136,8 @@ def update_target_skill(
     conn.commit()
 
 
-def remove_target_skill(conn: sqlite3.Connection, skill_id: int) -> str:
-    skill = get_target_skill(conn, skill_id)
+def remove_catalog_skill(conn: sqlite3.Connection, skill_id: int) -> str:
+    skill = get_catalog_skill(conn, skill_id)
     if not skill:
         return "missing"
 
@@ -2541,6 +3147,7 @@ def remove_target_skill(conn: sqlite3.Connection, skill_id: int) -> str:
             """
             UPDATE skill
             SET is_active = 0,
+                status = 'candidate',
                 updated_at = ?
             WHERE id = ?
             """,
@@ -2554,14 +3161,15 @@ def remove_target_skill(conn: sqlite3.Connection, skill_id: int) -> str:
     return "deleted"
 
 
-def restore_target_skill(conn: sqlite3.Connection, skill_id: int) -> str:
-    skill = get_target_skill(conn, skill_id)
+def restore_catalog_skill(conn: sqlite3.Connection, skill_id: int) -> str:
+    skill = get_catalog_skill(conn, skill_id)
     if not skill:
         return "missing"
     conn.execute(
         """
         UPDATE skill
         SET is_active = 1,
+            status = 'active',
             updated_at = ?
         WHERE id = ?
         """,
@@ -2576,12 +3184,12 @@ def restore_target_skill(conn: sqlite3.Connection, skill_id: int) -> str:
         """,
         (datetime.now(UTC).isoformat(), skill["group_id"]),
     )
-    refresh_target_skill_complexity(conn, skill_id, commit=False)
+    refresh_catalog_skill_complexity(conn, skill_id, commit=False)
     conn.commit()
     return "restored"
 
 
-def create_target_indicator(
+def create_catalog_indicator(
     conn: sqlite3.Connection,
     skill_id: int,
     indicator_type: str,
@@ -2626,12 +3234,12 @@ def create_target_indicator(
             datetime.now(UTC).isoformat(),
         ),
     )
-    refresh_target_skill_complexity(conn, skill_id, commit=False)
+    refresh_catalog_skill_complexity(conn, skill_id, commit=False)
     conn.commit()
     return int(cursor.lastrowid)
 
 
-def update_target_indicator(
+def update_catalog_indicator(
     conn: sqlite3.Connection,
     indicator_id: int,
     indicator_type: str,
@@ -2673,19 +3281,19 @@ def update_target_indicator(
             indicator_id,
         ),
     )
-    refresh_target_skill_complexity(conn, row["skill_id"], commit=False)
+    refresh_catalog_skill_complexity(conn, row["skill_id"], commit=False)
     conn.commit()
 
 
-def remove_target_indicator(conn: sqlite3.Connection, indicator_id: int) -> str:
-    indicator = get_target_indicator(conn, indicator_id)
+def remove_catalog_indicator(conn: sqlite3.Connection, indicator_id: int) -> str:
+    indicator = get_catalog_indicator(conn, indicator_id)
     if not indicator:
         return "missing"
 
     skill_id = int(indicator["skill_id"])
     if indicator.get("source_profile_name") == "manual":
         conn.execute("DELETE FROM indicator WHERE id = ?", (indicator_id,))
-        refresh_target_skill_complexity(conn, skill_id, commit=False)
+        refresh_catalog_skill_complexity(conn, skill_id, commit=False)
         conn.commit()
         return "deleted"
 
@@ -2698,17 +3306,17 @@ def remove_target_indicator(conn: sqlite3.Connection, indicator_id: int) -> str:
         """,
         (datetime.now(UTC).isoformat(), indicator_id),
     )
-    refresh_target_skill_complexity(conn, skill_id, commit=False)
+    refresh_catalog_skill_complexity(conn, skill_id, commit=False)
     conn.commit()
     return "archived"
 
 
-def restore_target_indicator(conn: sqlite3.Connection, indicator_id: int) -> str:
-    indicator = get_target_indicator(conn, indicator_id)
+def restore_catalog_indicator(conn: sqlite3.Connection, indicator_id: int) -> str:
+    indicator = get_catalog_indicator(conn, indicator_id)
     if not indicator:
         return "missing"
 
-    skill = get_target_skill(conn, int(indicator["skill_id"]))
+    skill = get_catalog_skill(conn, int(indicator["skill_id"]))
     conn.execute(
         """
         UPDATE indicator
@@ -2737,7 +3345,7 @@ def restore_target_indicator(conn: sqlite3.Connection, indicator_id: int) -> str
             """,
             (datetime.now(UTC).isoformat(), skill["group_id"]),
         )
-        refresh_target_skill_complexity(conn, skill["id"], commit=False)
+        refresh_catalog_skill_complexity(conn, skill["id"], commit=False)
     conn.commit()
     return "restored"
 
@@ -3334,24 +3942,36 @@ def not_found(start_response, text: str = "Not found"):
     return response(start_response, text.encode("utf-8"), status="404 Not Found", content_type="text/plain; charset=utf-8")
 
 
-def create_app(db_path: Path, summary_path: Path, target_db_path: Path):
+def create_app(db_path: Path, summary_path: Path):
     env = Environment(
         loader=FileSystemLoader(TEMPLATES_DIR),
         autoescape=select_autoescape(["html", "xml"]),
     )
-    summary = load_summary(summary_path)
+    startup_conn = open_db(db_path)
+    try:
+        ensure_intake_runtime_schema(startup_conn, db_path)
+    finally:
+        startup_conn.close()
+    summary = refresh_summary_counts(load_summary(summary_path), db_path)
 
     def render(template_name: str, context: dict[str, object]) -> str:
         template = env.get_template(template_name)
         shared = {
             "nav": [
-                {"label": "Справочник", "href": "/competencies"},
-                {"label": "Скиллсеты", "href": "/profiles"},
-                {"label": "Каталог DB", "href": "/catalog-admin/groups"},
-                {"label": "Архив", "href": "/catalog-admin/archive"},
-                {"label": "Проверка", "href": "/reviews"},
-                {"label": "Бриф", "href": "/intake"},
-                {"label": "УП", "href": "/up"},
+                {"label": "Брифы", "href": "/intake", "prefixes": ["/intake"]},
+                {"label": "Проверка", "href": "/reviews", "prefixes": ["/reviews"]},
+                {
+                    "label": "Справочник",
+                    "href": "/catalog-admin/groups",
+                    "prefixes": ["/catalog-admin", "/competencies", "/profiles"],
+                },
+                {"label": "УП", "href": "/up", "prefixes": ["/up"]},
+            ],
+            "secondary_nav": [
+                {"label": "Иерархия", "href": "/catalog-admin/groups", "prefixes": ["/catalog-admin/groups", "/catalog-admin/skills"]},
+                {"label": "Архив", "href": "/catalog-admin/archive", "prefixes": ["/catalog-admin/archive"]},
+                {"label": "Старый просмотр", "href": "/competencies", "prefixes": ["/competencies"]},
+                {"label": "Профили", "href": "/profiles", "prefixes": ["/profiles"]},
             ],
             "complexity_options": COMPLEXITY_OPTIONS,
             "intake_progress_steps": INTAKE_PROGRESS_STEPS,
@@ -3390,16 +4010,16 @@ def create_app(db_path: Path, summary_path: Path, target_db_path: Path):
             return json_response(start_response, picker_result, status=status)
 
         if path == "/catalog-admin/archive" and method == "GET":
-            target_conn = open_target_db(target_db_path)
+            catalog_conn = open_db(db_path)
             try:
                 archive_query = query_params.get("q", [""])[-1].strip()
                 archive_scope = query_params.get("scope", ["all"])[-1].strip() or "all"
                 if archive_scope not in {"all", "groups", "skills", "indicators"}:
                     archive_scope = "all"
 
-                groups = list_archived_groups(target_conn, archive_query) if archive_scope in {"all", "groups"} else []
-                skills = list_archived_skills(target_conn, archive_query) if archive_scope in {"all", "skills"} else []
-                indicators = list_archived_indicators(target_conn, archive_query) if archive_scope in {"all", "indicators"} else []
+                groups = list_archived_groups(catalog_conn, archive_query) if archive_scope in {"all", "groups"} else []
+                skills = list_archived_skills(catalog_conn, archive_query) if archive_scope in {"all", "skills"} else []
+                indicators = list_archived_indicators(catalog_conn, archive_query) if archive_scope in {"all", "indicators"} else []
                 html = render(
                     "catalog_admin_archive.html",
                     {
@@ -3414,19 +4034,19 @@ def create_app(db_path: Path, summary_path: Path, target_db_path: Path):
                 )
                 return html_response(start_response, html)
             finally:
-                target_conn.close()
+                catalog_conn.close()
 
         if path == "/catalog-admin/archive" and method == "POST":
-            target_conn = open_target_db(target_db_path)
+            catalog_conn = open_db(db_path)
             try:
                 form_data = parse_post_data(environ)
                 action = form_data.get("action", "")
                 if action == "restore_group":
-                    restore_target_group(target_conn, int(form_data["group_id"]))
+                    restore_catalog_group(catalog_conn, int(form_data["group_id"]))
                 elif action == "restore_skill":
-                    restore_target_skill(target_conn, int(form_data["skill_id"]))
+                    restore_catalog_skill(catalog_conn, int(form_data["skill_id"]))
                 elif action == "restore_indicator":
-                    restore_target_indicator(target_conn, int(form_data["indicator_id"]))
+                    restore_catalog_indicator(catalog_conn, int(form_data["indicator_id"]))
                 redirect_params = {}
                 if form_data.get("q", "").strip():
                     redirect_params["q"] = form_data.get("q", "").strip()
@@ -3437,12 +4057,12 @@ def create_app(db_path: Path, summary_path: Path, target_db_path: Path):
                     location += "?" + urlencode(redirect_params)
                 return redirect_response(start_response, location)
             finally:
-                target_conn.close()
+                catalog_conn.close()
 
         if path == "/catalog-admin/groups" and method == "GET":
-            target_conn = open_target_db(target_db_path)
+            catalog_conn = open_db(db_path)
             try:
-                groups = list_target_groups(target_conn)
+                groups = list_catalog_groups(catalog_conn)
                 html = render(
                     "catalog_admin_groups.html",
                     {
@@ -3453,33 +4073,33 @@ def create_app(db_path: Path, summary_path: Path, target_db_path: Path):
                 )
                 return html_response(start_response, html)
             finally:
-                target_conn.close()
+                catalog_conn.close()
 
         if path == "/catalog-admin/groups" and method == "POST":
-            target_conn = open_target_db(target_db_path)
+            catalog_conn = open_db(db_path)
             try:
                 form_data = parse_post_data(environ)
                 action = form_data.get("action", "")
                 if action == "create_group":
-                    create_target_group(
-                        target_conn,
+                    create_catalog_group(
+                        catalog_conn,
                         name=form_data.get("name", "").strip() or "Новая группа",
                         sort_order=int(form_data.get("sort_order", "999") or 999),
                         status=form_data.get("status", "active"),
                     )
                 elif action == "update_group":
-                    update_target_group(
-                        target_conn,
+                    update_catalog_group(
+                        catalog_conn,
                         group_id=int(form_data["group_id"]),
                         name=form_data.get("name", "").strip() or "Группа",
                         sort_order=int(form_data.get("sort_order", "999") or 999),
                         status=form_data.get("status", "active"),
                     )
                 elif action == "remove_group":
-                    remove_target_group(target_conn, int(form_data["group_id"]))
+                    remove_catalog_group(catalog_conn, int(form_data["group_id"]))
                 return redirect_response(start_response, "/catalog-admin/groups")
             finally:
-                target_conn.close()
+                catalog_conn.close()
 
         if path.startswith("/catalog-admin/groups/"):
             try:
@@ -3487,22 +4107,22 @@ def create_app(db_path: Path, summary_path: Path, target_db_path: Path):
             except ValueError:
                 return not_found(start_response)
 
-            target_conn = open_target_db(target_db_path)
+            catalog_conn = open_db(db_path)
             try:
                 if method == "POST":
                     form_data = parse_post_data(environ)
                     action = form_data.get("action", "")
                     if action == "update_group":
-                        update_target_group(
-                            target_conn,
+                        update_catalog_group(
+                            catalog_conn,
                             group_id=group_id,
                             name=form_data.get("name", "").strip() or "Группа",
                             sort_order=int(form_data.get("sort_order", "999") or 999),
                             status=form_data.get("status", "active"),
                         )
                     elif action == "create_skill":
-                        create_target_skill(
-                            target_conn,
+                        create_catalog_skill(
+                            catalog_conn,
                             group_id=group_id,
                             name=form_data.get("name", "").strip() or "Новый skill",
                             sort_order=int(form_data.get("sort_order", "999") or 999),
@@ -3515,16 +4135,16 @@ def create_app(db_path: Path, summary_path: Path, target_db_path: Path):
                     elif action == "remove_skill":
                         skill_id = int(form_data.get("skill_id", "0"))
                         if skill_id:
-                            remove_target_skill(target_conn, skill_id)
+                            remove_catalog_skill(catalog_conn, skill_id)
                     elif action == "remove_group":
-                        remove_target_group(target_conn, group_id)
+                        remove_catalog_group(catalog_conn, group_id)
                         return redirect_response(start_response, "/catalog-admin/groups")
                     return redirect_response(start_response, f"/catalog-admin/groups/{group_id}")
 
-                group = get_target_group(target_conn, group_id)
+                group = get_catalog_group(catalog_conn, group_id)
                 if not group:
                     return not_found(start_response, "Group not found")
-                skills = list_target_group_skills(target_conn, group_id)
+                skills = list_catalog_group_skills(catalog_conn, group_id)
                 html = render(
                     "catalog_admin_group_detail.html",
                     {
@@ -3536,7 +4156,7 @@ def create_app(db_path: Path, summary_path: Path, target_db_path: Path):
                 )
                 return html_response(start_response, html)
             finally:
-                target_conn.close()
+                catalog_conn.close()
 
         if path.startswith("/catalog-admin/skills/"):
             try:
@@ -3544,14 +4164,14 @@ def create_app(db_path: Path, summary_path: Path, target_db_path: Path):
             except ValueError:
                 return not_found(start_response)
 
-            target_conn = open_target_db(target_db_path)
+            catalog_conn = open_db(db_path)
             try:
                 if method == "POST":
                     form_data = parse_post_data(environ)
                     action = form_data.get("action", "")
                     if action == "update_skill":
-                        update_target_skill(
-                            target_conn,
+                        update_catalog_skill(
+                            catalog_conn,
                             skill_id=skill_id,
                             name=form_data.get("name", "").strip() or "Skill",
                             sort_order=int(form_data.get("sort_order", "999") or 999),
@@ -3562,15 +4182,31 @@ def create_app(db_path: Path, summary_path: Path, target_db_path: Path):
                             is_active=1 if form_data.get("is_active", "1") == "1" else 0,
                         )
                     elif action == "remove_skill":
-                        skill = get_target_skill(target_conn, skill_id)
+                        skill = get_catalog_skill(catalog_conn, skill_id)
                         group_id = skill["group_id"] if skill else None
-                        remove_target_skill(target_conn, skill_id)
+                        remove_catalog_skill(catalog_conn, skill_id)
                         if group_id is not None:
                             return redirect_response(start_response, f"/catalog-admin/groups/{group_id}")
                         return redirect_response(start_response, "/catalog-admin/groups")
+                    elif action == "add_alias":
+                        add_skill_alias(
+                            catalog_conn,
+                            skill_id=skill_id,
+                            alias=form_data.get("alias", ""),
+                            source="manual",
+                        )
+                    elif action == "remove_alias":
+                        alias_id = int(form_data.get("alias_id", "0") or 0)
+                        if alias_id:
+                            remove_skill_alias(catalog_conn, skill_id, alias_id)
+                    elif action == "merge_skill":
+                        target_skill_id = int(form_data.get("target_skill_id", "0") or 0)
+                        if target_skill_id:
+                            merge_catalog_skills(catalog_conn, skill_id, target_skill_id)
+                            return redirect_response(start_response, f"/catalog-admin/skills/{target_skill_id}")
                     elif action == "create_indicator":
-                        create_target_indicator(
-                            target_conn,
+                        create_catalog_indicator(
+                            catalog_conn,
                             skill_id=skill_id,
                             indicator_type=form_data.get("indicator_type", "Не указано"),
                             text=form_data.get("text", "").strip() or "Новый индикатор",
@@ -3579,8 +4215,8 @@ def create_app(db_path: Path, summary_path: Path, target_db_path: Path):
                             is_active=1 if form_data.get("is_active", "1") == "1" else 0,
                         )
                     elif action == "update_indicator":
-                        update_target_indicator(
-                            target_conn,
+                        update_catalog_indicator(
+                            catalog_conn,
                             indicator_id=int(form_data["indicator_id"]),
                             indicator_type=form_data.get("indicator_type", "Не указано"),
                             text=form_data.get("text", "").strip() or "Индикатор",
@@ -3591,25 +4227,31 @@ def create_app(db_path: Path, summary_path: Path, target_db_path: Path):
                     elif action == "remove_indicator":
                         indicator_id = int(form_data.get("indicator_id", "0"))
                         if indicator_id:
-                            remove_target_indicator(target_conn, indicator_id)
+                            remove_catalog_indicator(catalog_conn, indicator_id)
                     return redirect_response(start_response, f"/catalog-admin/skills/{skill_id}")
 
-                skill = get_target_skill(target_conn, skill_id)
+                skill = get_catalog_skill(catalog_conn, skill_id)
                 if not skill:
                     return not_found(start_response, "Skill not found")
-                indicators = list_target_indicators(target_conn, skill_id)
+                indicators = list_catalog_indicators(catalog_conn, skill_id)
+                aliases = list_skill_aliases(catalog_conn, skill_id)
+                merge_query = (query_params.get("merge_query") or [""])[0].strip()
+                merge_candidates = search_catalog_skills(catalog_conn, merge_query, exclude_skill_id=skill_id) if merge_query else []
                 html = render(
                     "catalog_admin_skill_detail.html",
                     {
                         "title": skill["name"],
                         "skill": skill,
                         "indicators": indicators,
+                        "aliases": aliases,
+                        "merge_query": merge_query,
+                        "merge_candidates": merge_candidates,
                         "request_path": path,
                     },
                 )
                 return html_response(start_response, html)
             finally:
-                target_conn.close()
+                catalog_conn.close()
 
         conn = open_db(db_path)
         try:
@@ -4032,6 +4674,7 @@ def create_app(db_path: Path, summary_path: Path, target_db_path: Path):
                 dag_build_state = None
                 if isinstance(result, dict) and isinstance(result.get("brief_id"), int):
                     dag_build_state = get_brief_dag_state(conn, int(result["brief_id"]))
+                workflow_steps = build_intake_workflow_steps(job, result, dag_build_state)
                 html = render(
                     "intake.html",
                     {
@@ -4041,7 +4684,9 @@ def create_app(db_path: Path, summary_path: Path, target_db_path: Path):
                         "job": job,
                         "recent_jobs": list_recent_intake_jobs(conn),
                         "result": result,
+                        "llm_usage": load_llm_usage_summary(job_id),
                         "dag_build_state": dag_build_state,
+                        "workflow_steps": workflow_steps,
                         "form_error": None if job.get("status") != "failed" else f"Ошибка intake-пайплайна: {job.get('error_text')}",
                         "upload_name": job.get("source_name"),
                         "request_path": "/intake",
@@ -4060,12 +4705,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run a local read-only viewer for the imported skills catalog.")
     parser.add_argument("--db", type=Path, default=DEFAULT_DB, help="Path to SQLite catalog database.")
     parser.add_argument("--summary", type=Path, default=DEFAULT_SUMMARY, help="Path to summary JSON.")
-    parser.add_argument("--target-db", type=Path, default=DEFAULT_TARGET_DB, help="Path to target SQLite catalog DB.")
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind.")
     parser.add_argument("--port", type=int, default=8010, help="Port to bind.")
     args = parser.parse_args()
 
-    app = create_app(args.db.resolve(), args.summary.resolve(), args.target_db.resolve())
+    app = create_app(args.db.resolve(), args.summary.resolve())
     with make_server(args.host, args.port, app) as server:
         print(f"Catalog UI listening on http://{args.host}:{args.port}")
         server.serve_forever()

@@ -22,6 +22,19 @@ CREATE TABLE IF NOT EXISTS evidence_source (
     retrieved_at  TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS evidence_query_cache (
+    cache_key TEXT PRIMARY KEY,
+    normalized_query TEXT NOT NULL,
+    query TEXT NOT NULL,
+    model TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_evidence_query_cache_updated
+    ON evidence_query_cache(updated_at);
+
 -- Профиль-ориентированные AI-предложения навыков (обобщает project-scoped
 -- ai_analysis_suggestion на уровень профиля/брифа).
 CREATE TABLE IF NOT EXISTS skill_suggestion (
@@ -114,10 +127,14 @@ CREATE TABLE IF NOT EXISTS curriculum_plan_row (
     block_goal    TEXT,
     project_name  TEXT NOT NULL,
     project_summary TEXT,
+    outcomes_know TEXT,
+    outcomes_can TEXT,
+    outcomes_skills TEXT,
     learning_outcomes TEXT,
     skills_list   TEXT,
     audience_level TEXT,
     required_tools TEXT,
+    materials TEXT,
     storytelling  TEXT,
     delivery_format TEXT,
     group_size    TEXT,
@@ -131,3 +148,22 @@ CREATE TABLE IF NOT EXISTS curriculum_plan_row (
 
 CREATE INDEX IF NOT EXISTS idx_curriculum_plan_row_plan_order
     ON curriculum_plan_row(plan_id, row_number);
+
+-- Лог промоции intake-suggestion в канонический skills catalog.
+CREATE TABLE IF NOT EXISTS skill_promotion_log (
+    id            INTEGER PRIMARY KEY,
+    suggestion_id INTEGER NOT NULL UNIQUE REFERENCES skill_suggestion(id) ON DELETE CASCADE,
+    skill_id      INTEGER NOT NULL REFERENCES skill(id) ON DELETE CASCADE,
+    alias         TEXT NOT NULL,
+    normalized_alias TEXT NOT NULL,
+    resolution_after_promotion TEXT,
+    created_skill INTEGER NOT NULL DEFAULT 0 CHECK (created_skill IN (0, 1)),
+    created_alias INTEGER NOT NULL DEFAULT 0 CHECK (created_alias IN (0, 1)),
+    status        TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'reverted')),
+    source        TEXT NOT NULL DEFAULT 'intake_accept',
+    created_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    reverted_at   TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_skill_promotion_log_skill
+    ON skill_promotion_log(skill_id, status);

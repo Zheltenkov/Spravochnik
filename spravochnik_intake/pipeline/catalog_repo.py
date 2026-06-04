@@ -29,6 +29,9 @@ class CatalogRepo:
         self.con.row_factory = sqlite3.Row
         self._load_index()
 
+    def close(self) -> None:
+        self.con.close()
+
     def _load_index(self) -> None:
         cur = self.con.cursor()
         self.by_norm: dict[str, tuple[int, str, str | None]] = {}   # normalized -> (skill_id, canonical_name, canonical_group)

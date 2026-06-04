@@ -50,8 +50,14 @@ USE_COUNCIL = _env_bool("USE_COUNCIL", True)
 OPENROUTER_URL = os.environ.get("OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
 OPENROUTER_HTTP_REFERER = os.environ.get("OPENROUTER_HTTP_REFERER", "http://127.0.0.1:8010")
 OPENROUTER_APP_TITLE = os.environ.get("OPENROUTER_APP_TITLE", "Spravochnik Intake")
+LLM_USAGE_LOG_PATH = os.environ.get(
+    "LLM_USAGE_LOG_PATH",
+    str(Path(__file__).resolve().parents[2] / "artifacts" / "llm_usage.jsonl"),
+)
+EVIDENCE_CACHE_TTL_DAYS = int(os.environ.get("EVIDENCE_CACHE_TTL_DAYS", "30"))
 MODEL_PLAN = os.environ.get("MODEL_PLAN", "openai/gpt-5-mini")
-MODEL_SEARCH = os.environ.get("MODEL_SEARCH", "perplexity/sonar-pro")
+MODEL_SEARCH = os.environ.get("MODEL_SEARCH", "perplexity/sonar")
+MODEL_SEARCH_MAX_TOKENS = int(os.environ.get("MODEL_SEARCH_MAX_TOKENS", "1200"))
 MODEL_PANEL = [
     item.strip()
     for item in os.environ.get(
@@ -70,6 +76,7 @@ AUTO_ACCEPT_COUNCIL_AGREEMENT = float(os.environ.get("AUTO_ACCEPT_COUNCIL_AGREEM
 AUTO_ACCEPT_NEW_FOR_PROGRAM_BRIEF = _env_bool("AUTO_ACCEPT_NEW_FOR_PROGRAM_BRIEF", False)
 PROGRAM_BRIEF_MAX_SKILLS_PER_AREA = int(os.environ.get("PROGRAM_BRIEF_MAX_SKILLS_PER_AREA", "2"))
 FUZZY_MATCH_MIN = int(os.environ.get("FUZZY_MATCH_MIN", "90"))      # rapidfuzz score для fuzzy-резолва
+GRAY_SEARCH_MAX_QUERIES = int(os.environ.get("GRAY_SEARCH_MAX_QUERIES", "3"))
 
 # Стадия 2->3
 TAU_EDGE_ACCEPT = float(os.environ.get("TAU_EDGE_ACCEPT", "0.80"))
@@ -81,6 +88,18 @@ UP_HOURS_PER_DAY = float(os.environ.get("UP_HOURS_PER_DAY", "2.94"))
 UP_XP_PER_HOUR = int(os.environ.get("UP_XP_PER_HOUR", "10"))
 UP_MAX_SKILLS_PER_PROJECT = int(os.environ.get("UP_MAX_SKILLS_PER_PROJECT", "2"))
 UP_MAX_PROJECTS_PER_BLOCK = int(os.environ.get("UP_MAX_PROJECTS_PER_BLOCK", "3"))
+UP_GENERATED_COLUMNS = list("ABCDEFGHIJKLMN")
+UP_IGNORED_COLUMNS = list("OPQRSTUV")
+UP_BLOOM_KNOW = {"remember", "understand"}
+UP_BLOOM_CAN = {"apply", "analyze"}
+UP_BLOOM_SKILLS = {"evaluate", "create"}
+UP_DEFAULT_FORMAT = os.environ.get("UP_DEFAULT_FORMAT", "индивидуальный")
+UP_FORMAT_GROUP_SIZES = {
+    "индивидуальный": (1, 1),
+    "парный": (2, 2),
+    "мини-группа": (3, 5),
+    "групповой": (3, 5),
+}
 UP_HOUR_BANDS = [
     int(item.strip())
     for item in os.environ.get("UP_HOUR_BANDS", "8,12,16,20,24").split(",")

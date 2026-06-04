@@ -102,51 +102,6 @@ def touch_review(
     )
 
 
-def sync_review_statuses_to_target(source_db: Path, target_db: Path) -> int:
-    if not target_db.exists():
-        return 0
-
-    source_conn = sqlite3.connect(source_db)
-    source_conn.row_factory = sqlite3.Row
-    target_conn = sqlite3.connect(target_db)
-    target_conn.row_factory = sqlite3.Row
-    updated = 0
-    try:
-        rows = source_conn.execute(
-            """
-            SELECT id, status, resolution_note, reviewed_at, updated_at, details
-            FROM review_queue
-            ORDER BY id
-            """
-        ).fetchall()
-        for row in rows:
-            target_conn.execute(
-                """
-                UPDATE review_queue
-                SET status = ?,
-                    resolution_note = ?,
-                    reviewed_at = ?,
-                    updated_at = ?,
-                    details = ?
-                WHERE source_review_id = ?
-                """,
-                (
-                    row["status"],
-                    row["resolution_note"],
-                    row["reviewed_at"],
-                    row["updated_at"],
-                    row["details"],
-                    row["id"],
-                ),
-            )
-            updated += 1
-        target_conn.commit()
-    finally:
-        source_conn.close()
-        target_conn.close()
-    return updated
-
-
 def update_summary_open_reviews(conn: sqlite3.Connection, summary_json: Path = SUMMARY_JSON) -> None:
     if not summary_json.exists():
         return

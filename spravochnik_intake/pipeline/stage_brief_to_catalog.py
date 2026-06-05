@@ -16,7 +16,7 @@ from . import stage_normalize
 from . import language
 from .models import BLOOM, Evidence, IndicatorSpec, SkillCandidate
 from .catalog_repo import CatalogRepo
-from .skill_names import canonicalize_skill_name
+from .skill_names import canonicalize_skill_name, has_observable_action
 
 RUSSIAN_OUTPUT_RULE = (
     "Все поля name, group, coverage_area, rationale и тексты индикаторов пиши на русском языке. "
@@ -39,6 +39,70 @@ _ROUTINE_ACTION_SIGNAL = re.compile(
     r")",
     re.IGNORECASE,
 )
+_APPLY_ACTION_SIGNAL = re.compile(
+    r"\b("
+    r"примен|использ|настро|настра|разверт|развёрт|организ|провед|подготов|"
+    r"рассчит|счит|вед[её]т|интегрир|автоматиз"
+    r")",
+    re.IGNORECASE,
+)
+_ANALYZE_ACTION_SIGNAL = re.compile(
+    r"\b("
+    r"анализ|сравнив|интерпрет|приоритиз|сегментир|оцени|валидир|проектир"
+    r")",
+    re.IGNORECASE,
+)
+_CREATE_ACTION_SIGNAL = re.compile(
+    r"\b("
+    r"созда|собир|разработ|спроект|постро"
+    r")",
+    re.IGNORECASE,
+)
+
+_GENERIC_CATALOG_GROUPS = {
+    "прочие навыки",
+    "прочее",
+    "other",
+    "uncategorized",
+    "misc",
+    "miscellaneous",
+}
+
+_ACTION_TOKEN_STOPWORDS = {
+    "проведение",
+    "формулирование",
+    "проектирование",
+    "настройка",
+    "разработка",
+    "подготовка",
+    "оценка",
+    "анализ",
+    "расчет",
+    "расчёт",
+    "организация",
+    "внедрение",
+    "развертывание",
+    "развёртывание",
+    "приоритизация",
+    "создание",
+    "работа",
+    "использование",
+    "применение",
+}
+
+_DOMAIN_HINTS: dict[str, tuple[str, ...]] = {
+    "research": ("исслед", "интерв", "customer", "discovery", "клиент", "пользователь", "jtbd", "persona", "персон"),
+    "product": ("продукт", "mvp", "гипотез", "ценност", "сегмент", "сценар", "roadmap", "беклог", "backlog"),
+    "engineering": ("код", "code", "review", "go", "asp", "sql", "api", "репозитор", "git", "ci", "cd", "тест", "архитект", "deploy", "деплой", "docker"),
+    "infrastructure": ("монитор", "observability", "backup", "бэкап", "runbook", "инцидент", "логирован", "алерт", "cloud", "облак"),
+    "marketing": ("маркет", "позиционир", "landing", "лендинг", "воронк", "канал", "привлеч"),
+    "monetization": ("монет", "тариф", "pricing", "unit", "economics", "экономик", "пробн", "доступ", "продаж"),
+    "legal": ("прав", "юрид", "legal", "договор", "документ", "администр"),
+    "finance": ("финанс", "budget", "бюджет", "налог", "платеж"),
+    "support": ("support", "поддерж", "feedback", "обратн", "triage", "sla"),
+    "strategy": ("стратег", "okr", "risk", "рис", "управлен", "governance"),
+    "ai": ("ai", "llm", "human-in-the-loop", "hitl", "prompt", "промпт"),
+}
 
 
 def _seniority_bloom_ceiling(spec: dict[str, object] | None) -> str | None:
@@ -63,6 +127,17 @@ def _clamp_bloom_for_audience(level: str, spec: dict[str, object] | None, text: 
     if not has_high_signal or has_routine_signal:
         return _BLOOM_BY_SCORE[BLOOM[ceiling]]
     return level
+
+
+def _bloom_floor_for_text(text: str | None) -> str | None:
+    source_text = text or ""
+    if _CREATE_ACTION_SIGNAL.search(source_text):
+        return "create"
+    if _ANALYZE_ACTION_SIGNAL.search(source_text):
+        return "analyze"
+    if _APPLY_ACTION_SIGNAL.search(source_text):
+        return "apply"
+    return None
 
 
 def normalize_bloom(value: str | None, spec: dict[str, object] | None = None, text: str | None = None) -> str:
@@ -90,7 +165,73 @@ def normalize_bloom(value: str | None, spec: dict[str, object] | None = None, te
     }
     key = (value or "understand").strip().casefold()
     normalized = mapping.get(key, "understand")
+    floor = _bloom_floor_for_text(text)
+    if floor and BLOOM[normalized] < BLOOM[floor]:
+        normalized = floor
     return _clamp_bloom_for_audience(normalized, spec, text)
+
+
+def _number(value: str) -> float:
+    return float(value.replace(",", "."))
+
+
+def _extract_workload_from_text(text: str) -> dict[str, object]:
+    """Extract target workload from a free-form Russian/English brief."""
+    source = text.casefold().replace("ё", "е")
+    duration_months: tuple[float, float] | None = None
+    duration_weeks: tuple[float, float] | None = None
+    hours_per_week: float | None = None
+
+    month_range = re.search(r"(\d+(?:[,.]\d+)?)\s*[-–—]\s*(\d+(?:[,.]\d+)?)\s*месяц", source)
+    if month_range:
+        duration_months = (_number(month_range.group(1)), _number(month_range.group(2)))
+    else:
+        month_single = re.search(r"(\d+(?:[,.]\d+)?)\s*месяц", source)
+        if month_single:
+            value = _number(month_single.group(1))
+            duration_months = (value, value)
+
+    week_range = re.search(r"(\d+(?:[,.]\d+)?)\s*[-–—]\s*(\d+(?:[,.]\d+)?)\s*недел", source)
+    if week_range:
+        duration_weeks = (_number(week_range.group(1)), _number(week_range.group(2)))
+    else:
+        week_single = re.search(r"(\d+(?:[,.]\d+)?)\s*недел", source)
+        if week_single:
+            value = _number(week_single.group(1))
+            duration_weeks = (value, value)
+
+    weekly = re.search(r"(\d+(?:[,.]\d+)?)\s*(?:академич(?:еских)?\s*)?(?:астрономич(?:еских)?\s*)?час(?:ов|а)?\s*(?:в|/)\s*недел", source)
+    if weekly:
+        hours_per_week = _number(weekly.group(1))
+
+    weeks_min: float | None = None
+    weeks_max: float | None = None
+    if duration_weeks:
+        weeks_min, weeks_max = duration_weeks
+    elif duration_months:
+        weeks_min = duration_months[0] * 4.345
+        weeks_max = duration_months[1] * 4.345
+
+    if hours_per_week is None or weeks_min is None or weeks_max is None:
+        return {}
+
+    total_min = round(weeks_min * hours_per_week)
+    total_max = round(weeks_max * hours_per_week)
+    return {
+        "duration_months_min": round(duration_months[0], 2) if duration_months else None,
+        "duration_months_max": round(duration_months[1], 2) if duration_months else None,
+        "duration_weeks_min": round(weeks_min, 2),
+        "duration_weeks_max": round(weeks_max, 2),
+        "hours_per_week": round(hours_per_week, 2),
+        "target_total_hours_min": int(total_min),
+        "target_total_hours_max": int(total_max),
+        "target_total_hours": int(round((total_min + total_max) / 2)),
+    }
+
+
+def extract_workload_from_text(text: str) -> dict[str, object]:
+    """Public wrapper used by persisted-plan rebuilds."""
+    return _extract_workload_from_text(text)
 
 
 def _normalized_spec(raw: dict[str, object]) -> dict[str, object]:
@@ -126,37 +267,94 @@ def _normalized_spec(raw: dict[str, object]) -> dict[str, object]:
     }
 
 
-def _mock_program_brief_spec() -> dict[str, object]:
-    return {
-        "artifact_type": "program_brief",
-        "role": "Технологический предприниматель",
-        "seniority": "начинающий",
-        "domain": "технологическое предпринимательство / цифровые продукты / AI-assisted product building",
-        "operator_role": "Дизайнер образовательной программы",
-        "program_goal": "Подготовить начинающего технологического предпринимателя к запуску цифрового продукта как бизнеса.",
-        "must_include_areas": [
-            "Выявление проблемы клиента и customer discovery",
-            "Проверка продуктовых гипотез",
-            "Сегментация клиентов и ценностное предложение",
-            "Определение границ MVP и продуктовая приоритизация",
-            "AI-assisted разработка и архитектурное мышление",
-            "Инженерная дисциплина: репозиторий, CI, тесты, релизы",
-            "Инфраструктура: деплой, observability, backup, incidents",
-            "AI-workflows и автоматизация бизнес-процессов",
-            "Маркетинг технологического продукта",
-            "Продажи и монетизация",
-            "Поддержка пользователей и feedback loop",
-            "Правовые, финансовые и административные основы",
-            "Стратегия, управление рисками и цели",
-            "Контроль качества AI, безопасность и human-in-the-loop",
-        ],
-        "sub_queries": [
-            "Навыки выпускника для customer discovery, problem framing, JTBD и проверки гипотез в технологическом предпринимательстве",
-            "Навыки выпускника для определения MVP, продуктовой приоритизации и AI-assisted разработки цифрового продукта",
-            "Навыки выпускника для go-to-market: позиционирование, каналы привлечения, продажи и монетизация технологического продукта",
-            "Навыки выпускника для инфраструктуры продукта, поддержки пользователей, observability, AI quality control и risk management",
-        ],
+_BRIEF_SECTION_LABEL_RE = re.compile(
+    r"^(наименование|идея|целевая аудитория|участники|результат|цель|задача|описание|требования|контекст)\s*[:\-]\s*",
+    re.IGNORECASE,
+)
+
+
+def _is_program_brief_text(brief: str) -> bool:
+    source = brief.casefold().replace("ё", "е")
+    return bool(re.search(r"\b(программа|курс|обучени|учебн|ветк|паспорт|тз)\b", source))
+
+
+def _brief_sentence_candidates(brief: str) -> list[str]:
+    """Extract neutral topic candidates from a free-form brief for offline mode."""
+    candidates: list[str] = []
+    for chunk in re.split(r"[\n.;•\u2022]+", brief):
+        text = _BRIEF_SECTION_LABEL_RE.sub("", chunk).strip(" \t:-")
+        text = re.sub(r"\s+", " ", text)
+        if len(text) < 12 or len(text) > 180:
+            continue
+        if re.search(r"\b(телефон|email|http|www)\b", text.casefold()):
+            continue
+        candidates.append(text)
+    unique: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        norm = item.casefold().replace("ё", "е")
+        if norm in seen:
+            continue
+        seen.add(norm)
+        unique.append(item)
+    return unique[:12]
+
+
+def _short_topic_label(text: str, *, max_words: int = 8, max_chars: int = 90) -> str:
+    label = re.sub(r"\s+", " ", str(text or "")).strip(" .,-:;")
+    words = label.split()
+    if len(words) > max_words:
+        label = " ".join(words[:max_words])
+    if len(label) > max_chars:
+        label = label[:max_chars].rstrip(" .,-:;") + "..."
+    return label or "общая тема"
+
+
+def _topic_to_mock_skill_name(topic: str) -> str:
+    """Build an offline skill placeholder from source text without domain-specific templates."""
+    cleaned = _BRIEF_SECTION_LABEL_RE.sub("", str(topic or "")).strip(" .,-:;")
+    canonical = canonicalize_skill_name(cleaned)
+    if has_observable_action(canonical):
+        return canonical
+    return f"Работа с темой «{_short_topic_label(canonical)}»"
+
+
+def _extract_mock_role(brief: str, *, is_program: bool) -> str:
+    for pattern in (
+        r"(?:подготовить|обучить|готовим|готовить)\s+([^.\n;,:]{3,90})",
+        r"(?:роль|профиль|выпускник|специалист)\s*[:\-]\s*([^.\n;]{3,90})",
+    ):
+        match = re.search(pattern, brief, flags=re.IGNORECASE)
+        if match:
+            return " ".join(match.group(1).split()).strip(" .,-")
+    return "Выпускник программы" if is_program else "Специалист"
+
+
+def _extract_mock_domain(brief: str, areas: list[str]) -> str:
+    if areas:
+        return areas[0][:120]
+    first_line = next((line.strip() for line in brief.splitlines() if line.strip()), "")
+    return first_line[:120] or "Домен из брифа"
+
+
+def _mock_spec_from_brief(brief: str) -> dict[str, object]:
+    is_program = _is_program_brief_text(brief)
+    areas = _brief_sentence_candidates(brief)
+    if not areas:
+        areas = ["Ключевые задачи и навыки из брифа"]
+    raw = {
+        "artifact_type": "program_brief" if is_program else "learner_brief",
+        "role": _extract_mock_role(brief, is_program=is_program),
+        "seniority": "не указан",
+        "domain": _extract_mock_domain(brief, areas),
+        "operator_role": None,
+        "program_goal": areas[0] if is_program and areas else "",
+        "must_include_areas": areas[:12],
+        "sub_queries": [f"Навыки выпускника: {area}" for area in areas[:6]],
     }
+    spec = _normalized_spec(raw)
+    spec.update({key: value for key, value in _extract_workload_from_text(brief).items() if value is not None})
+    return spec
 
 
 _PROGRAM_ARTIFACT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
@@ -218,6 +416,67 @@ def _lexical_overlap(left: str, right: str) -> float:
         return 0.0
     intersection = left_tokens & right_tokens
     return len(intersection) / max(min(len(left_tokens), len(right_tokens)), 1)
+
+
+def _semantic_domains(*values: str | None) -> set[str]:
+    text = " ".join(value or "" for value in values).casefold().replace("ё", "е")
+    domains: set[str] = set()
+    for domain, hints in _DOMAIN_HINTS.items():
+        if any(hint in text for hint in hints):
+            domains.add(domain)
+    return domains
+
+
+def _is_generic_catalog_group(value: str | None) -> bool:
+    normalized = " ".join((value or "").casefold().replace("ё", "е").split())
+    return normalized in _GENERIC_CATALOG_GROUPS or "прочие" in normalized or "uncategorized" in normalized
+
+
+def _meaningful_tokens(*values: str | None) -> set[str]:
+    tokens = _norm_tokens(" ".join(value or "" for value in values))
+    return {token for token in tokens if token not in _ACTION_TOKEN_STOPWORDS and len(token) >= 3}
+
+
+def _has_exact_catalog_name(candidate: SkillCandidate) -> bool:
+    canonical = (candidate.canonical_name or "").strip()
+    if not canonical:
+        return False
+    variants = [candidate.name, candidate.source_name or ""]
+    canonical_norm = " ".join(canonical.casefold().replace("ё", "е").split())
+    return any(" ".join(value.casefold().replace("ё", "е").split()) == canonical_norm for value in variants if value)
+
+
+def group_is_compatible(candidate: SkillCandidate) -> bool:
+    """Check whether candidate context and canonical catalog context are semantically compatible."""
+    candidate_domains = _semantic_domains(candidate.name, candidate.group, candidate.coverage_area)
+    canonical_domains = _semantic_domains(candidate.canonical_name, candidate.canonical_group)
+    if candidate_domains and canonical_domains and not (candidate_domains & canonical_domains):
+        return False
+
+    candidate_tokens = _meaningful_tokens(candidate.name, candidate.coverage_area, candidate.group)
+    canonical_tokens = _meaningful_tokens(candidate.canonical_name, candidate.canonical_group)
+    if candidate_tokens and canonical_tokens and candidate_tokens & canonical_tokens:
+        return True
+
+    # Exact names can be accepted even when the domain dictionary does not know the terminology yet.
+    return _has_exact_catalog_name(candidate)
+
+
+def is_catalog_match_safe(candidate: SkillCandidate, spec: dict[str, object] | None = None) -> bool:
+    """Guard against false positive catalog matches before auto-accepting a candidate."""
+    if candidate.resolution not in {"matched", "alias", "fuzzy"}:
+        return True
+    if candidate.match_score is None:
+        return False
+    score = float(candidate.match_score)
+    if score < 95.0:
+        return False
+    artifact_type = str((spec or {}).get("artifact_type") or "").strip()
+    if artifact_type in {"program_brief", "mixed"} and _is_generic_catalog_group(candidate.canonical_group):
+        return False
+    if candidate.resolution == "fuzzy" and score < 98.0:
+        return False
+    return group_is_compatible(candidate)
 
 
 def _build_coverage_audit(
@@ -337,6 +596,7 @@ def decompose(brief: str) -> dict:
             "artifact_type ('learner_brief'|'program_brief'|'mixed'), "
             "role, seniority, domain, operator_role, program_goal, "
             "must_include_areas (list 8-16 обязательных областей компетенций выпускника), "
+            "duration_months_min, duration_months_max, hours_per_week, target_total_hours, если эти данные явно есть в брифе, "
             "sub_queries (list 4-6 поисковых запросов только про learner skills и graduate outcomes). "
             "Запрещено заполнять sub_queries вопросами про размер когорты, бюджет программы, staffing, загрузку преподавателей, ресурсы команды запуска, KPI самой программы. "
             "Нужно вытаскивать skills выпускника, а не операционные решения по запуску программы."
@@ -346,34 +606,13 @@ def decompose(brief: str) -> dict:
             [{"role": "system", "content": sys}, {"role": "user", "content": brief}],
             json_mode=True,
         )))
-        return _normalized_spec(raw)
-    brief_lower = brief.lower()
-    if "предпринимател" in brief_lower or "стартап" in brief_lower or "тз на продукт" in brief_lower:
-        return _mock_program_brief_spec()
-    return _normalized_spec(
-        {
-            "artifact_type": "learner_brief",
-            "role": "Backend разработчик на Python",
-            "seniority": "junior",
-            "domain": "финтех",
-            "operator_role": None,
-            "program_goal": "",
-            "must_include_areas": [
-                "Python backend development",
-                "Работа с БД и SQL",
-                "REST API",
-                "Очереди сообщений",
-                "Docker",
-            ],
-            "sub_queries": [
-                "junior backend требования",
-                "работа с БД и SQL",
-                "REST API",
-                "очереди сообщений",
-                "контейнеризация Docker",
-            ],
-        }
-    )
+        spec = _normalized_spec(raw)
+        spec.update({key: value for key, value in _extract_workload_from_text(brief).items() if value is not None})
+        for field in ("duration_months_min", "duration_months_max", "hours_per_week", "target_total_hours"):
+            if raw.get(field) not in (None, "") and field not in spec:
+                spec[field] = raw[field]
+        return spec
+    return _mock_spec_from_brief(brief)
 
 
 def _normalize_evidence_query(query: str) -> str:
@@ -495,7 +734,6 @@ def search(query: str, cache_conn: sqlite3.Connection | None = None) -> list[dic
         "требован": [("Git в командной работе", "vacancy", "https://hh.ru/v/4", "Git, ветки, review")],
         "проблем": [("Discovery: выявление проблем клиента", "framework", "https://example.org/discovery", "JTBD, problem framing")],
         "ai-инструменты в маркетинге": [("AI-маркетинг: генерация креативов, аналитика", "syllabus", "https://example.org/ai-mkt", "AI marketing")],
-        "стартапа": [("Базовые функции стартапа", "framework", "https://example.org/startup-fn", "startup functions")],
         "метрики": [("Продуктовые метрики и сегментация", "syllabus", "https://example.org/product-analytics", "product analytics")],
     }
     out = []
@@ -725,8 +963,8 @@ def synthesize_with_coverage(evidence: list[Evidence], spec: dict) -> tuple[list
                 "status в coverage: covered|partial|uncovered. "
                 "Кандидаты должны быть только learner-skills/graduate outcomes. "
                 "Название кандидата формулируй как наблюдаемый навык или действие, а не как роль/должность человека. "
-                "Хорошо: 'Проведение проблемных интервью', 'Настройка CI/CD', 'Определение границ MVP'. "
-                "Плохо: 'Исследователь', 'Маркетолог', 'Стратег', 'Инженер MVP'. "
+                "Хорошо: 'Проведение проблемных интервью', 'Настройка CI/CD', 'Планирование работ'. "
+                "Плохо: 'Исследователь', 'Маркетолог', 'Стратег', 'Инженер'. "
                 "Не включай staffing decisions, преподавателей, бюджет, ресурсы программы, критерии набора, состав когорты, функции команды запуска, outsourcing-решения, роли операторов программы. "
                 "Старайся не концентрироваться только в одной инженерной зоне: распределяй кандидатов по разным must_include_areas. "
                 "На одну область давай 1-2 наиболее важных атомарных skill-кандидата, если evidence это поддерживает. "
@@ -774,63 +1012,28 @@ def synthesize_with_coverage(evidence: list[Evidence], spec: dict) -> tuple[list
             )
         coverage = _build_coverage_audit(spec, out, data.get("coverage"))
         return out, coverage
-    # MOCK: реалистичные кандидаты под бриф (резолв пойдёт против реального каталога)
-    role = str(spec.get("role", "")).lower()
-    if "предпринимател" in role or "стартап" in role:
-        proto = [
-            ("Выявление проблемы клиента", "Customer Discovery", "Выявление проблемы клиента и customer discovery", [("Выявляет проблему клиента через интервью и наблюдение", "apply")], []),
-            ("Проверка продуктовых гипотез", "Customer Discovery", "Проверка продуктовых гипотез", [("Проверяет гипотезы о проблеме и решении", "analyze")], []),
-            ("Формулирование ценностного предложения", "Product Strategy", "Сегментация клиентов и ценностное предложение", [("Формулирует ценностное предложение для сегмента", "apply")], []),
-            ("Определение границ MVP", "Product Strategy", "Определение границ MVP и продуктовая приоритизация", [("Определяет минимальный состав MVP", "apply")], []),
-            ("Продуктовая приоритизация", "Product Strategy", "Определение границ MVP и продуктовая приоритизация", [("Приоритизирует backlog по ценности и рискам", "analyze")], []),
-            ("AI-assisted разработка цифрового продукта", "Product Development", "AI-assisted разработка и архитектурное мышление", [("Использует AI для ускорения разработки продукта", "apply")], ["LLM", "IDE with AI"]),
-            ("Настройка базовой инженерной дисциплины", "Engineering Delivery", "Инженерная дисциплина: репозиторий, CI, тесты, релизы", [("Ведет репозиторий, CI и тесты", "apply")], ["Git", "CI"]),
-            ("Развертывание и наблюдаемость цифрового продукта", "Product Infrastructure", "Инфраструктура: деплой, observability, backup, incidents", [("Разворачивает сервис и настраивает observability", "apply")], ["Cloud", "Monitoring"]),
-            ("Позиционирование и каналы привлечения", "Go-To-Market", "Маркетинг технологического продукта", [("Определяет позиционирование и каналы привлечения", "apply")], []),
-            ("Построение модели монетизации", "Go-To-Market", "Продажи и монетизация", [("Формирует базовую модель монетизации продукта", "apply")], []),
-            ("Поддержка пользователей и сбор обратной связи", "Customer Success", "Поддержка пользователей и feedback loop", [("Организует поддержку и feedback loop", "apply")], []),
-            ("Контроль качества AI и безопасность", "Risk & Compliance", "Контроль качества AI, безопасность и human-in-the-loop", [("Проверяет результаты AI и управляет рисками безопасности", "analyze")], []),
-        ]
-        out = []
-        for i, (name, grp, area, inds, tools) in enumerate(proto, 1):
-            out.append(
-                _localize_candidate(
-                    SkillCandidate(
-                        tmp_id=f"C{i:02d}",
-                        name=name,
-                        group=grp,
-                        coverage_area=area,
-                        indicators=[IndicatorSpec(text=text, bloom=bloom) for text, bloom in inds],
-                        tools=tools,
-                        evidence_ids=ev_ids[:2] or ev_ids[:1],
-                    )
-                )
-            )
-        return out, _build_coverage_audit(spec, out)
+    topics: list[tuple[str, list[str]]] = []
+    for item in evidence:
+        topic = item.claim or item.snippet
+        if topic:
+            topics.append((topic, [item.id]))
+    if not topics:
+        topics = [(str(area), []) for area in (spec.get("must_include_areas") or []) if str(area).strip()]
 
-    def by_kw(*kw):
-        return [e.id for e in evidence if any(k.lower() in (e.claim + " " + e.snippet).lower() for k in kw)]
-    proto = [
-        ("Работа с языком SQL", "Данные", [("Знает SELECT/JOIN", "understand"), ("Пишет агрегации", "apply")], ["PostgreSQL"], ("SQL",)),
-        ("Понимание основ реляционных баз данных", "Данные", [("Понимает нормализацию", "understand")], ["PostgreSQL"], ("реляц", "relational")),
-        ("Работа с REST API", "Сервисы", [("Проектирует контракт", "apply")], ["OpenAPI"], ("REST",)),
-        ("Базовая работа с очередями сообщений", "Интеграции", [("Понимает pub/sub", "apply")], ["RabbitMQ"], ("очеред",)),
-        ("Работа с Docker", "Инфраструктура", [("Пишет Dockerfile", "apply")], ["Docker"], ("Docker", "контейнер")),
-        ("Применение системы контроля версий Git", "Командная работа", [("Работает с ветками", "apply")], ["Git"], ("Git",)),
-    ]
-    out = []
-    for i, (name, grp, inds, tools, kw) in enumerate(proto, 1):
-        ids = by_kw(*kw)
-        if not ids:
-            continue
+    out: list[SkillCandidate] = []
+    group = str(spec.get("domain") or spec.get("role") or "Общее").strip() or "Общее"
+    for i, (topic, ids) in enumerate(topics[:12], 1):
+        name = _topic_to_mock_skill_name(topic)
+        area = _short_topic_label(topic)
         out.append(
             _localize_candidate(
                 SkillCandidate(
                     tmp_id=f"C{i:02d}",
                     name=name,
-                    group=grp,
-                    indicators=[IndicatorSpec(text=t, bloom=b) for t, b in inds],
-                    tools=tools,
+                    group=group,
+                    coverage_area=area,
+                    indicators=[IndicatorSpec(text=f"Применяет навык в теме «{area}»", bloom="apply")],
+                    tools=[],
                     evidence_ids=ids,
                 )
             )
@@ -886,6 +1089,11 @@ def atomize_candidates(cands: list[SkillCandidate], spec: dict | None = None) ->
             if canonical_name and canonical_name != candidate.name:
                 candidate.source_name = candidate.source_name or candidate.name
                 candidate.name = canonical_name
+            artifact_type = str((spec or {}).get("artifact_type") or "").strip()
+            if artifact_type in {"program_brief", "mixed"} and not has_observable_action(candidate.name):
+                candidate.decision = "needs_review"
+                if "missing_observable_action" not in candidate.reasons:
+                    candidate.reasons.append("missing_observable_action")
         if spec:
             candidate.indicators = [
                 IndicatorSpec(text=indicator.text, bloom=normalize_bloom(indicator.bloom, spec, indicator.text))
@@ -929,6 +1137,8 @@ def _meets_auto_accept_policy(cand: SkillCandidate, spec: dict[str, object] | No
         and not config.AUTO_ACCEPT_NEW_FOR_PROGRAM_BRIEF
     ):
         return False
+    if not is_catalog_match_safe(cand, spec):
+        return False
     return (
         cand.council_agreement is not None
         and cand.confidence >= config.AUTO_ACCEPT_CONFIDENCE
@@ -941,7 +1151,7 @@ def triage_candidates(cands: list[SkillCandidate], spec: dict[str, object] | Non
     for c in cands:
         if not _is_for_resolve(c):
             continue
-        r = []
+        r = list(dict.fromkeys(c.reasons or []))
         n = len(set(c.evidence_ids))
         if c.resolution == "new":
             r.append("novel_skill")
@@ -949,13 +1159,15 @@ def triage_candidates(cands: list[SkillCandidate], spec: dict[str, object] | Non
                 r.append("program_brief_publication_guardrail")
         if c.resolution == "fuzzy":
             r.append("fuzzy_match_ambiguous")
+        if c.resolution in {"matched", "alias", "fuzzy"} and not is_catalog_match_safe(c, spec):
+            r.append("catalog_match_suspicious")
         if c.confidence < config.TAU_CONFIDENCE:
             r.append("low_confidence")
         if n < config.MIN_SOURCES and c.resolution not in {"matched", "alias"}:
             r.append("single_source")
         if c.council_ran and c.council_agreement is not None and c.council_agreement < config.COUNCIL_AGREE_OK:
             r.append("council_split")
-        if _meets_auto_accept_policy(c, spec):
+        if not r and _meets_auto_accept_policy(c, spec):
             c.decision = "accepted"
             c.reasons = ["auto_accept_policy"]
             continue

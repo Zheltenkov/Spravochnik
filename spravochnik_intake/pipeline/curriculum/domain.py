@@ -50,6 +50,11 @@ class ProjectBlueprint:
     occurrences: list[SkillOccurrence]
     block_key: str
     artifact: str
+    artifact_key: str = ""
+    artifact_family: str = "practice"
+    artifact_template_code: str = ""
+    enrichment: dict[str, str] = field(default_factory=dict)
+    title: str = ""
     project_kind: str = "integrative"
 
     @property

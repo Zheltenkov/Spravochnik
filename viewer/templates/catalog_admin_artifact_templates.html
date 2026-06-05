@@ -1,0 +1,178 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+    <div>
+        <h1>Шаблоны УП</h1>
+        <p>Методологические шаблоны проверяемых артефактов для планировщика. Они применяются к навыкам по области покрытия и не меняют DAG.</p>
+    </div>
+</section>
+
+<section class="filter-panel">
+    <form class="admin-form" method="post" action="/catalog-admin/artifact-templates">
+        <input type="hidden" name="action" value="save_template">
+        {% if edit_template %}
+        <input type="hidden" name="template_id" value="{{ edit_template.id }}">
+        {% endif %}
+
+        <div class="summary-head">
+            <h2>{% if edit_template %}Редактирование шаблона{% else %}Новый шаблон{% endif %}</h2>
+            {% if edit_template %}
+            <a class="action-btn action-btn-light" href="/catalog-admin/artifact-templates">Создать новый</a>
+            {% endif %}
+        </div>
+
+        <div class="admin-grid">
+            <label>
+                <span>Код</span>
+                <input type="text" name="code" value="{{ edit_template.code if edit_template else '' }}" placeholder="Например, customer-interview-report">
+            </label>
+            <label>
+                <span>Название</span>
+                <input type="text" name="title" value="{{ edit_template.title if edit_template else '' }}" placeholder="Короткое имя шаблона">
+            </label>
+            <label>
+                <span>Тип артефакта</span>
+                <select name="artifact_family">
+                    {% set current_family = edit_template.artifact_family if edit_template else 'practice' %}
+                    {% for value, label in artifact_family_options %}
+                    <option value="{{ value }}" {% if current_family == value %}selected{% endif %}>{{ label }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+        </div>
+
+        <div class="admin-grid">
+            <label>
+                <span>Статус</span>
+                {% set current_status = edit_template.status if edit_template else 'active' %}
+                <select name="status">
+                    <option value="active" {% if current_status == 'active' %}selected{% endif %}>active</option>
+                    <option value="draft" {% if current_status == 'draft' %}selected{% endif %}>draft</option>
+                    <option value="deprecated" {% if current_status == 'deprecated' %}selected{% endif %}>deprecated</option>
+                </select>
+            </label>
+            <label>
+                <span>Приоритет</span>
+                <input type="number" name="priority" value="{{ edit_template.priority if edit_template else 100 }}">
+            </label>
+            <label>
+                <span>Вес scope</span>
+                <input type="number" step="0.1" name="scope_weight" value="{{ edit_template.scope_weight if edit_template else '1.0' }}">
+            </label>
+        </div>
+
+        <label>
+            <span>Описание проверяемого артефакта</span>
+            <textarea name="artifact_description" rows="3" placeholder="Например: структурированный отчёт по теме {theme} на основе skills: {skills}">{{ edit_template.artifact_description if edit_template else '' }}</textarea>
+        </label>
+
+        <label>
+            <span>Название проекта</span>
+            <textarea name="project_name_pattern" rows="2" placeholder="Например: Практика по теме {theme}">{{ edit_template.project_name_pattern if edit_template else '' }}</textarea>
+        </label>
+
+        <div class="form-grid-2">
+            <label>
+                <span>Материалы и инструменты</span>
+                <textarea name="materials_pattern" rows="4" placeholder="Можно использовать {skills}, {first_skill}, {theme}, {artifact}">{{ edit_template.materials_pattern if edit_template else '' }}</textarea>
+            </label>
+            <label>
+                <span>Сюжет / контекст задания</span>
+                <textarea name="storytelling_pattern" rows="4" placeholder="Ситуация, в которой студент применяет skills">{{ edit_template.storytelling_pattern if edit_template else '' }}</textarea>
+            </label>
+        </div>
+
+        <label>
+            <span>Критерии проверки</span>
+            <textarea name="validation_criteria" rows="3" placeholder="Наблюдаемые критерии качества результата">{{ edit_template.validation_criteria if edit_template else '' }}</textarea>
+        </label>
+
+        <div class="form-grid-2">
+            <label>
+                <span>Область применения</span>
+                {% set current_scope_type = edit_template.scope_type if edit_template else 'coverage_area' %}
+                <select name="scope_type">
+                    {% for value, label in scope_type_options %}
+                    <option value="{{ value }}" {% if current_scope_type == value %}selected{% endif %}>{{ label }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <label>
+                <span>Scope names</span>
+                <textarea name="scope_names" rows="3" placeholder="Одна область на строку. Для any можно оставить пустым.">{{ edit_template.scope_names_text if edit_template else '' }}</textarea>
+            </label>
+        </div>
+
+        <p class="muted">Доступные плейсхолдеры: <code>{theme}</code>, <code>{skills}</code>, <code>{first_skill}</code>, <code>{artifact}</code>, <code>{artifact_family}</code>.</p>
+
+        <div class="review-actions">
+            <button type="submit" class="action-btn action-btn-primary">Сохранить шаблон</button>
+        </div>
+    </form>
+</section>
+
+<section class="filter-panel">
+    <div class="summary-head">
+        <h2>Существующие шаблоны</h2>
+        <span class="pill">{{ templates|length }}</span>
+    </div>
+    {% if templates %}
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Шаблон</th>
+                <th>Тип</th>
+                <th>Scope</th>
+                <th>Приоритет</th>
+                <th>Статус</th>
+                <th>Действие</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for template in templates %}
+            <tr>
+                <td>
+                    <strong>{{ template.title }}</strong>
+                    <p class="muted">{{ template.code }}</p>
+                    {% if template.artifact_description %}
+                    <p>{{ template.artifact_description }}</p>
+                    {% endif %}
+                </td>
+                <td>{{ template.artifact_family }}</td>
+                <td>
+                    {% if template.scopes %}
+                    {% for scope in template.scopes %}
+                    <span class="pill">{{ scope.scope_type }}: {{ scope.scope_name or '*' }}</span>
+                    {% endfor %}
+                    {% else %}
+                    <span class="muted">Не задан</span>
+                    {% endif %}
+                </td>
+                <td>{{ template.priority }}</td>
+                <td>
+                    <span class="status-badge {% if template.status != 'active' %}warn{% endif %}">{{ template.status }}</span>
+                </td>
+                <td>
+                    <div class="review-actions review-actions-vertical">
+                        <a class="action-btn action-btn-light" href="/catalog-admin/artifact-templates?edit={{ template.id }}">Редактировать</a>
+                        <form method="post" action="/catalog-admin/artifact-templates">
+                            <input type="hidden" name="template_id" value="{{ template.id }}">
+                            {% if template.status == 'active' %}
+                            <input type="hidden" name="action" value="deprecate_template">
+                            <button type="submit" class="action-btn action-btn-danger">Отключить</button>
+                            {% else %}
+                            <input type="hidden" name="action" value="activate_template">
+                            <button type="submit" class="action-btn action-btn-primary">Включить</button>
+                            {% endif %}
+                        </form>
+                    </div>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <div class="empty-state">Шаблонов пока нет. Создайте первый шаблон выше.</div>
+    {% endif %}
+</section>
+{% endblock %}

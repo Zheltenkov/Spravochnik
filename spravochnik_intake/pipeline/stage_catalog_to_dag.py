@@ -119,6 +119,11 @@ def triage_edges(edges: list[PrereqEdge], cands: list[SkillCandidate]) -> None:
         e.decision = "accept" if not r else "needs_review"
 
 
+def operational_edges(edges: list[PrereqEdge]) -> list[PrereqEdge]:
+    """Return only confirmed edges that are allowed to influence the operational DAG."""
+    return [edge for edge in edges if edge.decision == "accept"]
+
+
 def build_dag(edges: list[PrereqEdge], cands: list[SkillCandidate]):
     """Возвращает (DAG, removed_cycle, removed_transitive)."""
     G = nx.DiGraph()
@@ -268,9 +273,12 @@ def build_dag_payload(
 
 def run(cands: list[SkillCandidate]):
     used_candidates = _graph_candidates(cands)
-    edges = deduplicate_edges(propose_edges(used_candidates))
-    triage_edges(edges, used_candidates)
-    DAG, removed_cycle, removed_transitive = build_dag(edges, used_candidates)
-    dag_payload = build_dag_payload(edges, DAG, removed_cycle, removed_transitive, used_candidates)
+    all_edges = deduplicate_edges(propose_edges(used_candidates))
+    triage_edges(all_edges, used_candidates)
+    accepted_edges = operational_edges(all_edges)
+    DAG, removed_cycle, removed_transitive = build_dag(accepted_edges, used_candidates)
+    dag_payload = build_dag_payload(all_edges, DAG, removed_cycle, removed_transitive, used_candidates)
     dag_payload["used_candidate_ids"] = [cand.tmp_id for cand in used_candidates]
-    return edges, DAG, removed_cycle, removed_transitive, dag_payload
+    dag_payload["candidate_edge_count"] = len(all_edges)
+    dag_payload["accepted_edge_count"] = len(accepted_edges)
+    return all_edges, DAG, removed_cycle, removed_transitive, dag_payload

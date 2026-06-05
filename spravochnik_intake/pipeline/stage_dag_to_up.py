@@ -151,28 +151,88 @@ def _block_goal(nodes: list[PlanNode]) -> str:
     return f"Сформировать практику: {names}" if names else "Сформировать практический результат блока."
 
 
-def _project_name(nodes: list[PlanNode], block_index: int, project_index: int) -> str:
-    # Пока делаем детерминированный title; LLM-enrichment можно добавить отдельным нижним генератором.
+def _project_name(project: ProjectBlueprint, block_index: int, project_index: int, block_key: str = "") -> str:
+    # Название должно опираться на данные проекта, а не на доменно-локальные keyword-шаблоны.
+    nodes = project.unique_nodes
+    if project.title:
+        return project.title
     if len(nodes) == 1:
         return _compact_label(nodes[0].name, max_words=6, max_chars=64)
     anchor = nodes[-1].name
     return _compact_label(anchor, max_words=6, max_chars=64)
 
 
-def _project_summary(nodes: list[PlanNode], role: str) -> str:
+def _project_summary(project: ProjectBlueprint, role: str) -> str:
+    nodes = project.unique_nodes
     names = ", ".join(node.name for node in nodes)
+    artifact = project.artifact.strip()
+    if artifact:
+        return (
+            f"Практический проект, в котором участник в роли «{role}» собирает проверяемый артефакт: "
+            f"{artifact}. Навыки проекта: {names}."
+        )
     return (
         f"Практический проект, в котором участник в роли «{role}» применяет навыки {names} "
         "и собирает проверяемый промежуточный результат."
     )
 
 
-def _project_storytelling(nodes: list[PlanNode], role: str, block_key: str) -> str:
+def _project_storytelling(project: ProjectBlueprint, role: str, block_key: str) -> str:
+    nodes = project.unique_nodes
     names = ", ".join(node.name for node in nodes)
+    artifact = project.artifact.strip() or "проверяемый результат проекта"
     return (
         f"Ты работаешь как {role} и решаешь учебный кейс по теме «{block_key}». "
-        f"Нужно применить навыки {names} в ограниченном прикладном сценарии и защитить результат."
+        f"Нужно применить навыки {names}, собрать артефакт «{artifact}» и защитить результат."
     )
+
+
+def _project_assessment_criteria(project: ProjectBlueprint) -> str:
+    if project.enrichment.get("validation_criteria"):
+        return project.enrichment["validation_criteria"]
+    artifact = project.artifact.strip() or "проверяемый результат"
+    skills = ", ".join(node.name for node in project.unique_nodes)
+    return (
+        f"Критерии проверки: артефакт «{artifact}» создан и предъявлен; "
+        f"в решении явно применены навыки: {skills}; результат можно проверить по заявленным ЗУН."
+    )
+
+
+def _project_materials(project: ProjectBlueprint) -> str:
+    if project.enrichment.get("materials"):
+        criteria = _project_assessment_criteria(project)
+        materials = project.enrichment["materials"]
+        return materials if criteria and criteria in materials else "\n".join(item for item in [materials, criteria] if item)
+    nodes = project.unique_nodes
+    tools = sorted({tool for node in nodes for tool in node.tools})
+    lines = [
+        f"Описание артефакта: {project.artifact.strip() or 'проверяемый результат проекта'}.",
+        f"Опорные навыки: {', '.join(node.name for node in nodes)}.",
+        _project_assessment_criteria(project),
+    ]
+    if tools:
+        lines.insert(2, f"Инструменты: {', '.join(tools)}.")
+    return "\n".join(lines)
+
+
+def enrich_curriculum_row(row: dict[str, object], project: ProjectBlueprint, spec: dict[str, object] | None, block_key: str) -> None:
+    """Enrich a curriculum row without mutating DAG identity fields."""
+    protected_node_ids = list(row.get("node_ids") or [])
+    protected_node_names = list(row.get("node_names") or [])
+    role = str((spec or {}).get("role") or "участник программы").strip()
+    project_name = _project_name(project, int(row.get("block_index", 0) or 0), int(row.get("project_index_in_block", 0) or 0), block_key)
+    row.update(
+        {
+            "project_name": project_name,
+            "project_summary": _project_summary(project, role),
+            "materials": _project_materials(project),
+            "storytelling": project.enrichment.get("storytelling") or _project_storytelling(project, role, block_key),
+            "platform_project_name": project_name,
+            "validation_criteria": _project_assessment_criteria(project),
+        }
+    )
+    row["node_ids"] = protected_node_ids
+    row["node_names"] = protected_node_names
 
 
 def _occurrence_outcome_sources(occurrence: SkillOccurrence) -> tuple[str, tuple[str, ...]]:
@@ -254,13 +314,68 @@ def _project_skill_list(project: ProjectBlueprint) -> str:
     return ", ".join(labels)
 
 
+def _weighted_skill_list(project: ProjectBlueprint) -> str:
+    nodes = project.unique_nodes
+    if not nodes:
+        return ""
+    base_weight = round(100 / len(nodes))
+    weights = [base_weight] * len(nodes)
+    delta = 100 - sum(weights)
+    if weights:
+        weights[-1] += delta
+    return ", ".join(f"{node.name}: {weight}%" for node, weight in zip(nodes, weights, strict=False))
+
+
 def _default_group_size(delivery_format: str) -> int:
     bounds = config.UP_FORMAT_GROUP_SIZES.get(delivery_format, (1, 1))
     return int(bounds[0])
 
 
+def _target_total_hours(spec: dict[str, object] | None) -> float | None:
+    raw = (spec or {}).get("target_total_hours")
+    if raw in (None, ""):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _scale_hours_to_target(rows: list[dict[str, object]], spec: dict[str, object] | None) -> None:
+    target_hours = _target_total_hours(spec)
+    current_hours = sum(float(row.get("effort_hours", 0) or 0) for row in rows)
+    if not rows or not target_hours or current_hours <= 0:
+        return
+    factor = target_hours / current_hours
+    # Small deltas are noise from rounding. Large deltas mean the brief contains
+    # an explicit workload contract and the plan must respect it.
+    if 0.9 <= factor <= 1.1:
+        return
+    for row in rows:
+        raw = float(row.get("effort_hours", 0) or 0) * factor
+        row["effort_hours"] = max(4, int(round(raw / 2.0) * 2))
+    rounded_total = sum(float(row.get("effort_hours", 0) or 0) for row in rows)
+    delta = int(round(target_hours - rounded_total))
+    if delta and rows:
+        rows[-1]["effort_hours"] = max(4, int(float(rows[-1].get("effort_hours", 0) or 0) + delta))
+
+
+def _fill_effort_columns(rows: list[dict[str, object]]) -> None:
+    total_hours = sum(float(row.get("effort_hours", 0) or 0) for row in rows)
+    cumulative_days = 0.0
+    for row in rows:
+        effort_hours = float(row.get("effort_hours", 0) or 0)
+        effort_days = round(effort_hours / config.UP_HOURS_PER_DAY, 2) if config.UP_HOURS_PER_DAY else 0.0
+        cumulative_days = round(cumulative_days + effort_days, 2)
+        row["effort_days"] = effort_days
+        row["cumulative_days"] = cumulative_days
+        row["xp"] = int(round(effort_hours * config.UP_XP_PER_HOUR))
+        row["completion_percent"] = round((sum(float(item.get("effort_hours", 0) or 0) for item in rows[: int(row["row_number"])]) / total_hours) * 100, 1) if total_hours else ""
+        row["p2p_checks"] = 1 if effort_hours >= 12 else 0
+
+
 def _format_rows(blocks: list[CurriculumBlock], spec: dict[str, object] | None) -> list[dict[str, object]]:
-    role = str((spec or {}).get("role") or "участник программы").strip()
     rows: list[dict[str, object]] = []
     row_number = 0
     for block_index, block in enumerate(blocks, start=1):
@@ -274,45 +389,49 @@ def _format_rows(blocks: list[CurriculumBlock], spec: dict[str, object] | None) 
             effort_hours = _estimate_project_hours(project_nodes)
             required_tools = ", ".join(sorted({tool for node in project_nodes for tool in node.tools}))
             outcomes_know, outcomes_can, outcomes_skills, outcome_count = _project_outcomes(project)
-            project_name = _project_name(project_nodes, block_index, project_index)
             block_key = project.block_key or (project_nodes[0].block_key if project_nodes else "Общее")
             delivery_format = config.UP_DEFAULT_FORMAT
-            rows.append(
-                {
-                    "block_index": block_index,
-                    "row_number": row_number,
-                    "project_index_in_block": project_index,
-                    "block_title": block_title if project_index == 1 else "",
-                    "block_goal": block_goal,
-                    "project_name": project_name,
-                    "project_summary": _project_summary(project_nodes, role),
-                    "outcomes_know": outcomes_know,
-                    "outcomes_can": outcomes_can,
-                    "outcomes_skills": outcomes_skills,
-                    "learning_outcomes": "\n".join(item for item in [outcomes_know, outcomes_can, outcomes_skills] if item),
-                    "skills_list": _project_skill_list(project),
-                    "node_ids": project.node_ids,
-                    "node_names": [node.name for node in project_nodes],
-                    "occurrence_count": len(project.occurrences),
-                    "outcome_count": outcome_count,
-                    "artifact": project.artifact,
-                    "audience_level": _audience_label(spec),
-                    "required_tools": required_tools,
-                    "materials": "",
-                    "storytelling": _project_storytelling(project_nodes, role, block_key),
-                    "delivery_format": delivery_format,
-                    "group_size": _default_group_size(delivery_format),
-                    "effort_hours": effort_hours,
-                    "effort_days": "",
-                    "cumulative_days": "",
-                    "xp": "",
-                    "completion_percent": "",
-                    "p2p_checks": "",
-                    "weighted_skills": "",
-                    "platform_project_name": "",
-                    "artifact_links": "",
-                }
-            )
+            row = {
+                "block_index": block_index,
+                "row_number": row_number,
+                "project_index_in_block": project_index,
+                "block_title": block_title if project_index == 1 else "",
+                "block_goal": block_goal,
+                "project_name": "",
+                "project_summary": "",
+                "outcomes_know": outcomes_know,
+                "outcomes_can": outcomes_can,
+                "outcomes_skills": outcomes_skills,
+                "learning_outcomes": "\n".join(item for item in [outcomes_know, outcomes_can, outcomes_skills] if item),
+                "skills_list": _project_skill_list(project),
+                "node_ids": project.node_ids,
+                "node_names": [node.name for node in project_nodes],
+                "occurrence_count": len(project.occurrences),
+                "outcome_count": outcome_count,
+                "artifact": project.artifact,
+                "artifact_key": project.artifact_key,
+                "artifact_family": project.artifact_family,
+                "artifact_template_code": project.artifact_template_code,
+                "audience_level": _audience_label(spec),
+                "required_tools": required_tools,
+                "materials": "",
+                "storytelling": "",
+                "delivery_format": delivery_format,
+                "group_size": _default_group_size(delivery_format),
+                "effort_hours": effort_hours,
+                "effort_days": "",
+                "cumulative_days": "",
+                "xp": "",
+                "completion_percent": "",
+                "p2p_checks": "",
+                "weighted_skills": _weighted_skill_list(project),
+                "platform_project_name": "",
+                "artifact_links": "",
+            }
+            enrich_curriculum_row(row, project, spec, block_key)
+            rows.append(row)
+    _scale_hours_to_target(rows, spec)
+    _fill_effort_columns(rows)
     return rows
 
 
@@ -362,6 +481,11 @@ def _quality_metrics(rows: list[dict[str, object]], planner_meta: dict[str, obje
             "core_thread_count": 0,
             "repeated_thread_count": 0,
             "spiral_enabled": bool(config.UP_SPIRAL_ENABLED),
+            "artifact_first": bool(planner_meta.get("artifact_first", False)),
+            "artifact_project_count": int(planner_meta.get("artifact_project_count", 0) or 0),
+            "db_template_count": int(planner_meta.get("db_template_count", 0) or 0),
+            "db_template_project_count": int(planner_meta.get("db_template_project_count", 0) or 0),
+            "unassigned_node_count": int(planner_meta.get("unassigned_node_count", 0) or 0),
             "target_skills_per_project": [config.UP_TARGET_SKILLS_MIN, config.UP_TARGET_SKILLS_MAX],
             "target_outcomes_per_project": [config.UP_TARGET_OUTCOMES_MIN, config.UP_TARGET_OUTCOMES_MAX],
         }
@@ -381,6 +505,11 @@ def _quality_metrics(rows: list[dict[str, object]], planner_meta: dict[str, obje
         "core_thread_count": len(planner_meta.get("core_thread_ids") or []),
         "repeated_thread_count": int(planner_meta.get("repeated_thread_count", 0) or 0),
         "spiral_enabled": bool(config.UP_SPIRAL_ENABLED),
+        "artifact_first": bool(planner_meta.get("artifact_first", False)),
+        "artifact_project_count": int(planner_meta.get("artifact_project_count", 0) or 0),
+        "db_template_count": int(planner_meta.get("db_template_count", 0) or 0),
+        "db_template_project_count": int(planner_meta.get("db_template_project_count", 0) or 0),
+        "unassigned_node_count": int(planner_meta.get("unassigned_node_count", 0) or 0),
         "target_skills_per_project": [config.UP_TARGET_SKILLS_MIN, config.UP_TARGET_SKILLS_MAX],
         "target_outcomes_per_project": [config.UP_TARGET_OUTCOMES_MIN, config.UP_TARGET_OUTCOMES_MAX],
     }
@@ -404,7 +533,10 @@ def run(spec: dict[str, object] | None, candidates: list[SkillCandidate], dag_pa
         }
 
     nodes = [_node_from_candidate(candidate) for candidate in candidates]
-    blocks, planner_meta = build_curriculum_blocks(nodes, dag_payload)
+    artifact_templates = (spec or {}).get("artifact_templates")
+    if not isinstance(artifact_templates, list):
+        artifact_templates = []
+    blocks, planner_meta = build_curriculum_blocks(nodes, dag_payload, artifact_templates)
     rows = _format_rows(blocks, spec)
     total_hours = sum(float(row.get("effort_hours", 0) or 0) for row in rows)
     total_days = sum(float(row.get("effort_days", 0) or 0) for row in rows)

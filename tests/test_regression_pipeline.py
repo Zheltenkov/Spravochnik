@@ -14,7 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from spravochnik_intake.pipeline import config, stage_atomize, stage_brief_to_catalog, stage_dag_to_up, storage
+from spravochnik_intake.pipeline import config, stage_atomize, stage_brief_to_catalog, stage_catalog_to_dag, stage_dag_to_up, storage
 from spravochnik_intake.pipeline.catalog_repo import CatalogRepo
 from spravochnik_intake.pipeline.models import IndicatorSpec, SkillCandidate
 from spravochnik_intake.pipeline.skill_names import canonicalize_skill_name
@@ -30,6 +30,7 @@ from viewer.app import (
     ensure_intake_runtime_schema,
     get_intake_job,
     merge_catalog_skills,
+    load_brief_spec_for_plan,
     open_db,
     update_intake_job,
 )
@@ -253,7 +254,7 @@ def test_up_planner_keeps_direct_edges_out_of_same_project() -> None:
     assert not any({"A", "B"}.issubset(set(row["node_ids"])) for row in plan["rows"])
 
 
-def test_up_planner_marks_inconsistent_topological_order_invalid() -> None:
+def test_up_planner_repairs_inconsistent_topological_order_with_hard_edges() -> None:
     candidates = [
         _candidate("A base", group="theme", bloom="apply", decision="accepted"),
         _candidate("B depends", group="theme", bloom="apply", decision="accepted"),
@@ -276,8 +277,10 @@ def test_up_planner_marks_inconsistent_topological_order_invalid() -> None:
 
     plan = stage_dag_to_up.run({"role": "tester", "seniority": "junior"}, candidates, dag_payload)
 
-    assert plan["status"] == "invalid"
-    assert plan["report"]["order_violations"] == ["A base -> B depends"]
+    assert plan["status"] == "built"
+    assert plan["report"]["order_violations"] == []
+    assert plan["report"]["project_violations"] == []
+    assert [row["node_ids"] for row in plan["rows"]] == [["A"], ["B"]]
 
 
 def test_up_planner_builds_integrative_projects_and_quality_metrics(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -285,9 +288,9 @@ def test_up_planner_builds_integrative_projects_and_quality_metrics(monkeypatch:
     monkeypatch.setattr(config, "UP_MAX_SKILLS_PER_PROJECT", 4)
     monkeypatch.setattr(config, "UP_TARGET_OUTCOMES_MIN", 3)
     candidates = [
-        _candidate("A discovery", group="theme", bloom="apply", decision="accepted"),
-        _candidate("B interview", group="theme", bloom="apply", decision="accepted"),
-        _candidate("C map", group="theme", bloom="analyze", decision="accepted"),
+        _candidate("Анализ потребности", group="theme", bloom="analyze", decision="accepted"),
+        _candidate("Оценка ограничений", group="theme", bloom="analyze", decision="accepted"),
+        _candidate("Исследование контекста", group="theme", bloom="analyze", decision="accepted"),
     ]
     for index, candidate in enumerate(candidates, start=1):
         candidate.tmp_id = f"S{index}"
@@ -324,7 +327,147 @@ def test_up_planner_localizes_groups_and_keeps_block_titles_compact(monkeypatch:
     assert "Право и администрирование" in plan["rows"][0]["block_title"]
     assert "Legal" not in plan["rows"][0]["block_title"]
     assert len(plan["rows"][0]["block_title"]) <= 80
-    assert "Подготовка базовых юридических документов" in plan["rows"][0]["project_name"]
+    assert plan["rows"][0]["project_name"] == "Практический проект: Право и администрирование"
+
+
+def test_up_planner_uses_dynamic_catalog_themes_without_local_archetypes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "UP_MAX_SKILLS_PER_PROJECT", 4)
+    candidates = [
+        _candidate("Оценка кислотности почвы", group="Фермерство / Почва", bloom="apply", decision="accepted"),
+        _candidate("Настройка полива теплицы", group="Фермерство / Теплицы", bloom="apply", decision="accepted"),
+        _candidate("Планирование кормления стада", group="Животноводство", bloom="analyze", decision="accepted"),
+        _candidate("Контроль санитарной обработки оборудования", group="Пищевая безопасность", bloom="apply", decision="accepted"),
+    ]
+    for index, candidate in enumerate(candidates, start=1):
+        candidate.tmp_id = f"S{index}"
+    dag_payload = {
+        "order": [{"id": f"S{index}"} for index in range(1, len(candidates) + 1)],
+        "final_edges": [],
+    }
+
+    plan = stage_dag_to_up.run({"role": "Агроном", "seniority": "начинающий"}, candidates, dag_payload)
+    project_names = [row["project_name"] for row in plan["rows"]]
+
+    assert plan["status"] == "built"
+    assert plan["report"]["quality_metrics"]["artifact_first"] is True
+    assert all(name.startswith("Практический проект:") for name in project_names)
+    assert any("Фермерство" in name for name in project_names)
+    assert any("Животноводство" in name for name in project_names)
+
+
+def test_up_planner_splits_same_theme_by_artifact_compatibility(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "UP_MAX_SKILLS_PER_PROJECT", 4)
+    candidates = [
+        _candidate("Анализ качества почвы", group="Фермерство", bloom="analyze", decision="accepted"),
+        _candidate("Настройка датчика влажности", group="Фермерство", bloom="apply", decision="accepted"),
+        _candidate("Оценка кислотности почвы", group="Фермерство", bloom="analyze", decision="accepted"),
+    ]
+    for index, candidate in enumerate(candidates, start=1):
+        candidate.tmp_id = f"S{index}"
+    dag_payload = {
+        "order": [{"id": "S1"}, {"id": "S2"}, {"id": "S3"}],
+        "final_edges": [],
+    }
+
+    plan = stage_dag_to_up.run({"role": "Агроном", "seniority": "начинающий"}, candidates, dag_payload)
+
+    assert plan["status"] == "built"
+    assert any({"S1", "S3"}.issubset(set(row["node_ids"])) for row in plan["rows"])
+    assert not any({"S1", "S2"}.issubset(set(row["node_ids"])) for row in plan["rows"])
+    assert {row["artifact_family"] for row in plan["rows"]} >= {"analysis", "configuration"}
+
+
+def test_up_row_enricher_fills_fields_without_changing_node_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "UP_MAX_SKILLS_PER_PROJECT", 4)
+    candidates = [
+        _candidate("Анализ влажности почвы", group="Фермерство", bloom="analyze", decision="accepted"),
+        _candidate("Оценка кислотности почвы", group="Фермерство", bloom="analyze", decision="accepted"),
+    ]
+    for index, candidate in enumerate(candidates, start=1):
+        candidate.tmp_id = f"S{index}"
+    dag_payload = {
+        "order": [{"id": "S1"}, {"id": "S2"}],
+        "final_edges": [],
+    }
+
+    plan = stage_dag_to_up.run({"role": "Агроном", "seniority": "начинающий"}, candidates, dag_payload)
+    row = plan["rows"][0]
+
+    assert row["node_ids"] == ["S1", "S2"]
+    assert row["project_name"]
+    assert row["project_summary"]
+    assert row["storytelling"]
+    assert "Критерии проверки" in row["materials"]
+    assert row["validation_criteria"]
+
+
+def test_storage_loads_db_backed_artifact_templates() -> None:
+    db_path = _runtime_db_path("artifact-template")
+    conn = _create_base_catalog_db(db_path)
+    try:
+        template_id = storage.upsert_curriculum_artifact_template(
+            conn,
+            code="soil-analysis",
+            title="Аналитический проект по теме {theme}",
+            artifact_family="analysis",
+            artifact_description="Отчёт по теме {theme}: {skills}",
+            materials_pattern="Материалы по теме {theme}",
+            storytelling_pattern="Кейс по теме {theme}",
+            validation_criteria="Проверить выводы по навыкам: {skills}",
+            scopes=[{"scope_type": "coverage_area", "scope_name": "Фермерство", "weight": 1.0}],
+        )
+
+        templates = storage.load_curriculum_artifact_templates(conn)
+
+        assert template_id > 0
+        assert templates[0]["code"] == "soil-analysis"
+        assert templates[0]["scopes"][0]["normalized_scope_name"] == "фермерство"
+    finally:
+        conn.close()
+        db_path.unlink(missing_ok=True)
+
+
+def test_up_planner_applies_db_artifact_template_without_changing_node_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "UP_MAX_SKILLS_PER_PROJECT", 4)
+    candidates = [
+        _candidate("Анализ влажности почвы", group="Фермерство", bloom="analyze", decision="accepted"),
+        _candidate("Оценка кислотности почвы", group="Фермерство", bloom="analyze", decision="accepted"),
+    ]
+    for index, candidate in enumerate(candidates, start=1):
+        candidate.tmp_id = f"S{index}"
+    dag_payload = {
+        "order": [{"id": "S1"}, {"id": "S2"}],
+        "final_edges": [],
+    }
+    spec = {
+        "role": "Агроном",
+        "seniority": "начинающий",
+        "artifact_templates": [
+            {
+                "id": 1,
+                "code": "soil-analysis",
+                "title": "Аналитический проект: {theme}",
+                "artifact_family": "analysis",
+                "artifact_description": "Методологический отчёт по теме {theme}: {skills}",
+                "materials_pattern": "Набор данных и чек-лист для темы {theme}",
+                "storytelling_pattern": "Участник решает кейс в теме {theme}",
+                "validation_criteria": "Проверить аргументацию и навыки: {skills}",
+                "priority": 1,
+                "scopes": [{"scope_type": "coverage_area", "scope_name": "Фермерство", "normalized_scope_name": "фермерство", "weight": 1.0}],
+            }
+        ],
+    }
+
+    plan = stage_dag_to_up.run(spec, candidates, dag_payload)
+    row = plan["rows"][0]
+
+    assert row["node_ids"] == ["S1", "S2"]
+    assert row["artifact_template_code"] == "soil-analysis"
+    assert row["project_name"] == "Аналитический проект: Фермерство"
+    assert "Методологический отчёт" in row["artifact"]
+    assert "Набор данных" in row["materials"]
+    assert "Проверить аргументацию" in row["validation_criteria"]
+    assert plan["report"]["quality_metrics"]["db_template_project_count"] == 1
 
 
 def test_up_planner_allows_soft_edges_inside_integrative_project(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -354,6 +497,47 @@ def test_up_planner_allows_soft_edges_inside_integrative_project(monkeypatch: py
     assert plan["status"] == "built"
     assert any({"A", "B"}.issubset(set(row["node_ids"])) for row in plan["rows"])
     assert plan["report"]["project_violations"] == []
+
+
+def test_up_planner_scales_hours_to_brief_workload(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "UP_MAX_SKILLS_PER_PROJECT", 4)
+    candidates = [
+        _candidate("Проведение интервью", group="Исследование клиентов", bloom="apply", decision="accepted"),
+        _candidate("Формулирование гипотез", group="Продуктовая стратегия", bloom="apply", decision="accepted"),
+        _candidate("Разработка MVP", group="Разработка продукта", bloom="apply", decision="accepted"),
+    ]
+    for index, candidate in enumerate(candidates, start=1):
+        candidate.tmp_id = f"S{index}"
+    dag_payload = {
+        "order": [{"id": f"S{index}"} for index in range(1, 4)],
+        "final_edges": [],
+    }
+
+    plan = stage_dag_to_up.run({"role": "tester", "seniority": "junior", "target_total_hours": 480}, candidates, dag_payload)
+
+    assert plan["status"] == "built"
+    assert plan["summary"]["total_hours"] == 480
+    assert all(row["weighted_skills"] for row in plan["rows"])
+
+
+def test_load_brief_spec_for_plan_restores_workload_from_raw_brief() -> None:
+    db_path = _runtime_db_path("brief-spec-workload")
+    conn = _create_base_catalog_db(db_path)
+    try:
+        brief_id = storage.save_brief(
+            conn,
+            "Программа длится 5-6 месяцев, нагрузка 20 часов в неделю.",
+            {"role": "роль", "seniority": "junior", "domain": "домен"},
+        )
+
+        spec = load_brief_spec_for_plan(conn, brief_id)
+
+        assert spec["target_total_hours"] == 478
+        assert spec["hours_per_week"] == 20.0
+        assert "artifact_templates" in spec
+    finally:
+        conn.close()
+        db_path.unlink(missing_ok=True)
 
 
 def test_up_planner_adds_spiral_thread_occurrence(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -403,10 +587,19 @@ def test_intro_bloom_create_is_clamped_without_explicit_signal() -> None:
     assert stage_brief_to_catalog.normalize_bloom("create", {"seniority": seniority}, explicit) == "create"
 
 
+def test_practical_actions_are_not_downgraded_to_understand() -> None:
+    spec = {"seniority": "начинающий"}
+
+    assert stage_brief_to_catalog.normalize_bloom("understand", spec, "Настраивает мониторинг и логирование") == "apply"
+    assert stage_brief_to_catalog.normalize_bloom("understand", spec, "Проектирует высокоуровневую архитектуру") == "analyze"
+
+
 def test_triage_does_not_mark_matched_skill_as_novel() -> None:
     candidate = _candidate("Existing skill", decision="needs_review")
     candidate.resolution = "matched"
     candidate.match_score = 100.0
+    candidate.canonical_name = "Existing skill"
+    candidate.canonical_group = "Research"
     candidate.confidence = 0.98
     candidate.evidence_ids = []
 
@@ -414,6 +607,67 @@ def test_triage_does_not_mark_matched_skill_as_novel() -> None:
 
     assert "novel_skill" not in candidate.reasons
     assert "single_source" not in candidate.reasons
+
+
+def test_triage_sends_suspicious_catalog_match_to_review() -> None:
+    candidate = _candidate("Проведение customer discovery", group="Исследование клиентов", decision="needs_review")
+    candidate.coverage_area = "Исследование клиентов и problem framing"
+    candidate.resolution = "alias"
+    candidate.match_score = 100.0
+    candidate.canonical_name = "Проведение code review"
+    candidate.canonical_group = "Инженерная дисциплина"
+    candidate.confidence = 0.98
+    candidate.council_agreement = 1.0
+
+    stage_brief_to_catalog.triage_candidates([candidate], {"artifact_type": "program_brief"})
+
+    assert candidate.decision == "needs_review"
+    assert "catalog_match_suspicious" in candidate.reasons
+
+
+def test_triage_blocks_low_score_and_generic_catalog_matches() -> None:
+    low_score = _candidate("Планирование полива", group="Фермерство", decision="needs_review")
+    low_score.resolution = "matched"
+    low_score.match_score = 84.0
+    low_score.canonical_name = "Планирование полива"
+    low_score.canonical_group = "Фермерство"
+    low_score.confidence = 0.99
+    low_score.council_agreement = 1.0
+
+    generic_group = _candidate("Оценка кислотности почвы", group="Фермерство", decision="needs_review")
+    generic_group.resolution = "alias"
+    generic_group.match_score = 100.0
+    generic_group.canonical_name = "Оценка кислотности почвы"
+    generic_group.canonical_group = "Прочие навыки"
+    generic_group.confidence = 0.99
+    generic_group.council_agreement = 1.0
+
+    stage_brief_to_catalog.triage_candidates([low_score, generic_group], {"artifact_type": "program_brief"})
+
+    assert low_score.decision == "needs_review"
+    assert generic_group.decision == "needs_review"
+    assert "catalog_match_suspicious" in low_score.reasons
+    assert "catalog_match_suspicious" in generic_group.reasons
+
+
+def test_operational_dag_ignores_edges_that_need_review() -> None:
+    candidates = [
+        _candidate("A base", bloom="analyze", decision="accepted"),
+        _candidate("B target", bloom="apply", decision="accepted"),
+    ]
+    candidates[0].tmp_id = "A"
+    candidates[1].tmp_id = "B"
+    edges = [
+        stage_catalog_to_dag.PrereqEdge(src="A", dst="B", relation_type="soft", confidence=0.95, source="ai"),
+    ]
+
+    stage_catalog_to_dag.triage_edges(edges, candidates)
+    accepted_edges = stage_catalog_to_dag.operational_edges(edges)
+    dag, _removed_cycle, _removed_transitive = stage_catalog_to_dag.build_dag(accepted_edges, candidates)
+
+    assert edges[0].decision == "needs_review"
+    assert accepted_edges == []
+    assert dag.number_of_edges() == 0
 
 
 def test_atomize_batches_live_suspicious_candidates(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -440,7 +694,7 @@ def test_atomize_batches_live_suspicious_candidates(monkeypatch: pytest.MonkeyPa
     assert [candidate.atomicity for candidate in result] == ["atomic", "atomic"]
 
 
-def test_curriculum_csv_writes_a_to_v_and_keeps_o_to_v_empty() -> None:
+def test_curriculum_csv_writes_a_to_v_with_working_methodology_fields() -> None:
     payload = {
         "csv_primary_header": [f"col-{letter}" for letter in "ABCDEFGHIJKLMNOPQRSTUV"],
         "csv_secondary_header": [""] * 22,
@@ -463,8 +717,11 @@ def test_curriculum_csv_writes_a_to_v_and_keeps_o_to_v_empty() -> None:
                 "effort_days": 99,
                 "cumulative_days": 99,
                 "xp": 999,
-                "platform_project_name": "must not export",
-                "artifact_links": "must not export",
+                "completion_percent": 50,
+                "p2p_checks": 2,
+                "skills_list": "Навык A, Навык B",
+                "platform_project_name": "platform name",
+                "artifact_links": "gitlab link",
             }
         ],
     }
@@ -491,7 +748,16 @@ def test_curriculum_csv_writes_a_to_v_and_keeps_o_to_v_empty() -> None:
         "1",
         "8",
     ]
-    assert rows[2][14:] == [""] * 8
+    assert rows[2][14:] == [
+        "99",
+        "99",
+        "999",
+        "50",
+        "2",
+        "Навык A: 50%, Навык B: 50%",
+        "platform name",
+        "gitlab link",
+    ]
 
 
 def test_intake_status_labels_and_workflow_steps() -> None:

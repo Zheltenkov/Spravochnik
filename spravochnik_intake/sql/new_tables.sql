@@ -140,6 +140,7 @@ CREATE TABLE IF NOT EXISTS curriculum_plan_row (
     audience_level TEXT,
     required_tools TEXT,
     materials TEXT,
+    validation_criteria TEXT,
     storytelling  TEXT,
     delivery_format TEXT,
     group_size    TEXT,
@@ -147,12 +148,55 @@ CREATE TABLE IF NOT EXISTS curriculum_plan_row (
     effort_days   REAL,
     cumulative_days REAL,
     xp            INTEGER,
+    completion_percent REAL,
+    p2p_checks    INTEGER,
+    weighted_skills TEXT,
     platform_project_name TEXT,
     artifact_links TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_curriculum_plan_row_plan_order
     ON curriculum_plan_row(plan_id, row_number);
+
+-- DB-backed методологические шаблоны проверяемых артефактов.
+-- Planner применяет только активные шаблоны, scope которых совпал с темой
+-- проекта; если шаблонов нет, используется безопасный dynamic fallback.
+CREATE TABLE IF NOT EXISTS curriculum_artifact_template (
+    id            INTEGER PRIMARY KEY,
+    code          TEXT NOT NULL UNIQUE,
+    title         TEXT NOT NULL,
+    artifact_family TEXT NOT NULL CHECK (
+        artifact_family IN ('analysis','document','configuration','design','production','practice')
+    ),
+    artifact_description TEXT NOT NULL,
+    project_name_pattern TEXT,
+    materials_pattern TEXT,
+    storytelling_pattern TEXT,
+    validation_criteria TEXT,
+    priority      INTEGER NOT NULL DEFAULT 100,
+    status        TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','draft','deprecated')),
+    source        TEXT NOT NULL DEFAULT 'manual',
+    created_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS curriculum_artifact_template_scope (
+    id            INTEGER PRIMARY KEY,
+    template_id   INTEGER NOT NULL REFERENCES curriculum_artifact_template(id) ON DELETE CASCADE,
+    scope_type    TEXT NOT NULL CHECK (scope_type IN ('taxonomy_node','skill_group','coverage_area','any')),
+    scope_id      INTEGER,
+    scope_name    TEXT,
+    normalized_scope_name TEXT,
+    weight        REAL NOT NULL DEFAULT 1.0,
+    created_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(template_id, scope_type, scope_id, normalized_scope_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_curriculum_artifact_template_status
+    ON curriculum_artifact_template(status, artifact_family, priority);
+
+CREATE INDEX IF NOT EXISTS idx_curriculum_artifact_template_scope
+    ON curriculum_artifact_template_scope(scope_type, normalized_scope_name);
 
 -- Лог промоции intake-suggestion в канонический skills catalog.
 CREATE TABLE IF NOT EXISTS skill_promotion_log (

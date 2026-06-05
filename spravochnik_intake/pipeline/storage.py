@@ -32,6 +32,10 @@ _REQUIRED_COLS = {
         ("outcomes_can", "TEXT"),
         ("outcomes_skills", "TEXT"),
         ("materials", "TEXT"),
+        ("validation_criteria", "TEXT"),
+        ("completion_percent", "REAL"),
+        ("p2p_checks", "INTEGER"),
+        ("weighted_skills", "TEXT"),
     ],
 }
 
@@ -142,6 +146,127 @@ def _normalize_catalog_key(value: str) -> str:
     normalized = unicodedata.normalize("NFKC", value).lower().strip()
     normalized = re.sub(r"[^0-9a-zа-яё+ ]", " ", normalized)
     return re.sub(r"\s+", " ", normalized)
+
+
+def load_curriculum_artifact_templates(con: sqlite3.Connection, active_only: bool = True) -> list[dict[str, object]]:
+    """Load active methodologist-managed artifact templates for the UP planner."""
+    if not _table_exists(con, "curriculum_artifact_template"):
+        return []
+    status_filter = "WHERE status = 'active'" if active_only else ""
+    rows = con.execute(
+        f"""
+        SELECT id, code, title, artifact_family, artifact_description,
+               project_name_pattern, materials_pattern, storytelling_pattern,
+               validation_criteria, priority, status, source
+        FROM curriculum_artifact_template
+        {status_filter}
+        ORDER BY priority ASC, id ASC
+        """
+    ).fetchall()
+    templates: list[dict[str, object]] = []
+    for row in rows:
+        template = dict(row)
+        template_id = int(template["id"])
+        scopes: list[dict[str, object]] = []
+        if _table_exists(con, "curriculum_artifact_template_scope"):
+            scope_rows = con.execute(
+                """
+                SELECT scope_type, scope_id, scope_name, normalized_scope_name, weight
+                FROM curriculum_artifact_template_scope
+                WHERE template_id = ?
+                ORDER BY weight DESC, id ASC
+                """,
+                (template_id,),
+            ).fetchall()
+            for scope_row in scope_rows:
+                scope = dict(scope_row)
+                if not scope.get("normalized_scope_name") and scope.get("scope_name"):
+                    scope["normalized_scope_name"] = _normalize_catalog_key(str(scope["scope_name"]))
+                scopes.append(scope)
+        template["scopes"] = scopes
+        templates.append(template)
+    return templates
+
+
+def upsert_curriculum_artifact_template(
+    con: sqlite3.Connection,
+    *,
+    code: str,
+    title: str,
+    artifact_family: str,
+    artifact_description: str,
+    project_name_pattern: str = "",
+    materials_pattern: str = "",
+    storytelling_pattern: str = "",
+    validation_criteria: str = "",
+    priority: int = 100,
+    status: str = "active",
+    source: str = "manual",
+    scopes: list[dict[str, object]] | None = None,
+) -> int:
+    """Create or update a methodology-owned artifact template."""
+    normalized_code = _slug_catalog_key(code or title)
+    con.execute(
+        """
+        INSERT INTO curriculum_artifact_template(
+            code, title, artifact_family, artifact_description, project_name_pattern,
+            materials_pattern, storytelling_pattern, validation_criteria, priority,
+            status, source, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(code) DO UPDATE SET
+            title = excluded.title,
+            artifact_family = excluded.artifact_family,
+            artifact_description = excluded.artifact_description,
+            project_name_pattern = excluded.project_name_pattern,
+            materials_pattern = excluded.materials_pattern,
+            storytelling_pattern = excluded.storytelling_pattern,
+            validation_criteria = excluded.validation_criteria,
+            priority = excluded.priority,
+            status = excluded.status,
+            source = excluded.source,
+            updated_at = excluded.updated_at
+        """,
+        (
+            normalized_code,
+            title,
+            artifact_family,
+            artifact_description,
+            project_name_pattern,
+            materials_pattern,
+            storytelling_pattern,
+            validation_criteria,
+            priority,
+            status,
+            source,
+            _utc_now_iso(),
+        ),
+    )
+    row = con.execute("SELECT id FROM curriculum_artifact_template WHERE code = ?", (normalized_code,)).fetchone()
+    template_id = int(row["id"])
+    con.execute("DELETE FROM curriculum_artifact_template_scope WHERE template_id = ?", (template_id,))
+    for scope in scopes or []:
+        scope_type = str(scope.get("scope_type") or "coverage_area").strip()
+        scope_name = str(scope.get("scope_name") or "").strip()
+        normalized_scope_name = str(scope.get("normalized_scope_name") or "").strip() or _normalize_catalog_key(scope_name)
+        con.execute(
+            """
+            INSERT INTO curriculum_artifact_template_scope(
+                template_id, scope_type, scope_id, scope_name, normalized_scope_name, weight
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                template_id,
+                scope_type,
+                scope.get("scope_id"),
+                scope_name or None,
+                normalized_scope_name or None,
+                float(scope.get("weight", 1.0) or 1.0),
+            ),
+        )
+    con.commit()
+    return template_id
 
 
 def _slug_catalog_key(value: str) -> str:
@@ -738,10 +863,11 @@ def save_curriculum_plan(
                 plan_id, block_index, row_number, project_index_in_block, block_title, block_goal,
                 project_name, project_summary, outcomes_know, outcomes_can, outcomes_skills,
                 learning_outcomes, skills_list, audience_level, required_tools, materials,
-                storytelling, delivery_format, group_size, effort_hours, effort_days,
-                cumulative_days, xp, platform_project_name, artifact_links
+                validation_criteria, storytelling, delivery_format, group_size, effort_hours, effort_days,
+                cumulative_days, xp, completion_percent, p2p_checks, weighted_skills,
+                platform_project_name, artifact_links
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 plan_id,
@@ -760,6 +886,7 @@ def save_curriculum_plan(
                 row.get("audience_level"),
                 row.get("required_tools"),
                 row.get("materials"),
+                row.get("validation_criteria"),
                 row.get("storytelling"),
                 row.get("delivery_format"),
                 row.get("group_size"),
@@ -767,6 +894,9 @@ def save_curriculum_plan(
                 effort_days,
                 cumulative_days,
                 xp,
+                None if row.get("completion_percent") in (None, "") else float(row.get("completion_percent", 0) or 0),
+                None if row.get("p2p_checks") in (None, "") else int(row.get("p2p_checks", 0) or 0),
+                row.get("weighted_skills"),
                 row.get("platform_project_name"),
                 row.get("artifact_links"),
             ),

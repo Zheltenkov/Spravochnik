@@ -8,6 +8,7 @@ import io
 import json
 from math import isfinite
 import mimetypes
+import re
 import sqlite3
 import subprocess
 import sys
@@ -53,6 +54,15 @@ COMPLEXITY_OPTIONS = [
     ("senior", "Продвинутый (senior)"),
     ("master", "Мастерский"),
 ]
+
+ARTIFACT_FAMILY_OPTIONS = [
+    ("analysis", "Аналитический вывод"),
+    ("document", "Комплект документов"),
+    ("configuration", "Рабочая настройка"),
+    ("design", "Проектное решение"),
+    ("production", "Созданный продуктовый результат"),
+    ("practice", "Практический результат"),
+]
 COMPLEXITY_LABELS = {value: label for value, label in COMPLEXITY_OPTIONS if value}
 COMPLEXITY_ORDER = {value: index for index, (value, _label) in enumerate(COMPLEXITY_OPTIONS) if value}
 REVIEW_REASON_LABELS = {
@@ -70,6 +80,8 @@ REVIEW_REASON_LABELS = {
     "low_confidence": "Низкая уверенность",
     "single_source": "Недостаточно подтверждающих источников",
     "council_split": "Модели не согласились между собой",
+    "catalog_match_suspicious": "Подозрительный match с каталогом: нужно проверить смысл и группу canonical skill",
+    "missing_observable_action": "Название не похоже на наблюдаемый навык: нет действия или отглагольного существительного",
     "auto_accept_policy": "Автопринято по policy: уверенность >= 0.95 и согласие жюри = 1.00",
     "composite_decomposed": "Кандидат разбит на атомарные части",
     "non_skill:competency_block": "Это блок программы, а не skill",
@@ -337,8 +349,16 @@ def build_similarity_hint(
     score: float | int | None,
     resolution: str | None,
     has_nearest: bool,
+    reasons: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, str]:
     """Explain how a catalog similarity score should be interpreted."""
+    reason_set = {str(reason) for reason in reasons or []}
+    if "catalog_match_suspicious" in reason_set:
+        return {
+            "label": "Подозрительный матч",
+            "class": "weak",
+            "recommendation": "Не используйте canonical skill автоматически. Нужно проверить смысл, группу и индикаторы.",
+        }
     if score is None:
         return {
             "label": "Нет данных",
@@ -466,12 +486,17 @@ def ensure_intake_runtime_schema(conn: sqlite3.Connection, db_path: Path) -> Non
         table_exists(conn, "profile_brief")
         and table_exists(conn, "curriculum_plan")
         and table_exists(conn, "curriculum_plan_row")
+        and table_exists(conn, "curriculum_artifact_template")
+        and table_exists(conn, "curriculum_artifact_template_scope")
         and column_exists(conn, "skill_suggestion", "coverage_area")
         and column_exists(conn, "skill_suggestion", "source_name")
         and column_exists(conn, "skill_suggestion", "indicators_json")
         and column_exists(conn, "skill_suggestion", "match_score")
         and column_exists(conn, "skill_suggestion", "nearest_skill_id")
         and column_exists(conn, "skill_suggestion", "nearest_name")
+        and column_exists(conn, "curriculum_plan_row", "weighted_skills")
+        and column_exists(conn, "curriculum_plan_row", "completion_percent")
+        and column_exists(conn, "curriculum_plan_row", "validation_criteria")
     )
     if resolved not in INTAKE_SCHEMA_READY or not schema_ready:
         from spravochnik_intake.pipeline import storage as intake_storage
@@ -1041,6 +1066,7 @@ def hydrate_job_result_payload(conn: sqlite3.Connection, result: dict[str, objec
             match_score_value,
             str(candidate.get("resolution") or ""),
             bool(nearest_id),
+            candidate.get("reasons") if isinstance(candidate.get("reasons"), list) else [],
         )
         nearest_preview = load_nearest_skill_preview(conn, nearest_id)
         if nearest_preview:
@@ -1320,16 +1346,22 @@ def load_accepted_skill_candidates(conn: sqlite3.Connection, brief_id: int):
 
 def load_brief_spec_for_plan(conn: sqlite3.Connection, brief_id: int) -> dict[str, object]:
     row = conn.execute(
-        "SELECT role, seniority, domain FROM profile_brief WHERE id = ?",
+        "SELECT raw_text, role, seniority, domain FROM profile_brief WHERE id = ?",
         (brief_id,),
     ).fetchone()
     if not row:
         return {}
-    return {
+    from spravochnik_intake.pipeline import stage_brief_to_catalog
+    from spravochnik_intake.pipeline import storage as intake_storage
+
+    spec = {
         "role": row["role"],
         "seniority": row["seniority"],
         "domain": row["domain"],
     }
+    spec.update({key: value for key, value in stage_brief_to_catalog.extract_workload_from_text(str(row["raw_text"] or "")).items() if value is not None})
+    spec["artifact_templates"] = intake_storage.load_curriculum_artifact_templates(conn)
+    return spec
 
 
 def build_curriculum_plan_for_brief(
@@ -1854,7 +1886,7 @@ def run_intake_pipeline(
                 "nearest_skill_id": candidate.nearest_skill_id,
                 "nearest_name": candidate.nearest_name,
                 "nearest_group": candidate.nearest_group,
-                "similarity_hint": build_similarity_hint(candidate.match_score, candidate.resolution, bool(candidate.nearest_skill_id)),
+                "similarity_hint": build_similarity_hint(candidate.match_score, candidate.resolution, bool(candidate.nearest_skill_id), candidate.reasons),
                 "confidence": f"{candidate.confidence:.2f}" if candidate.confidence else "—",
                 "council_agreement": None if candidate.council_agreement is None else f"{candidate.council_agreement:.2f}",
                 "decision": candidate.decision,
@@ -2149,6 +2181,23 @@ def curriculum_plan_status_label(status: str | None) -> str:
     return mapping.get((status or "").strip().casefold(), "Неизвестно")
 
 
+def weighted_skills_from_row(row: dict[str, object]) -> str:
+    existing = str(row.get("weighted_skills") or "").strip()
+    if existing:
+        return existing
+    skills = [
+        item.strip()
+        for item in str(row.get("skills_list") or "").split(",")
+        if item.strip()
+    ]
+    if not skills:
+        return ""
+    base_weight = round(100 / len(skills))
+    weights = [base_weight] * len(skills)
+    weights[-1] += 100 - sum(weights)
+    return ", ".join(f"{skill}: {weight}%" for skill, weight in zip(skills, weights, strict=False))
+
+
 def curriculum_plan_to_csv_bytes(plan_payload: dict[str, object]) -> bytes:
     buffer = io.StringIO(newline="")
     writer = csv.writer(buffer)
@@ -2177,14 +2226,14 @@ def curriculum_plan_to_csv_bytes(plan_payload: dict[str, object]) -> bytes:
                 row.get("delivery_format", ""),
                 row.get("group_size", ""),
                 row.get("effort_hours", ""),
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
+                row.get("effort_days", ""),
+                row.get("cumulative_days", ""),
+                row.get("xp", ""),
+                row.get("completion_percent", ""),
+                row.get("p2p_checks", ""),
+                weighted_skills_from_row(row),
+                row.get("platform_project_name", ""),
+                row.get("artifact_links", ""),
             ]
         )
     return buffer.getvalue().encode("utf-8-sig")
@@ -2263,6 +2312,7 @@ def build_curriculum_plan_payload_from_rows(
         if not any(row.get(key) for key in ("outcomes_know", "outcomes_can", "outcomes_skills")) and row.get("learning_outcomes"):
             row["outcomes_can"] = row.get("learning_outcomes")
         row.setdefault("materials", "")
+        row["weighted_skills"] = weighted_skills_from_row(row)
         normalized_rows.append(row)
     rows = normalized_rows
 
@@ -2475,10 +2525,10 @@ def create_curriculum_plan_row(conn: sqlite3.Connection, plan_id: int) -> int:
             plan_id, block_index, row_number, project_index_in_block, block_title, block_goal,
             project_name, project_summary, outcomes_know, outcomes_can, outcomes_skills,
             learning_outcomes, skills_list, audience_level, required_tools, materials,
-            storytelling, delivery_format, group_size, effort_hours, effort_days,
+            validation_criteria, storytelling, delivery_format, group_size, effort_hours, effort_days,
             cumulative_days, xp, platform_project_name, artifact_links
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             plan_id,
@@ -2495,6 +2545,7 @@ def create_curriculum_plan_row(conn: sqlite3.Connection, plan_id: int) -> int:
             "",
             "",
             plan.get("audience_level", "Начальный"),
+            "",
             "",
             "",
             "",
@@ -2541,6 +2592,20 @@ def parse_optional_int(value: str | None) -> int | None:
     return int(cleaned)
 
 
+def parse_artifact_template_scopes(form_data: dict[str, str]) -> list[dict[str, object]]:
+    scope_type = form_data.get("scope_type", "coverage_area").strip() or "coverage_area"
+    raw_names = form_data.get("scope_names", "").strip()
+    weight = parse_optional_float(form_data.get("scope_weight")) or 1.0
+    if scope_type == "any":
+        return [{"scope_type": "any", "scope_name": "*", "weight": weight}]
+    names = [
+        item.strip()
+        for item in re.split(r"[\n;]+", raw_names)
+        if item.strip()
+    ]
+    return [{"scope_type": scope_type, "scope_name": name, "weight": weight} for name in names]
+
+
 def update_curriculum_plan_row(conn: sqlite3.Connection, plan_id: int, row_id: int, form_data: dict[str, str]) -> dict[str, object]:
     row = get_curriculum_plan_row(conn, plan_id, row_id)
     if not row:
@@ -2567,6 +2632,7 @@ def update_curriculum_plan_row(conn: sqlite3.Connection, plan_id: int, row_id: i
             audience_level = ?,
             required_tools = ?,
             materials = ?,
+            validation_criteria = ?,
             storytelling = ?,
             delivery_format = ?,
             group_size = ?,
@@ -2594,6 +2660,7 @@ def update_curriculum_plan_row(conn: sqlite3.Connection, plan_id: int, row_id: i
             form_data.get("audience_level", "").strip(),
             form_data.get("required_tools", "").strip(),
             form_data.get("materials", "").strip(),
+            form_data.get("validation_criteria", "").strip(),
             form_data.get("storytelling", "").strip(),
             form_data.get("delivery_format", "").strip(),
             form_data.get("group_size", "").strip(),
@@ -4262,6 +4329,7 @@ def create_app(db_path: Path, summary_path: Path):
             ],
             "secondary_nav": [
                 {"label": "Иерархия", "href": "/catalog-admin/groups", "prefixes": ["/catalog-admin/groups", "/catalog-admin/skills"]},
+                {"label": "Шаблоны УП", "href": "/catalog-admin/artifact-templates", "prefixes": ["/catalog-admin/artifact-templates"]},
                 {"label": "Архив", "href": "/catalog-admin/archive", "prefixes": ["/catalog-admin/archive"]},
                 {"label": "Справочник компетенций", "href": "/competencies", "prefixes": ["/competencies"]},
                 {"label": "Профили", "href": "/profiles", "prefixes": ["/profiles"]},
@@ -4349,6 +4417,86 @@ def create_app(db_path: Path, summary_path: Path):
                 if redirect_params:
                     location += "?" + urlencode(redirect_params)
                 return redirect_response(start_response, location)
+            finally:
+                catalog_conn.close()
+
+        if path == "/catalog-admin/artifact-templates" and method == "GET":
+            from spravochnik_intake.pipeline import storage as intake_storage
+
+            catalog_conn = open_db(db_path)
+            try:
+                ensure_intake_runtime_schema(catalog_conn, db_path)
+                templates = intake_storage.load_curriculum_artifact_templates(catalog_conn, active_only=False)
+                edit_id = parse_optional_int(query_params.get("edit", [""])[-1])
+                edit_template = next((dict(item) for item in templates if int(item.get("id") or 0) == edit_id), None)
+                if edit_template:
+                    scopes = edit_template.get("scopes") if isinstance(edit_template.get("scopes"), list) else []
+                    first_scope = scopes[0] if scopes else {}
+                    edit_template["scope_type"] = str(first_scope.get("scope_type") or "coverage_area") if isinstance(first_scope, dict) else "coverage_area"
+                    edit_template["scope_weight"] = str(first_scope.get("weight") or "1.0") if isinstance(first_scope, dict) else "1.0"
+                    edit_template["scope_names_text"] = "\n".join(
+                        str(scope.get("scope_name") or "")
+                        for scope in scopes
+                        if isinstance(scope, dict) and str(scope.get("scope_type") or "") != "any"
+                    )
+                html = render(
+                    "catalog_admin_artifact_templates.html",
+                    {
+                        "title": "Шаблоны УП",
+                        "templates": templates,
+                        "edit_template": edit_template,
+                        "artifact_family_options": ARTIFACT_FAMILY_OPTIONS,
+                        "scope_type_options": [
+                            ("coverage_area", "Coverage area"),
+                            ("skill_group", "Группа skills"),
+                            ("taxonomy_node", "Узел таксономии"),
+                            ("any", "Любая область"),
+                        ],
+                        "request_path": path,
+                    },
+                )
+                return html_response(start_response, html)
+            finally:
+                catalog_conn.close()
+
+        if path == "/catalog-admin/artifact-templates" and method == "POST":
+            from spravochnik_intake.pipeline import storage as intake_storage
+
+            catalog_conn = open_db(db_path)
+            try:
+                ensure_intake_runtime_schema(catalog_conn, db_path)
+                form_data = parse_post_data(environ)
+                action = form_data.get("action", "")
+                template_id = parse_optional_int(form_data.get("template_id"))
+                if action == "save_template":
+                    priority = parse_optional_int(form_data.get("priority")) or 100
+                    intake_storage.upsert_curriculum_artifact_template(
+                        catalog_conn,
+                        code=form_data.get("code", "").strip() or form_data.get("title", "").strip(),
+                        title=form_data.get("title", "").strip() or "Шаблон артефакта",
+                        artifact_family=form_data.get("artifact_family", "practice").strip() or "practice",
+                        artifact_description=form_data.get("artifact_description", "").strip(),
+                        project_name_pattern=form_data.get("project_name_pattern", "").strip(),
+                        materials_pattern=form_data.get("materials_pattern", "").strip(),
+                        storytelling_pattern=form_data.get("storytelling_pattern", "").strip(),
+                        validation_criteria=form_data.get("validation_criteria", "").strip(),
+                        priority=priority,
+                        status=form_data.get("status", "active").strip() or "active",
+                        source="methodologist",
+                        scopes=parse_artifact_template_scopes(form_data),
+                    )
+                elif action in {"activate_template", "deprecate_template"} and template_id:
+                    status = "active" if action == "activate_template" else "deprecated"
+                    catalog_conn.execute(
+                        """
+                        UPDATE curriculum_artifact_template
+                        SET status = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (status, utc_now_iso(), template_id),
+                    )
+                    catalog_conn.commit()
+                return redirect_response(start_response, "/catalog-admin/artifact-templates")
             finally:
                 catalog_conn.close()
 

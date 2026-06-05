@@ -127,6 +127,8 @@ def localize_skill_label(value: str | None) -> str:
     if not label:
         return ""
     normalized = _norm(label)
+    if not normalized or has_cyrillic(label):
+        return label
     if normalized in _SKILL_ALIASES:
         return _SKILL_ALIASES[normalized]
     for source, target in _SKILL_ALIASES.items():

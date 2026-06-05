@@ -21,6 +21,12 @@
         <form method="post" action="/up/plans/{{ plan.id }}/rows/new">
             <button type="submit" class="action-btn">Добавить строку</button>
         </form>
+        {% if plan.brief_id %}
+        <form method="post" action="/up/plans/{{ plan.id }}/template-proposals/generate">
+            <button type="submit" class="action-btn action-btn-secondary">Предложить шаблоны УП</button>
+        </form>
+        <a class="action-btn action-btn-light" href="/up/plans/{{ plan.id }}/template-proposals">Шаблоны по брифу</a>
+        {% endif %}
         <form method="post" action="/up/plans/{{ plan.id }}/delete" onsubmit="return confirm('Удалить этот УП полностью? Связанный справочник не будет затронут.');">
             <button type="submit" class="action-btn action-btn-danger">Удалить УП</button>
         </form>
@@ -34,6 +40,47 @@
     <div class="summary-card"><div class="summary-label">Проектов</div><div class="summary-value">{{ plan.summary.projects }}</div></div>
     <div class="summary-card"><div class="summary-label">Астр. часы</div><div class="summary-value">{{ plan.summary.total_hours }}</div></div>
 </section>
+
+{% set quality = plan.report.quality_metrics if plan.report and plan.report.quality_metrics else none %}
+{% if quality %}
+<section class="filter-panel">
+    <div class="summary-head">
+        <h2>Метрики качества УП</h2>
+        <span class="pill">для методологической настройки</span>
+    </div>
+    <section class="chips-row">
+        <div class="summary-card">
+            <div class="summary-label">Skills / проект</div>
+            <div class="summary-value">{{ quality.avg_skills_per_project }}</div>
+        </div>
+        <div class="summary-card">
+            <div class="summary-label">Результатов / проект</div>
+            <div class="summary-value">{{ quality.avg_outcomes_per_project }}</div>
+        </div>
+        <div class="summary-card{% if quality.single_skill_project_count %} summary-card-warn{% endif %}">
+            <div class="summary-label">Одиночных проектов</div>
+            <div class="summary-value">{{ quality.single_skill_project_count }}</div>
+        </div>
+        <div class="summary-card{% if quality.overloaded_project_count %} summary-card-warn{% endif %}">
+            <div class="summary-label">Перегруженных</div>
+            <div class="summary-value">{{ quality.overloaded_project_count }}</div>
+        </div>
+        <div class="summary-card">
+            <div class="summary-label">Повторённых нитей</div>
+            <div class="summary-value">{{ quality.repeated_thread_count }}</div>
+        </div>
+        <div class="summary-card">
+            <div class="summary-label">DB-шаблонов в УП</div>
+            <div class="summary-value">{{ quality.db_template_project_count }}</div>
+        </div>
+    </section>
+    <p class="small muted">
+        Цель по плотности skills: {{ quality.target_skills_per_project|join("–") if quality.target_skills_per_project else "—" }} на проект.
+        Цель по результатам: {{ quality.target_outcomes_per_project|join("–") if quality.target_outcomes_per_project else "—" }} на проект.
+        Спираль: {% if quality.spiral_enabled %}включена{% else %}выключена{% endif %}.
+    </p>
+</section>
+{% endif %}
 
 {% if not plan.row_count %}
 <section class="filter-panel">

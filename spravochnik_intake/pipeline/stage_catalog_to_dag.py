@@ -119,9 +119,49 @@ def triage_edges(edges: list[PrereqEdge], cands: list[SkillCandidate]) -> None:
         e.decision = "accept" if not r else "needs_review"
 
 
+def apply_edge_decision_overrides(edges: list[PrereqEdge], decisions: dict[str, str] | None) -> None:
+    """Apply persisted methodologist decisions to proposed edges."""
+    if not decisions:
+        return
+    for edge in edges:
+        edge_key = f"{edge.src}->{edge.dst}"
+        decision = decisions.get(edge_key)
+        if decision == "accepted":
+            edge.decision = "accept"
+            edge.reasons = ["human_accepted"]
+            edge.bloom_violation = False
+        elif decision == "rejected":
+            edge.decision = "rejected"
+            edge.reasons = ["human_rejected"]
+
+
 def operational_edges(edges: list[PrereqEdge]) -> list[PrereqEdge]:
     """Return only confirmed edges that are allowed to influence the operational DAG."""
     return [edge for edge in edges if edge.decision == "accept"]
+
+
+def visual_preview_edges(edges: list[PrereqEdge]) -> list[PrereqEdge]:
+    """Return proposed edges that are safe enough for display-only DAG preview.
+
+    These edges must not influence persistence or curriculum planning. They are
+    useful for methodologists because AI-proposed edges intentionally go to
+    review before promotion into the operational DAG.
+    """
+    preview: list[PrereqEdge] = []
+    for edge in edges:
+        if edge.decision == "accept":
+            preview.append(edge)
+            continue
+        if edge.decision == "rejected":
+            continue
+        if edge.source != "ai":
+            continue
+        if edge.bloom_violation:
+            continue
+        if edge.confidence < config.TAU_EDGE_ACCEPT:
+            continue
+        preview.append(edge)
+    return preview
 
 
 def build_dag(edges: list[PrereqEdge], cands: list[SkillCandidate]):
@@ -180,11 +220,16 @@ def build_edge_review_queue(
             review_queue.append(
                 {
                     "edge_key": f"{edge.src}->{edge.dst}",
+                    "src_id": edge.src,
+                    "dst_id": edge.dst,
                     "edge_label": f"{display_names[edge.src]} -> {display_names[edge.dst]}",
                     "reason_code": ",".join(edge.reasons) or "needs_review",
                     "severity": "warning" if edge.bloom_violation else "info",
                     "status": "open",
                     "confidence": edge.confidence,
+                    "source": edge.source,
+                    "relation_type": edge.relation_type,
+                    "reasons": edge.reasons,
                 }
             )
 
@@ -192,11 +237,16 @@ def build_edge_review_queue(
         review_queue.append(
             {
                 "edge_key": f"{src}->{dst}",
+                "src_id": src,
+                "dst_id": dst,
                 "edge_label": f"{display_names[src]} -> {display_names[dst]}",
                 "reason_code": "cycle_broken",
                 "severity": "warning",
                 "status": "open",
                 "confidence": None,
+                "source": "pipeline",
+                "relation_type": "soft",
+                "reasons": ["cycle_broken"],
             }
         )
 
@@ -204,11 +254,16 @@ def build_edge_review_queue(
         review_queue.append(
             {
                 "edge_key": f"{src}->{dst}",
+                "src_id": src,
+                "dst_id": dst,
                 "edge_label": f"{display_names[src]} -> {display_names[dst]}",
                 "reason_code": "redundant_transitive",
                 "severity": "info",
                 "status": "open",
                 "confidence": None,
+                "source": "pipeline",
+                "relation_type": "soft",
+                "reasons": ["redundant_transitive"],
             }
         )
 
@@ -271,14 +326,38 @@ def build_dag_payload(
     }
 
 
-def run(cands: list[SkillCandidate]):
+def add_visual_preview_payload(dag_payload: dict[str, object], edges: list[PrereqEdge], cands: list[SkillCandidate]) -> None:
+    """Attach display-only DAG preview without changing the operational DAG."""
+    preview_edges = visual_preview_edges(edges)
+    if not preview_edges:
+        dag_payload["visual_edges"] = dag_payload.get("final_edges", [])
+        dag_payload["visual_waves"] = dag_payload.get("waves", [])
+        dag_payload["visual_order"] = dag_payload.get("order", [])
+        dag_payload["visual_edge_count"] = int(dag_payload.get("edges") or 0)
+        dag_payload["preview_edge_count"] = 0
+        return
+
+    preview_dag, preview_removed_cycle, preview_removed_transitive = build_dag(preview_edges, cands)
+    preview_payload = build_dag_payload(preview_edges, preview_dag, preview_removed_cycle, preview_removed_transitive, cands)
+    dag_payload["visual_edges"] = preview_payload["final_edges"]
+    dag_payload["visual_waves"] = preview_payload["waves"]
+    dag_payload["visual_order"] = preview_payload["order"]
+    dag_payload["visual_edge_count"] = preview_payload["edges"]
+    dag_payload["preview_edge_count"] = max(0, len(preview_edges) - int(dag_payload.get("accepted_edge_count") or 0))
+    dag_payload["visual_removed_cycle"] = preview_payload["removed_cycle"]
+    dag_payload["visual_removed_transitive"] = preview_payload["removed_transitive"]
+
+
+def run(cands: list[SkillCandidate], edge_decisions: dict[str, str] | None = None):
     used_candidates = _graph_candidates(cands)
     all_edges = deduplicate_edges(propose_edges(used_candidates))
     triage_edges(all_edges, used_candidates)
+    apply_edge_decision_overrides(all_edges, edge_decisions)
     accepted_edges = operational_edges(all_edges)
     DAG, removed_cycle, removed_transitive = build_dag(accepted_edges, used_candidates)
     dag_payload = build_dag_payload(all_edges, DAG, removed_cycle, removed_transitive, used_candidates)
     dag_payload["used_candidate_ids"] = [cand.tmp_id for cand in used_candidates]
     dag_payload["candidate_edge_count"] = len(all_edges)
     dag_payload["accepted_edge_count"] = len(accepted_edges)
+    add_visual_preview_payload(dag_payload, all_edges, used_candidates)
     return all_edges, DAG, removed_cycle, removed_transitive, dag_payload

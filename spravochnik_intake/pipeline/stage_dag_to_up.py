@@ -235,37 +235,81 @@ def enrich_curriculum_row(row: dict[str, object], project: ProjectBlueprint, spe
     row["node_names"] = protected_node_names
 
 
-def _occurrence_outcome_sources(occurrence: SkillOccurrence) -> tuple[str, tuple[str, ...]]:
+def _occurrence_totals(blocks: list[CurriculumBlock]) -> dict[str, int]:
+    totals: dict[str, int] = {}
+    for block in blocks:
+        for project in block.projects:
+            for occurrence in project.occurrences:
+                totals[occurrence.node.tmp_id] = totals.get(occurrence.node.tmp_id, 0) + 1
+    return totals
+
+
+def _allows_outcome_bucket(occurrence: SkillOccurrence, bucket: str, total_occurrences: int) -> bool:
+    if bucket in {"know", "can"}:
+        return True
+    if bucket != "skills":
+        return False
+    if occurrence.role == "assessment" or occurrence.bloom_bucket == "skills":
+        return True
+    # Если высокого повторного касания не будет, единственная строка должна
+    # сохранить терминальный результат. У повторяемых нитей "владеть"
+    # раскрывается позже.
+    return total_occurrences <= 1 and occurrence.node.bloom >= 5
+
+
+def _preferred_outcome_bucket(occurrence: SkillOccurrence, total_occurrences: int) -> str:
+    if occurrence.bloom_bucket == "know" or occurrence.node.bloom <= 2:
+        return "know"
+    if _allows_outcome_bucket(occurrence, "skills", total_occurrences):
+        if occurrence.bloom_bucket == "skills" or occurrence.role == "assessment" or occurrence.node.bloom >= 5:
+            return "skills"
+    return "can"
+
+
+def _occurrence_outcome_sources(occurrence: SkillOccurrence, occurrence_totals: dict[str, int] | None = None) -> tuple[str, tuple[str, ...]]:
     node = occurrence.node
-    if occurrence.bloom_bucket == "know":
+    total_occurrences = int((occurrence_totals or {}).get(node.tmp_id, 1) or 1)
+    bucket = _preferred_outcome_bucket(occurrence, total_occurrences)
+    if bucket == "know":
         return "know", node.outcomes_know or (f"Объясняет назначение навыка «{node.name}» в рабочем контексте.",)
-    if occurrence.bloom_bucket == "skills":
+    if bucket == "skills":
         return "skills", node.outcomes_skills or node.outcomes_can or (f"Интегрирует навык «{node.name}» в проверяемый артефакт.",)
-    if occurrence.role in {"assessment", "reinforcement"} and occurrence.touch_index >= 3:
-        return "skills", node.outcomes_skills or node.outcomes_can or (f"Закрепляет навык «{node.name}» в новом проектном контексте.",)
     return "can", node.outcomes_can or node.outcomes_know or (f"Применяет навык «{node.name}» для решения проектной задачи.",)
 
 
-def _fallback_outcome(occurrence: SkillOccurrence) -> tuple[str, str]:
+def _fallback_outcome(occurrence: SkillOccurrence, occurrence_totals: dict[str, int] | None = None) -> tuple[str, str]:
     node = occurrence.node
-    if occurrence.role == "assessment":
+    total_occurrences = int((occurrence_totals or {}).get(node.tmp_id, 1) or 1)
+    bucket = _preferred_outcome_bucket(occurrence, total_occurrences)
+    if bucket == "skills":
         return "skills", f"Защищает результат, демонстрируя владение навыком «{node.name}»."
     if occurrence.role == "reinforcement":
         return "can", f"Повторно применяет навык «{node.name}» в более сложном сценарии."
-    if node.bloom <= 2:
+    if bucket == "know":
         return "know", f"Понимает ключевые принципы навыка «{node.name}»."
-    if node.bloom <= 4:
-        return "can", f"Применяет навык «{node.name}» в практическом задании."
-    return "skills", f"Создаёт или оценивает артефакт с использованием навыка «{node.name}»."
+    return "can", f"Применяет навык «{node.name}» в практическом задании."
 
 
-def _project_outcomes(project: ProjectBlueprint) -> tuple[str, str, str, int]:
+def _project_allowed_buckets(project: ProjectBlueprint, occurrence_totals: dict[str, int] | None = None) -> set[str]:
+    allowed = {"know", "can"}
+    for occurrence in project.occurrences:
+        total_occurrences = int((occurrence_totals or {}).get(occurrence.node.tmp_id, 1) or 1)
+        if _allows_outcome_bucket(occurrence, "skills", total_occurrences):
+            allowed.add("skills")
+            break
+    return allowed
+
+
+def _project_outcomes(project: ProjectBlueprint, occurrence_totals: dict[str, int] | None = None) -> tuple[str, str, str, int]:
     buckets: dict[str, list[str]] = {"know": [], "can": [], "skills": []}
     max_outcomes = max(1, int(config.UP_TARGET_OUTCOMES_MAX))
     min_outcomes = max(1, min(int(config.UP_TARGET_OUTCOMES_MIN), max_outcomes))
+    allowed_buckets = _project_allowed_buckets(project, occurrence_totals)
 
     for occurrence in project.occurrences:
-        bucket, outcomes = _occurrence_outcome_sources(occurrence)
+        bucket, outcomes = _occurrence_outcome_sources(occurrence, occurrence_totals)
+        if bucket not in allowed_buckets:
+            continue
         for outcome in outcomes:
             text = outcome.strip()
             if text and text not in buckets[bucket] and sum(len(items) for items in buckets.values()) < max_outcomes:
@@ -274,21 +318,24 @@ def _project_outcomes(project: ProjectBlueprint) -> tuple[str, str, str, int]:
     for occurrence in project.occurrences:
         if sum(len(items) for items in buckets.values()) >= min_outcomes:
             break
-        bucket, outcome = _fallback_outcome(occurrence)
+        bucket, outcome = _fallback_outcome(occurrence, occurrence_totals)
+        if bucket not in allowed_buckets:
+            continue
         if outcome not in buckets[bucket]:
             buckets[bucket].append(outcome)
 
-    # Even a deliberately small introductory project should expose a complete
-    # ZUN profile instead of a single "demonstrates skill" line.
     anchor = project.unique_nodes[-1].name if project.unique_nodes else "проектный навык"
     completion_fallbacks = [
         ("know", f"Описывает контекст применения навыка «{anchor}»."),
         ("can", f"Применяет навык «{anchor}» при создании проектного артефакта."),
+        ("can", f"Обосновывает выбранный способ работы с темой «{project.block_key}»."),
         ("skills", f"Оформляет и защищает проверяемый результат по теме «{project.block_key}»."),
     ]
     for bucket, outcome in completion_fallbacks:
         if sum(len(items) for items in buckets.values()) >= min_outcomes:
             break
+        if bucket not in allowed_buckets:
+            continue
         if outcome not in buckets[bucket]:
             buckets[bucket].append(outcome)
 
@@ -378,6 +425,7 @@ def _fill_effort_columns(rows: list[dict[str, object]]) -> None:
 def _format_rows(blocks: list[CurriculumBlock], spec: dict[str, object] | None) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     row_number = 0
+    occurrence_totals = _occurrence_totals(blocks)
     for block_index, block in enumerate(blocks, start=1):
         all_block_nodes = [node for project in block.projects for node in project.unique_nodes]
         block_keys = sorted({node.block_key for node in all_block_nodes})
@@ -388,7 +436,7 @@ def _format_rows(blocks: list[CurriculumBlock], spec: dict[str, object] | None) 
             project_nodes = project.unique_nodes
             effort_hours = _estimate_project_hours(project_nodes)
             required_tools = ", ".join(sorted({tool for node in project_nodes for tool in node.tools}))
-            outcomes_know, outcomes_can, outcomes_skills, outcome_count = _project_outcomes(project)
+            outcomes_know, outcomes_can, outcomes_skills, outcome_count = _project_outcomes(project, occurrence_totals)
             block_key = project.block_key or (project_nodes[0].block_key if project_nodes else "Общее")
             delivery_format = config.UP_DEFAULT_FORMAT
             row = {

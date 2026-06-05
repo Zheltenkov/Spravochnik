@@ -14,12 +14,22 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from spravochnik_intake.pipeline import config, stage_atomize, stage_brief_to_catalog, stage_catalog_to_dag, stage_dag_to_up, storage
+from spravochnik_intake.pipeline import (
+    config,
+    stage_atomize,
+    stage_brief_to_catalog,
+    stage_catalog_to_dag,
+    stage_dag_to_up,
+    storage,
+    up_template_consilium,
+)
 from spravochnik_intake.pipeline.catalog_repo import CatalogRepo
+from spravochnik_intake.pipeline.curriculum import PlanNode, ProjectBlueprint, SkillOccurrence
 from spravochnik_intake.pipeline.models import IndicatorSpec, SkillCandidate
 from spravochnik_intake.pipeline.skill_names import canonicalize_skill_name
 from viewer.app import (
     apply_candidate_decision,
+    build_curriculum_plan_payload_from_rows,
     build_dag_for_brief,
     build_intake_workflow_steps,
     create_intake_job,
@@ -308,6 +318,61 @@ def test_up_planner_builds_integrative_projects_and_quality_metrics(monkeypatch:
     assert plan["report"]["quality_metrics"]["single_skill_project_count"] == 0
 
 
+def test_up_detail_payload_keeps_quality_metrics() -> None:
+    plan_meta = {
+        "id": 1,
+        "status": "built",
+        "title": "УП",
+        "audience_level": "Начальный",
+        "source_policy": "accepted_only",
+        "payload_json": json.dumps(
+            {
+                "message": "built",
+                "report": {
+                    "coverage_ok": True,
+                    "order_violations": [],
+                    "project_violations": [],
+                    "quality_metrics": {
+                        "avg_skills_per_project": 2.0,
+                        "avg_outcomes_per_project": 3.0,
+                        "single_skill_project_count": 0,
+                        "overloaded_project_count": 0,
+                        "core_thread_count": 1,
+                        "repeated_thread_count": 1,
+                        "spiral_enabled": True,
+                        "target_skills_per_project": [2, 4],
+                        "target_outcomes_per_project": [3, 5],
+                    },
+                },
+            },
+            ensure_ascii=False,
+        ),
+    }
+    rows = [
+        {
+            "id": 1,
+            "block_index": 1,
+            "row_number": 1,
+            "block_title": "Блок",
+            "block_goal": "Цель",
+            "project_name": "Проект",
+            "outcomes_know": "Знает",
+            "outcomes_can": "Умеет",
+            "outcomes_skills": "Владеет",
+            "skills_list": "Skill A, Skill B",
+            "effort_hours": 8,
+            "effort_days": 1,
+            "xp": 80,
+        }
+    ]
+
+    payload = build_curriculum_plan_payload_from_rows(plan_meta, rows)
+
+    assert payload["report"]["quality_metrics"]["avg_skills_per_project"] == 2.0
+    assert payload["report"]["quality_metrics"]["avg_outcomes_per_project"] == 3.0
+    assert payload["report"]["quality_metrics"]["repeated_thread_count"] == 1
+
+
 def test_up_planner_localizes_groups_and_keeps_block_titles_compact(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(config, "UP_MAX_SKILLS_PER_PROJECT", 4)
     candidates = [
@@ -540,6 +605,89 @@ def test_load_brief_spec_for_plan_restores_workload_from_raw_brief() -> None:
         db_path.unlink(missing_ok=True)
 
 
+def test_template_proposals_generate_and_accept() -> None:
+    db_path = _runtime_db_path("template-proposals")
+    conn = _create_base_catalog_db(db_path)
+    try:
+        brief_id = storage.save_brief(
+            conn,
+            "Бриф про customer discovery и MVP.",
+            {"role": "основатель", "seniority": "junior", "domain": "стартап"},
+        )
+        candidates = [
+            _candidate("Проводит интервью с пользователями", group="Исследование", decision="accepted"),
+            _candidate("Формулирует инсайты проблемы", group="Исследование", decision="accepted"),
+        ]
+        for candidate in candidates:
+            candidate.coverage_area = "выявление проблемы и понимание клиента"
+        storage.save_suggestions(conn, brief_id, candidates, {})
+
+        proposals = storage.generate_curriculum_artifact_template_proposals(conn, brief_id=brief_id, plan_id=None)
+
+        assert proposals
+        proposal = proposals[0]
+        assert proposal["status"] == "open"
+        assert "Проводит интервью с пользователями" in proposal["covered_skill_names"]
+        assert proposal["scope_names"] == ["выявление проблемы и понимание клиента"]
+
+        accepted = storage.accept_curriculum_artifact_template_proposal(conn, int(proposal["id"]))
+        templates = storage.load_curriculum_artifact_templates(conn)
+
+        assert accepted["status"] == "accepted"
+        assert templates
+        assert templates[0]["scopes"][0]["scope_name"] == "выявление проблемы и понимание клиента"
+    finally:
+        conn.close()
+        db_path.unlink(missing_ok=True)
+
+
+def test_template_consilium_filters_unknown_scope_and_skill_ids() -> None:
+    scope_groups = [
+        {
+            "scope_name": "исследование пользователя",
+            "skills": [
+                {"id": 10, "name": "Проведение интервью", "group_name": "Исследование"},
+                {"id": 11, "name": "Формулирование инсайтов", "group_name": "Исследование"},
+            ],
+        }
+    ]
+    raw = {
+        "proposals": [
+            {
+                "scope_names": ["несуществующая область"],
+                "title": "Плохой шаблон",
+                "artifact_family": "analysis",
+                "covered_skill_ids": [999],
+            },
+            {
+                "scope_names": ["исследование пользователя"],
+                "title": "Отчёт исследования пользователя",
+                "artifact_family": "analysis",
+                "artifact_description": "Студент предъявляет отчёт с фактами и выводами.",
+                "project_name_pattern": "Отчёт исследования",
+                "materials_pattern": "Бриф, заметки интервью, список навыков: {skills}.",
+                "storytelling_pattern": "Студент действует как исследователь продукта.",
+                "validation_criteria": "Есть факты, выводы и связь с навыками.",
+                "covered_skill_ids": [10, 999],
+                "rationale": "Один проверяемый артефакт на область исследования.",
+                "confidence": 0.92,
+            },
+        ]
+    }
+
+    proposals = up_template_consilium.validate_proposals(
+        raw,
+        scope_groups=scope_groups,
+        max_proposals=5,
+        source="test_consilium",
+    )
+
+    assert len(proposals) == 1
+    assert proposals[0]["scope_names"] == ["исследование пользователя"]
+    assert proposals[0]["covered_skill_ids"] == [10]
+    assert proposals[0]["source"] == "test_consilium"
+
+
 def test_up_planner_adds_spiral_thread_occurrence(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(config, "UP_SPIRAL_ENABLED", True)
     monkeypatch.setattr(config, "UP_MAX_SKILLS_PER_PROJECT", 4)
@@ -576,6 +724,37 @@ def test_up_planner_adds_spiral_thread_occurrence(monkeypatch: pytest.MonkeyPatc
     assert plan["report"]["quality_metrics"]["repeated_thread_count"] >= 1
     assert any("контроль/владение" in row["skills_list"] or "закрепление" in row["skills_list"] for row in plan["rows"])
     assert plan["report"]["project_violations"] == []
+
+
+def test_spiral_zun_reveals_skills_on_later_touch() -> None:
+    node = PlanNode(
+        tmp_id="S1",
+        name="A core",
+        group="theme",
+        block_key="theme",
+        bloom=5,
+        outcomes_know=("Знает основу A",),
+        outcomes_can=("Умеет применять A",),
+        outcomes_skills=("Владеет A в итоговом артефакте",),
+        tools=(),
+    )
+    primary_project = ProjectBlueprint(
+        occurrences=[SkillOccurrence(node=node, role="primary", touch_index=1, bloom_bucket="can")],
+        block_key="theme",
+        artifact="intro artifact",
+    )
+    assessment_project = ProjectBlueprint(
+        occurrences=[SkillOccurrence(node=node, role="assessment", touch_index=2, bloom_bucket="skills")],
+        block_key="theme",
+        artifact="assessment artifact",
+    )
+    occurrence_totals = {"S1": 2}
+
+    primary_outcomes = stage_dag_to_up._project_outcomes(primary_project, occurrence_totals)
+    assessment_outcomes = stage_dag_to_up._project_outcomes(assessment_project, occurrence_totals)
+
+    assert "Владеет A" not in primary_outcomes[2]
+    assert "Владеет A" in assessment_outcomes[2]
 
 
 def test_intro_bloom_create_is_clamped_without_explicit_signal() -> None:
@@ -668,6 +847,54 @@ def test_operational_dag_ignores_edges_that_need_review() -> None:
     assert edges[0].decision == "needs_review"
     assert accepted_edges == []
     assert dag.number_of_edges() == 0
+
+
+def test_visual_dag_preview_shows_safe_ai_edges_without_operational_promotion() -> None:
+    candidates = [
+        _candidate("A base", bloom="apply", decision="accepted"),
+        _candidate("B target", bloom="analyze", decision="accepted"),
+    ]
+    candidates[0].tmp_id = "A"
+    candidates[1].tmp_id = "B"
+    edges = [
+        stage_catalog_to_dag.PrereqEdge(src="A", dst="B", relation_type="soft", confidence=0.95, source="ai"),
+    ]
+
+    stage_catalog_to_dag.triage_edges(edges, candidates)
+    accepted_edges = stage_catalog_to_dag.operational_edges(edges)
+    dag, removed_cycle, removed_transitive = stage_catalog_to_dag.build_dag(accepted_edges, candidates)
+    payload = stage_catalog_to_dag.build_dag_payload(edges, dag, removed_cycle, removed_transitive, candidates)
+    payload["accepted_edge_count"] = len(accepted_edges)
+    stage_catalog_to_dag.add_visual_preview_payload(payload, edges, candidates)
+
+    assert edges[0].decision == "needs_review"
+    assert payload["final_edges"] == []
+    assert len(payload["visual_edges"]) == 1
+    assert payload["visual_edges"][0]["decision"] == "needs_review"
+    assert payload["preview_edge_count"] == 1
+    assert len(payload["visual_waves"]) == 2
+
+
+def test_edge_decision_override_promotes_ai_edge_to_operational_dag() -> None:
+    candidates = [
+        _candidate("A base", bloom="apply", decision="accepted"),
+        _candidate("B target", bloom="analyze", decision="accepted"),
+    ]
+    candidates[0].tmp_id = "A"
+    candidates[1].tmp_id = "B"
+    edges = [
+        stage_catalog_to_dag.PrereqEdge(src="A", dst="B", relation_type="soft", confidence=0.95, source="ai"),
+    ]
+
+    stage_catalog_to_dag.triage_edges(edges, candidates)
+    stage_catalog_to_dag.apply_edge_decision_overrides(edges, {"A->B": "accepted"})
+    accepted_edges = stage_catalog_to_dag.operational_edges(edges)
+    dag, _removed_cycle, _removed_transitive = stage_catalog_to_dag.build_dag(accepted_edges, candidates)
+
+    assert edges[0].decision == "accept"
+    assert edges[0].reasons == ["human_accepted"]
+    assert len(accepted_edges) == 1
+    assert dag.number_of_edges() == 1
 
 
 def test_atomize_batches_live_suspicious_candidates(monkeypatch: pytest.MonkeyPatch) -> None:

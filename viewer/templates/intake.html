@@ -423,7 +423,8 @@
 <section class="hero hero-compact"><div><h1>Граф пререквизитов</h1></div></section>
 <section class="chips-row">
     <div class="summary-card"><div class="summary-label">Узлов в DAG</div><div class="summary-value">{{ result.dag.nodes }}</div></div>
-    <div class="summary-card"><div class="summary-label">Рёбер в DAG</div><div class="summary-value">{{ result.dag.edges }}</div></div>
+    <div class="summary-card"><div class="summary-label">Рёбер в operational DAG</div><div class="summary-value">{{ result.dag.edges }}</div></div>
+    <div class="summary-card summary-card-soft"><div class="summary-label">Preview-рёбер</div><div class="summary-value">{{ result.dag.visual_edge_count or result.dag.edges }}</div></div>
     <div class="summary-card {% if result.dag.removed_cycle %}summary-card-warn{% endif %}"><div class="summary-label">Разорвано циклов</div><div class="summary-value">{{ result.dag.removed_cycle }}</div></div>
     <div class="summary-card summary-card-soft"><div class="summary-label">Убрано избыточных</div><div class="summary-value">{{ result.dag.removed_transitive }}</div></div>
     <div class="summary-card"><div class="summary-label">Ацикличен</div><div class="summary-value">{{ "да" if result.dag.acyclic else "нет" }}</div></div>
@@ -439,12 +440,19 @@
 </section>
 {% endif %}
 <div class="small muted">DAG перестраивается автоматически по текущим узлам с `entity_type=skill`, `atomicity=atomic` и `decision=accepted`.</div>
+{% if result.dag.preview_edge_count %}
+<div class="small muted">
+    На карте ниже показан preview: {{ result.dag.preview_edge_count }} LLM-рёбер ожидают методологической проверки и не влияют на УП, пока не подтверждены.
+</div>
+{% endif %}
 
-{% if result.dag.waves %}
+{% set dag_visual_waves = result.dag.visual_waves if result.dag.visual_waves else result.dag.waves %}
+{% set dag_visual_order = result.dag.visual_order if result.dag.visual_order else result.dag.order %}
+{% if dag_visual_waves %}
 <section class="hero hero-compact">
     <div>
         <h1>Карта зависимостей</h1>
-        <p>Колонки показывают волны обучения. Чем правее навык, тем позже он должен появиться в учебном маршруте.</p>
+        <p>Колонки показывают preview-волну зависимостей. Accepted-рёбра влияют на УП, proposed-рёбра видны только для проверки методологом.</p>
     </div>
 </section>
 <section class="dag-visual-card">
@@ -454,6 +462,7 @@
             <span class="dag-legend-chip dag-legend-chip-ai">Ребро от LLM</span>
             <span class="dag-legend-chip dag-legend-chip-hard">Структурный пререквизит</span>
             <span class="dag-legend-chip dag-legend-chip-soft">Мягкая методическая связь</span>
+            <span class="dag-legend-chip dag-legend-chip-review">Ожидает review</span>
         </div>
         <div class="review-actions">
             <button type="button" class="action-btn action-btn-light" id="dag-expand-all">Развернуть группы</button>
@@ -466,7 +475,7 @@
     <div class="dag-graph-shell" id="dag-graph-shell">
         <svg class="dag-edges-layer" id="dag-edges-layer" aria-hidden="true"></svg>
         <div class="dag-columns" id="dag-columns">
-            {% for wave in result.dag.waves %}
+            {% for wave in dag_visual_waves %}
             <section class="dag-wave-column">
                 <div class="dag-wave-title">Волна {{ loop.index }}</div>
                 <div class="dag-wave-subtitle">{{ wave|length }} навыков</div>
@@ -510,13 +519,13 @@
 </section>
 {% endif %}
 
-{% if result.dag.order %}
-<section class="hero hero-compact"><div><h1>Итоговый порядок</h1></div></section>
+{% if dag_visual_order %}
+<section class="hero hero-compact"><div><h1>Порядок preview</h1></div></section>
 <section class="table-wrap">
     <table class="data-table">
         <thead><tr><th>#</th><th>Навык</th><th>Группа</th><th>Bloom</th></tr></thead>
         <tbody>
-        {% for node in result.dag.order %}
+        {% for node in dag_visual_order %}
             <tr>
                 <td>{{ loop.index }}</td>
                 <td><strong>{{ node.name }}</strong></td>
@@ -772,10 +781,9 @@
     const dagExportSvgButton = document.getElementById("dag-export-svg");
     const dagExportPngButton = document.getElementById("dag-export-png");
     const dagExportPdfButton = document.getElementById("dag-export-pdf");
-
-    if (!intakeForm || !dropzone || !fileInput || !pathInput || !briefText || !statusNode) {
-        return;
-    }
+    const dagVisualEdges = Array.isArray(dagPayload?.visual_edges) && dagPayload.visual_edges.length
+        ? dagPayload.visual_edges
+        : (Array.isArray(dagPayload?.final_edges) ? dagPayload.final_edges : []);
 
     const syncTextSubmitVisibility = () => {
         if (!briefSubmitWrap) {
@@ -893,6 +901,9 @@
     };
 
     const submitFileSelection = (files) => {
+        if (!fileInput || !pathInput || !briefText || !statusNode || !intakeForm) {
+            return;
+        }
         const file = files?.[0];
         if (!file) {
             return;
@@ -907,57 +918,59 @@
         intakeForm.requestSubmit();
     };
 
-    dropzone.addEventListener("click", () => {
-        fileInput.click();
-    });
-
-    dropzone.addEventListener("keydown", (event) => {
-        if (event.key === "Enter" || event.key === " ") {
-            event.preventDefault();
+    if (intakeForm && dropzone && fileInput && pathInput && briefText && statusNode) {
+        dropzone.addEventListener("click", () => {
             fileInput.click();
-        }
-    });
+        });
 
-    ["dragenter", "dragover"].forEach((eventName) => {
-        dropzone.addEventListener(eventName, (event) => {
+        dropzone.addEventListener("keydown", (event) => {
+            if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                fileInput.click();
+            }
+        });
+
+        ["dragenter", "dragover"].forEach((eventName) => {
+            dropzone.addEventListener(eventName, (event) => {
+                event.preventDefault();
+                dropzone.classList.add("dragover");
+            });
+        });
+
+        ["dragleave", "dragend"].forEach((eventName) => {
+            dropzone.addEventListener(eventName, () => {
+                dropzone.classList.remove("dragover");
+            });
+        });
+
+        dropzone.addEventListener("drop", (event) => {
             event.preventDefault();
-            dropzone.classList.add("dragover");
-        });
-    });
-
-    ["dragleave", "dragend"].forEach((eventName) => {
-        dropzone.addEventListener(eventName, () => {
             dropzone.classList.remove("dragover");
+            submitFileSelection(event.dataTransfer?.files);
         });
-    });
 
-    dropzone.addEventListener("drop", (event) => {
-        event.preventDefault();
-        dropzone.classList.remove("dragover");
-        submitFileSelection(event.dataTransfer?.files);
-    });
+        fileInput.addEventListener("change", () => {
+            submitFileSelection(fileInput.files);
+        });
 
-    fileInput.addEventListener("change", () => {
-        submitFileSelection(fileInput.files);
-    });
+        briefText.addEventListener("input", () => {
+            if (!fileInput.files || fileInput.files.length === 0) {
+                pathInput.value = "";
+                statusNode.textContent = "Файл пока не выбран.";
+            }
+            syncTextSubmitVisibility();
+        });
 
-    briefText.addEventListener("input", () => {
-        if (!fileInput.files || fileInput.files.length === 0) {
-            pathInput.value = "";
-            statusNode.textContent = "Файл пока не выбран.";
-        }
+        intakeForm.addEventListener("submit", () => {
+            const hasSelectedFile = Boolean(fileInput.files && fileInput.files.length > 0);
+            if (!hasSelectedFile && briefText.value.trim()) {
+                pathInput.value = "";
+                statusNode.textContent = "Обрабатываю текстовый бриф.";
+            }
+        });
+
         syncTextSubmitVisibility();
-    });
-
-    intakeForm.addEventListener("submit", () => {
-        const hasSelectedFile = Boolean(fileInput.files && fileInput.files.length > 0);
-        if (!hasSelectedFile && briefText.value.trim()) {
-            pathInput.value = "";
-            statusNode.textContent = "Обрабатываю текстовый бриф.";
-        }
-    });
-
-    syncTextSubmitVisibility();
+    }
     renderJobProgress(currentJobStage, currentJobStatus);
 
     if (currentJobId && jobStageNode && jobProgressNode) {
@@ -1115,7 +1128,8 @@
     const createEdgePath = (pathData, sourceClass, relationClass, markerId, edge) => {
         const path = document.createElementNS(svgNamespace, "path");
         path.setAttribute("d", pathData);
-        path.setAttribute("class", `dag-edge dag-edge-${sourceClass} dag-edge-${relationClass}`);
+        const reviewClass = edge.decision === "accept" ? "" : " dag-edge-review";
+        path.setAttribute("class", `dag-edge dag-edge-${sourceClass} dag-edge-${relationClass}${reviewClass}`);
         path.setAttribute("marker-end", `url(#${markerId})`);
         path.dataset.srcId = edge.src_id;
         path.dataset.dstId = edge.dst_id;
@@ -1126,7 +1140,7 @@
     };
 
     const renderDagGraph = () => {
-        if (!dagPayload || !dagShell || !dagSvg || !dagColumns || !dagPayload.final_edges) {
+        if (!dagPayload || !dagShell || !dagSvg || !dagColumns) {
             return;
         }
 
@@ -1162,7 +1176,7 @@
             nodeMap.set(node.dataset.nodeId, node);
         });
 
-        for (const edge of dagPayload.final_edges) {
+        for (const edge of dagVisualEdges) {
             const srcNode = nodeMap.get(edge.src_id);
             const dstNode = nodeMap.get(edge.dst_id);
             if (!srcNode || !dstNode) {
@@ -1236,7 +1250,7 @@
     };
 
     const buildExportSvgMarkup = () => {
-        if (!dagPayload || !dagShell || !dagColumns || !dagPayload.final_edges) {
+        if (!dagPayload || !dagShell || !dagColumns) {
             return null;
         }
 
@@ -1293,8 +1307,9 @@
             const sourceClass = record.edge.source === "ai" ? "ai" : record.edge.source === "syllabus" ? "syllabus" : "pipeline";
             const markerId = sourceClass === "ai" ? "export-arrow-ai" : sourceClass === "syllabus" ? "export-arrow-syllabus" : "export-arrow-pipeline";
             const dash = record.edge.relation_type === "soft" ? ' stroke-dasharray="8 6"' : "";
+            const opacity = record.edge.decision === "accept" ? "" : ' opacity="0.58"';
             const stroke = sourceClass === "ai" ? "#b85c38" : sourceClass === "syllabus" ? "#0e8f6f" : "#7a6a4d";
-            parts.push(`<path d="${pathD}" fill="none" stroke="${stroke}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"${dash} marker-end="url(#${markerId})"></path>`);
+            parts.push(`<path d="${pathD}" fill="none" stroke="${stroke}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"${dash}${opacity} marker-end="url(#${markerId})"></path>`);
         }
 
         for (const [, layout] of nodeMap) {
@@ -1398,7 +1413,7 @@
         printWindow.document.close();
     };
 
-    if (dagPayload && dagPayload.final_edges) {
+    if (dagPayload && dagShell && dagSvg && dagColumns) {
         attachNodeHoverHandlers();
         document.querySelectorAll(".dag-group-cluster").forEach((group) => {
             group.addEventListener("toggle", () => {

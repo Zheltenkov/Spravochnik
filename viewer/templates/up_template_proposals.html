@@ -1,0 +1,135 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+    <div>
+        <h1>Предложения шаблонов УП</h1>
+        <p>Система предлагает шаблоны по accepted skills этого брифа. Они не влияют на УП, пока методолог не примет предложение.</p>
+        <div class="small muted">plan #{{ plan.id }} · brief #{{ plan.brief_id }}</div>
+    </div>
+    <div class="review-actions">
+        <a class="action-btn action-btn-light" href="/up/plans/{{ plan.id }}">Назад к УП</a>
+        <form method="post" action="/up/plans/{{ plan.id }}/template-proposals/generate">
+            <button type="submit" class="action-btn action-btn-primary">Сгенерировать заново</button>
+        </form>
+        <a class="action-btn action-btn-secondary" href="/catalog-admin/artifact-templates">Рабочие шаблоны</a>
+    </div>
+</section>
+
+{% if proposals %}
+<section class="list-grid">
+    {% for proposal in proposals %}
+    <article class="entity-card">
+        <div class="entity-head">
+            <div>
+                <h2>{{ proposal.title }}</h2>
+                <p class="muted">{{ proposal.code }}</p>
+            </div>
+            <span class="status-badge{% if proposal.status != 'accepted' %} warn{% endif %}">{{ proposal.status }}</span>
+        </div>
+
+        <div class="metrics">
+            <span>{{ proposal.artifact_family }}</span>
+            <span>confidence {{ "%.2f"|format(proposal.confidence) }}</span>
+            <span>{{ proposal.source }}</span>
+            <span>{{ proposal.covered_skill_names|length }} skills</span>
+            {% if proposal.accepted_template_id %}
+            <span>template #{{ proposal.accepted_template_id }}</span>
+            {% endif %}
+        </div>
+
+        {% if proposal.covered_skill_names %}
+        <p class="small"><strong>Покрывает:</strong> {{ proposal.covered_skill_names|join(", ") }}</p>
+        {% endif %}
+        {% if proposal.rationale %}
+        <p class="small muted">{{ proposal.rationale }}</p>
+        {% endif %}
+
+        <form class="admin-form" method="post" action="/up/plans/{{ plan.id }}/template-proposals/{{ proposal.id }}">
+            <div class="admin-grid">
+                <label>
+                    <span>Название</span>
+                    <input type="text" name="title" value="{{ proposal.title }}">
+                </label>
+                <label>
+                    <span>Тип артефакта</span>
+                    <select name="artifact_family">
+                        {% for value, label in artifact_family_options %}
+                        <option value="{{ value }}" {% if proposal.artifact_family == value %}selected{% endif %}>{{ label }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <label>
+                    <span>Confidence</span>
+                    <input type="number" step="0.01" min="0" max="1" name="confidence" value="{{ proposal.confidence }}">
+                </label>
+            </div>
+
+            <div class="form-grid-2">
+                <label>
+                    <span>Scope type</span>
+                    <select name="scope_type">
+                        {% for value, label in scope_type_options %}
+                        <option value="{{ value }}" {% if proposal.scope_type == value %}selected{% endif %}>{{ label }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <label>
+                    <span>Scope names</span>
+                    <textarea name="scope_names" rows="3">{{ proposal.scope_names|join("\n") }}</textarea>
+                </label>
+            </div>
+
+            <label>
+                <span>Описание проверяемого артефакта</span>
+                <textarea name="artifact_description" rows="3">{{ proposal.artifact_description }}</textarea>
+            </label>
+            <label>
+                <span>Название проекта</span>
+                <textarea name="project_name_pattern" rows="2">{{ proposal.project_name_pattern }}</textarea>
+            </label>
+
+            <div class="form-grid-2">
+                <label>
+                    <span>Материалы</span>
+                    <textarea name="materials_pattern" rows="4">{{ proposal.materials_pattern }}</textarea>
+                </label>
+                <label>
+                    <span>Сторителлинг</span>
+                    <textarea name="storytelling_pattern" rows="4">{{ proposal.storytelling_pattern }}</textarea>
+                </label>
+            </div>
+
+            <label>
+                <span>Критерии проверки</span>
+                <textarea name="validation_criteria" rows="3">{{ proposal.validation_criteria }}</textarea>
+            </label>
+            <label>
+                <span>Почему предложено</span>
+                <textarea name="rationale" rows="2">{{ proposal.rationale }}</textarea>
+            </label>
+
+            <p class="muted">Плейсхолдеры для planner: <code>{theme}</code>, <code>{skills}</code>, <code>{first_skill}</code>, <code>{artifact}</code>, <code>{artifact_family}</code>.</p>
+
+            <div class="review-actions">
+                {% if proposal.status == 'open' %}
+                <button type="submit" name="action" value="save_proposal" class="action-btn action-btn-light">Сохранить</button>
+                <button type="submit" name="action" value="accept_proposal" class="action-btn action-btn-primary">Принять и перестроить УП</button>
+                <button type="submit" name="action" value="reject_proposal" class="action-btn action-btn-danger">Отклонить</button>
+                {% elif proposal.status == 'accepted' %}
+                <span class="action-btn action-btn-light disabled">Принято в рабочие шаблоны</span>
+                {% else %}
+                <span class="action-btn action-btn-light disabled">Отклонено</span>
+                {% endif %}
+            </div>
+        </form>
+    </article>
+    {% endfor %}
+</section>
+{% else %}
+<section class="filter-panel">
+    <div class="empty-state">
+        Предложений пока нет. Нажмите «Сгенерировать заново»: система сгруппирует accepted skills по coverage area и предложит методологические шаблоны.
+    </div>
+</section>
+{% endif %}
+{% endblock %}

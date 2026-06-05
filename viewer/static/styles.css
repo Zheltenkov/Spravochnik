@@ -1387,6 +1387,15 @@ details[open] > summary .toggle-glyph::before {
         linear-gradient(90deg, currentColor 0 60%, transparent 60% 75%, currentColor 75% 100%);
 }
 
+.dag-legend-chip-review {
+    color: #c56a3d;
+}
+
+.dag-legend-chip-review::before {
+    background: rgba(197, 106, 61, 0.18);
+    border: 1px dashed rgba(197, 106, 61, 0.55);
+}
+
 .dag-legend-chip-hard::before,
 .dag-legend-chip-soft::before {
     width: 16px;
@@ -1584,6 +1593,11 @@ details[open] > summary .toggle-glyph::before {
 
 .dag-edge-soft {
     stroke-dasharray: 8 6;
+}
+
+.dag-edge-review {
+    opacity: 0.58;
+    stroke-dasharray: 4 8;
 }
 
 .dag-node-focus {

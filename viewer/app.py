@@ -488,6 +488,8 @@ def ensure_intake_runtime_schema(conn: sqlite3.Connection, db_path: Path) -> Non
         and table_exists(conn, "curriculum_plan_row")
         and table_exists(conn, "curriculum_artifact_template")
         and table_exists(conn, "curriculum_artifact_template_scope")
+        and table_exists(conn, "curriculum_artifact_template_proposal")
+        and table_exists(conn, "prerequisite_edge_decision")
         and column_exists(conn, "skill_suggestion", "coverage_area")
         and column_exists(conn, "skill_suggestion", "source_name")
         and column_exists(conn, "skill_suggestion", "indicators_json")
@@ -818,6 +820,88 @@ def get_brief_dag_state(conn: sqlite3.Connection, brief_id: int) -> dict[str, ob
         "open_review_count": int(open_reviews),
         "prerequisite_count": int(prerequisite_rows),
     }
+
+
+def load_prerequisite_edge_decisions(conn: sqlite3.Connection, brief_id: int) -> dict[str, str]:
+    if not table_exists(conn, "prerequisite_edge_decision"):
+        return {}
+    return {
+        str(row["edge_key"]): str(row["decision"])
+        for row in conn.execute(
+            """
+            SELECT edge_key, decision
+            FROM prerequisite_edge_decision
+            WHERE brief_id = ?
+            """,
+            (brief_id,),
+        )
+    }
+
+
+def parse_review_details_json(details: str | None) -> dict[str, object]:
+    if not details:
+        return {}
+    try:
+        data = json.loads(details)
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_prerequisite_edge_decision(
+    conn: sqlite3.Connection,
+    *,
+    brief_id: int,
+    details: dict[str, object],
+    decision: str,
+    resolution_note: str,
+) -> None:
+    if not table_exists(conn, "prerequisite_edge_decision"):
+        return
+    edge_key = str(details.get("edge_key") or "").strip()
+    if "->" not in edge_key:
+        return
+    src_raw, dst_raw = edge_key.split("->", 1)
+
+    def suggestion_id(raw: object) -> int | None:
+        value = str(raw or "").strip()
+        if value.startswith("S") and value[1:].isdigit():
+            return int(value[1:])
+        if value.isdigit():
+            return int(value)
+        return None
+
+    now = utc_now_iso()
+    conn.execute(
+        """
+        INSERT INTO prerequisite_edge_decision(
+            brief_id, edge_key, src_suggestion_id, dst_suggestion_id,
+            relation_type, confidence, source, decision, resolution_note, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(brief_id, edge_key) DO UPDATE SET
+            src_suggestion_id = excluded.src_suggestion_id,
+            dst_suggestion_id = excluded.dst_suggestion_id,
+            relation_type = excluded.relation_type,
+            confidence = excluded.confidence,
+            source = excluded.source,
+            decision = excluded.decision,
+            resolution_note = excluded.resolution_note,
+            updated_at = excluded.updated_at
+        """,
+        (
+            brief_id,
+            edge_key,
+            suggestion_id(details.get("src_id") or src_raw),
+            suggestion_id(details.get("dst_id") or dst_raw),
+            str(details.get("relation_type") or "soft"),
+            parse_optional_float(str(details.get("confidence"))) if details.get("confidence") is not None else None,
+            str(details.get("source") or "review"),
+            decision,
+            resolution_note.strip() or None,
+            now,
+        ),
+    )
 
 
 def build_deferred_dag_payload(state: dict[str, object], *, status: str, message: str) -> dict[str, object]:
@@ -1430,7 +1514,10 @@ def build_dag_for_brief(conn: sqlite3.Connection, brief_id: int) -> dict[str, ob
 
     intake_llm.set_usage_context(stage="dag", brief_id=brief_id)
     try:
-        edges, dag, removed_cycle, removed_transitive, dag_payload = stage_catalog_to_dag.run(cands)
+        edges, dag, removed_cycle, removed_transitive, dag_payload = stage_catalog_to_dag.run(
+            cands,
+            edge_decisions=load_prerequisite_edge_decisions(conn, brief_id),
+        )
     finally:
         intake_llm.set_usage_context(stage=None)
     prereq_count = storage.save_prerequisites(conn, brief_id, dag, cands, tmp_to_db)
@@ -2122,7 +2209,7 @@ def update_review_status(conn: sqlite3.Connection, review_id: int, new_status: s
     repair_intake_review_links(conn)
     review_row = conn.execute(
         """
-        SELECT id, entity_id, source_ref, reason_code
+        SELECT id, entity_id, source_ref, reason_code, details
         FROM review_queue
         WHERE id = ?
         """,
@@ -2145,7 +2232,23 @@ def update_review_status(conn: sqlite3.Connection, review_id: int, new_status: s
     )
     brief_id = parse_brief_id(review_row["source_ref"])
     suggestion_id = review_row["entity_id"]
-    if suggestion_id and brief_id is not None:
+    details = parse_review_details_json(review_row["details"])
+    if brief_id is not None and details.get("review_kind") == "prerequisite_edge":
+        if new_status in {"resolved", "ignored"}:
+            save_prerequisite_edge_decision(
+                conn,
+                brief_id=brief_id,
+                details=details,
+                decision="accepted" if new_status == "resolved" else "rejected",
+                resolution_note=resolution_note,
+            )
+        elif table_exists(conn, "prerequisite_edge_decision"):
+            conn.execute(
+                "DELETE FROM prerequisite_edge_decision WHERE brief_id = ? AND edge_key = ?",
+                (brief_id, str(details.get("edge_key") or "")),
+            )
+        clear_brief_dag_artifacts(conn, brief_id)
+    elif suggestion_id and brief_id is not None:
         mapped_decision = "needs_review"
         if new_status == "resolved":
             mapped_decision = "accepted"
@@ -2293,6 +2396,58 @@ def load_curriculum_plan_rows(conn: sqlite3.Connection, plan_id: int) -> list[di
     return [dict(row) for row in rows]
 
 
+def _count_up_outcomes(row: dict[str, object]) -> int:
+    total = 0
+    for key in ("outcomes_know", "outcomes_can", "outcomes_skills"):
+        total += len([line for line in str(row.get(key) or "").splitlines() if line.strip()])
+    return total
+
+
+def _count_up_skills(row: dict[str, object]) -> int:
+    raw_node_ids = row.get("node_ids")
+    if isinstance(raw_node_ids, list):
+        return len(raw_node_ids)
+    raw_skills = str(row.get("skills_list") or "").strip()
+    if not raw_skills:
+        return 0
+    return len([item for item in raw_skills.split(",") if item.strip()])
+
+
+def build_curriculum_quality_metrics_for_ui(
+    rows: list[dict[str, object]],
+    raw_metrics: dict[str, object] | None,
+) -> dict[str, object]:
+    metrics = dict(raw_metrics or {})
+    project_count = len(rows)
+    skill_counts = [_count_up_skills(row) for row in rows]
+    outcome_counts = [_count_up_outcomes(row) for row in rows]
+    target_skills = metrics.get("target_skills_per_project") if isinstance(metrics.get("target_skills_per_project"), list) else []
+    target_outcomes = metrics.get("target_outcomes_per_project") if isinstance(metrics.get("target_outcomes_per_project"), list) else []
+    max_skills = int(target_skills[-1]) if target_skills else 0
+    max_outcomes = int(target_outcomes[-1]) if target_outcomes else 0
+    if project_count:
+        metrics["avg_skills_per_project"] = round(sum(skill_counts) / project_count, 2)
+        metrics["avg_outcomes_per_project"] = round(sum(outcome_counts) / project_count, 2)
+        metrics["single_skill_project_count"] = sum(1 for count in skill_counts if count <= 1)
+        metrics["overloaded_project_count"] = sum(
+            1
+            for skill_count, outcome_count in zip(skill_counts, outcome_counts, strict=False)
+            if (max_skills and skill_count > max_skills) or (max_outcomes and outcome_count > max_outcomes)
+        )
+    else:
+        metrics.setdefault("avg_skills_per_project", 0.0)
+        metrics.setdefault("avg_outcomes_per_project", 0.0)
+        metrics.setdefault("single_skill_project_count", 0)
+        metrics.setdefault("overloaded_project_count", 0)
+    metrics.setdefault("core_thread_count", 0)
+    metrics.setdefault("repeated_thread_count", 0)
+    metrics.setdefault("spiral_enabled", False)
+    metrics.setdefault("artifact_project_count", 0)
+    metrics.setdefault("db_template_project_count", 0)
+    metrics.setdefault("unassigned_node_count", 0)
+    return metrics
+
+
 def build_curriculum_plan_payload_from_rows(
     plan_meta: dict[str, object],
     rows: list[dict[str, object]],
@@ -2346,11 +2501,13 @@ def build_curriculum_plan_payload_from_rows(
     message = str(payload.get("message") or default_message)
     if rows and "пока не стро" in message.casefold():
         message = default_message
-    report = payload.get("report") if isinstance(payload.get("report"), dict) else {}
+    payload_report = payload.get("report") if isinstance(payload.get("report"), dict) else {}
+    raw_quality_metrics = payload_report.get("quality_metrics") if isinstance(payload_report.get("quality_metrics"), dict) else {}
     report = {
-        "coverage_ok": bool(report.get("coverage_ok", False)),
-        "order_violations": report.get("order_violations") if isinstance(report.get("order_violations"), list) else [],
-        "project_violations": report.get("project_violations") if isinstance(report.get("project_violations"), list) else [],
+        "coverage_ok": bool(payload_report.get("coverage_ok", False)),
+        "order_violations": payload_report.get("order_violations") if isinstance(payload_report.get("order_violations"), list) else [],
+        "project_violations": payload_report.get("project_violations") if isinstance(payload_report.get("project_violations"), list) else [],
+        "quality_metrics": build_curriculum_quality_metrics_for_ui(rows, raw_quality_metrics),
     }
 
     built_payload = {
@@ -2604,6 +2761,12 @@ def parse_artifact_template_scopes(form_data: dict[str, str]) -> list[dict[str, 
         if item.strip()
     ]
     return [{"scope_type": scope_type, "scope_name": name, "weight": weight} for name in names]
+
+
+def parse_scope_names(raw_names: str | None, scope_type: str = "coverage_area") -> list[str]:
+    if scope_type == "any":
+        return ["*"]
+    return [item.strip() for item in re.split(r"[\n;]+", raw_names or "") if item.strip()]
 
 
 def update_curriculum_plan_row(conn: sqlite3.Connection, plan_id: int, row_id: int, form_data: dict[str, str]) -> dict[str, object]:
@@ -4909,6 +5072,103 @@ def create_app(db_path: Path, summary_path: Path):
                         content_type="text/csv; charset=utf-8",
                         headers=[("Content-Disposition", f'attachment; filename="{filename}"')],
                     )
+
+                if len(segments) == 5 and segments[3] == "template-proposals" and segments[4] == "generate" and method == "POST":
+                    from spravochnik_intake.pipeline import storage as intake_storage
+                    from spravochnik_intake.pipeline import llm as intake_llm
+
+                    plan_payload = get_curriculum_plan(conn, plan_id)
+                    if not plan_payload:
+                        return not_found(start_response, "Curriculum plan not found")
+                    brief_id = int(plan_payload.get("brief_id") or 0)
+                    if not brief_id:
+                        return not_found(start_response, "Curriculum plan has no brief")
+                    try:
+                        intake_llm.set_usage_context(brief_id=brief_id, stage="up_template_consilium")
+                        intake_storage.generate_curriculum_artifact_template_proposals(
+                            conn,
+                            brief_id=brief_id,
+                            plan_id=plan_id,
+                        )
+                    finally:
+                        intake_llm.clear_usage_context()
+                    return redirect_response(start_response, f"/up/plans/{plan_id}/template-proposals")
+
+                if len(segments) == 4 and segments[3] == "template-proposals" and method == "GET":
+                    from spravochnik_intake.pipeline import storage as intake_storage
+
+                    plan_payload = get_curriculum_plan(conn, plan_id)
+                    if not plan_payload:
+                        return not_found(start_response, "Curriculum plan not found")
+                    proposals = intake_storage.load_curriculum_artifact_template_proposals(
+                        conn,
+                        int(plan_payload.get("brief_id") or 0),
+                    )
+                    html = render(
+                        "up_template_proposals.html",
+                        {
+                            "title": f"Предложения шаблонов УП #{plan_id}",
+                            "plan": plan_payload,
+                            "proposals": proposals,
+                            "artifact_family_options": ARTIFACT_FAMILY_OPTIONS,
+                            "scope_type_options": [
+                                ("coverage_area", "Coverage area"),
+                                ("skill_group", "Группа skills"),
+                                ("taxonomy_node", "Узел таксономии"),
+                                ("any", "Любая область"),
+                            ],
+                            "request_path": "/up",
+                        },
+                    )
+                    return html_response(start_response, html)
+
+                if len(segments) == 5 and segments[3] == "template-proposals" and method == "POST":
+                    from spravochnik_intake.pipeline import storage as intake_storage
+
+                    try:
+                        proposal_id = int(segments[4])
+                    except ValueError:
+                        return not_found(start_response, "Invalid proposal id")
+                    plan_payload = get_curriculum_plan(conn, plan_id)
+                    if not plan_payload:
+                        return not_found(start_response, "Curriculum plan not found")
+                    form_data = parse_post_data(environ)
+                    action = form_data.get("action", "")
+                    redirect_plan_id = plan_id
+                    if action in {"save_proposal", "accept_proposal"}:
+                        scope_type = form_data.get("scope_type", "coverage_area").strip() or "coverage_area"
+                        intake_storage.update_curriculum_artifact_template_proposal(
+                            conn,
+                            proposal_id,
+                            title=form_data.get("title", "").strip(),
+                            artifact_family=form_data.get("artifact_family", "practice").strip() or "practice",
+                            scope_type=scope_type,
+                            scope_names=parse_scope_names(form_data.get("scope_names"), scope_type),
+                            artifact_description=form_data.get("artifact_description", "").strip(),
+                            project_name_pattern=form_data.get("project_name_pattern", "").strip(),
+                            materials_pattern=form_data.get("materials_pattern", "").strip(),
+                            storytelling_pattern=form_data.get("storytelling_pattern", "").strip(),
+                            validation_criteria=form_data.get("validation_criteria", "").strip(),
+                            rationale=form_data.get("rationale", "").strip(),
+                            confidence=parse_optional_float(form_data.get("confidence")),
+                        )
+                    if action == "accept_proposal":
+                        intake_storage.accept_curriculum_artifact_template_proposal(conn, proposal_id)
+                        brief_id = int(plan_payload.get("brief_id") or 0)
+                        rebuilt = build_curriculum_plan_for_brief(conn, brief_id)
+                        redirect_plan_id = int(rebuilt.get("plan_id") or plan_id)
+                        conn.execute(
+                            """
+                            UPDATE curriculum_artifact_template_proposal
+                            SET plan_id = COALESCE(plan_id, ?)
+                            WHERE brief_id = ?
+                            """,
+                            (redirect_plan_id, brief_id),
+                        )
+                        conn.commit()
+                    elif action == "reject_proposal":
+                        intake_storage.reject_curriculum_artifact_template_proposal(conn, proposal_id)
+                    return redirect_response(start_response, f"/up/plans/{redirect_plan_id}/template-proposals")
 
                 if len(segments) == 5 and segments[3] == "rows" and segments[4] == "new" and method == "POST":
                     plan_payload = get_curriculum_plan(conn, plan_id)

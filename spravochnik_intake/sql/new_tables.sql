@@ -79,6 +79,27 @@ CREATE TABLE IF NOT EXISTS skill_prerequisite (
     review_state  TEXT NOT NULL DEFAULT 'needs_review' CHECK (review_state IN ('accepted','needs_review','draft'))
 );
 
+-- Human decisions for proposed prerequisite edges. These records survive DAG
+-- rebuilds and are applied before operational DAG persistence.
+CREATE TABLE IF NOT EXISTS prerequisite_edge_decision (
+    id            INTEGER PRIMARY KEY,
+    brief_id      INTEGER NOT NULL REFERENCES profile_brief(id) ON DELETE CASCADE,
+    edge_key      TEXT NOT NULL,
+    src_suggestion_id INTEGER REFERENCES skill_suggestion(id) ON DELETE SET NULL,
+    dst_suggestion_id INTEGER REFERENCES skill_suggestion(id) ON DELETE SET NULL,
+    relation_type TEXT NOT NULL DEFAULT 'soft' CHECK (relation_type IN ('hard','soft')),
+    confidence    REAL,
+    source        TEXT,
+    decision      TEXT NOT NULL CHECK (decision IN ('accepted','rejected')),
+    resolution_note TEXT,
+    created_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at    TEXT,
+    UNIQUE(brief_id, edge_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_prerequisite_edge_decision_brief
+    ON prerequisite_edge_decision(brief_id, decision);
+
 -- Runtime-состояние intake-задач для UI и фонового выполнения.
 CREATE TABLE IF NOT EXISTS intake_job (
     id            INTEGER PRIMARY KEY,
@@ -197,6 +218,42 @@ CREATE INDEX IF NOT EXISTS idx_curriculum_artifact_template_status
 
 CREATE INDEX IF NOT EXISTS idx_curriculum_artifact_template_scope
     ON curriculum_artifact_template_scope(scope_type, normalized_scope_name);
+
+-- Предложения шаблонов УП по конкретному брифу.
+-- Это human-in-the-loop слой: proposals не применяются planner-ом, пока
+-- методолог не примет их в curriculum_artifact_template.
+CREATE TABLE IF NOT EXISTS curriculum_artifact_template_proposal (
+    id            INTEGER PRIMARY KEY,
+    brief_id      INTEGER NOT NULL REFERENCES profile_brief(id) ON DELETE CASCADE,
+    plan_id       INTEGER REFERENCES curriculum_plan(id) ON DELETE SET NULL,
+    status        TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','accepted','rejected')),
+    code          TEXT NOT NULL,
+    title         TEXT NOT NULL,
+    artifact_family TEXT NOT NULL CHECK (
+        artifact_family IN ('analysis','document','configuration','design','production','practice')
+    ),
+    scope_type    TEXT NOT NULL DEFAULT 'coverage_area' CHECK (
+        scope_type IN ('taxonomy_node','skill_group','coverage_area','any')
+    ),
+    scope_names_json TEXT NOT NULL DEFAULT '[]',
+    artifact_description TEXT NOT NULL,
+    project_name_pattern TEXT,
+    materials_pattern TEXT,
+    storytelling_pattern TEXT,
+    validation_criteria TEXT,
+    covered_skill_ids_json TEXT NOT NULL DEFAULT '[]',
+    covered_skill_names_json TEXT NOT NULL DEFAULT '[]',
+    rationale     TEXT,
+    confidence    REAL NOT NULL DEFAULT 0.75,
+    source        TEXT NOT NULL DEFAULT 'deterministic_proposer',
+    accepted_template_id INTEGER REFERENCES curriculum_artifact_template(id) ON DELETE SET NULL,
+    created_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at    TEXT,
+    UNIQUE(brief_id, code)
+);
+
+CREATE INDEX IF NOT EXISTS idx_curriculum_artifact_template_proposal_brief
+    ON curriculum_artifact_template_proposal(brief_id, status, id);
 
 -- Лог промоции intake-suggestion в канонический skills catalog.
 CREATE TABLE IF NOT EXISTS skill_promotion_log (

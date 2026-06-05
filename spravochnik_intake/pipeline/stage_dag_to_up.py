@@ -1,17 +1,18 @@
-"""Стадия 4: accepted skills + DAG -> черновик учебного плана.
+"""Стадия 4: accepted skills + DAG -> spiral curriculum plan draft.
 
-Делаем детерминированный upper planner:
-- не генерируем новые skills;
-- не меняем DAG;
-- только упаковываем принятые узлы в блоки/проекты и рендерим строки УП.
+The stage does not generate new skills and does not mutate the DAG. It builds a
+deterministic curriculum layer above the DAG: accepted skills become project
+occurrences, core threads can reappear later for reinforcement/assessment, and
+the final payload remains compatible with the existing UI and CSV export.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
 from math import isfinite
-import networkx as nx
+import re
 
 from . import config
+from . import language
+from .curriculum import CurriculumBlock, PlanNode, ProjectBlueprint, SkillOccurrence, build_curriculum_blocks
 from .models import SkillCandidate
 
 CSV_PRIMARY_HEADER = [
@@ -42,31 +43,17 @@ CSV_PRIMARY_HEADER = [
 CSV_SECONDARY_HEADER = [""] * len(CSV_PRIMARY_HEADER)
 
 
-@dataclass(frozen=True)
-class PlanNode:
-    """Нормализованный узел для upper planner."""
-
-    tmp_id: str
-    name: str
-    group: str
-    block_key: str
-    bloom: int
-    outcomes_know: tuple[str, ...]
-    outcomes_can: tuple[str, ...]
-    outcomes_skills: tuple[str, ...]
-    tools: tuple[str, ...]
-
-
 def _display_name(candidate: SkillCandidate) -> str:
     # Для сматченных сущностей используем каноническое имя каталога.
     if candidate.canonical_name and candidate.resolution in {"matched", "alias", "fuzzy"}:
-        return candidate.canonical_name
-    return candidate.name
+        return language.localize_skill_label(candidate.canonical_name)
+    return language.localize_skill_label(candidate.name)
 
 
 def _display_group(candidate: SkillCandidate) -> str:
     # Coverage area лучше подходит для тематического блока, чем сырая skill-group.
-    return candidate.coverage_area or candidate.canonical_group or candidate.group or "Общее"
+    value = candidate.coverage_area or candidate.canonical_group or candidate.group or "Общее"
+    return language.localize_area_label(value) or language.localize_group_label(value) or "Общее"
 
 
 def _node_from_candidate(candidate: SkillCandidate) -> PlanNode:
@@ -130,18 +117,46 @@ def _estimate_project_hours(nodes: list[PlanNode]) -> int:
     return _snap_hours(raw_hours)
 
 
-def _slugify(value: str) -> str:
-    lowered = value.casefold().replace("ё", "е")
-    slug = "-".join(part for part in "".join(ch if ch.isalnum() else "-" for ch in lowered).split("-") if part)
-    return slug or "project"
+def _compact_label(value: str, *, max_words: int = 5, max_chars: int = 56) -> str:
+    """Return a short Russian UI/CSV label without losing technical terms."""
+    text = language.localize_area_label(value) or language.localize_skill_label(value) or value
+    text = re.sub(r"\s+", " ", text.replace("—", "-")).strip(" .,-")
+    if not text:
+        return "Общее"
+    # Long clarifications after colon are useful in coverage audit, but too noisy as block titles.
+    text = text.split(":", 1)[0].strip()
+    words = text.split()
+    if len(words) > max_words:
+        text = " ".join(words[:max_words])
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip(" ,.-") + "..."
+    return text or "Общее"
+
+
+def _join_limited(values: list[str], *, limit: int = 3) -> str:
+    labels = [_compact_label(value, max_words=5, max_chars=48) for value in values if value]
+    unique = list(dict.fromkeys(labels))
+    if len(unique) <= limit:
+        return ", ".join(unique)
+    return ", ".join(unique[:limit]) + f" и ещё {len(unique) - limit}"
+
+
+def _block_title(block_index: int, block_keys: list[str]) -> str:
+    theme = _join_limited(block_keys, limit=2) or "Общее"
+    return f"Блок {block_index}. {theme}"
+
+
+def _block_goal(nodes: list[PlanNode]) -> str:
+    names = _join_limited([node.name for node in nodes], limit=4)
+    return f"Сформировать практику: {names}" if names else "Сформировать практический результат блока."
 
 
 def _project_name(nodes: list[PlanNode], block_index: int, project_index: int) -> str:
     # Пока делаем детерминированный title; LLM-enrichment можно добавить отдельным нижним генератором.
     if len(nodes) == 1:
-        return nodes[0].name
+        return _compact_label(nodes[0].name, max_words=6, max_chars=64)
     anchor = nodes[-1].name
-    return f"{anchor} — проект {block_index}.{project_index}"
+    return _compact_label(anchor, max_words=6, max_chars=64)
 
 
 def _project_summary(nodes: list[PlanNode], role: str) -> str:
@@ -160,111 +175,107 @@ def _project_storytelling(nodes: list[PlanNode], role: str, block_key: str) -> s
     )
 
 
+def _occurrence_outcome_sources(occurrence: SkillOccurrence) -> tuple[str, tuple[str, ...]]:
+    node = occurrence.node
+    if occurrence.bloom_bucket == "know":
+        return "know", node.outcomes_know or (f"Объясняет назначение навыка «{node.name}» в рабочем контексте.",)
+    if occurrence.bloom_bucket == "skills":
+        return "skills", node.outcomes_skills or node.outcomes_can or (f"Интегрирует навык «{node.name}» в проверяемый артефакт.",)
+    if occurrence.role in {"assessment", "reinforcement"} and occurrence.touch_index >= 3:
+        return "skills", node.outcomes_skills or node.outcomes_can or (f"Закрепляет навык «{node.name}» в новом проектном контексте.",)
+    return "can", node.outcomes_can or node.outcomes_know or (f"Применяет навык «{node.name}» для решения проектной задачи.",)
+
+
+def _fallback_outcome(occurrence: SkillOccurrence) -> tuple[str, str]:
+    node = occurrence.node
+    if occurrence.role == "assessment":
+        return "skills", f"Защищает результат, демонстрируя владение навыком «{node.name}»."
+    if occurrence.role == "reinforcement":
+        return "can", f"Повторно применяет навык «{node.name}» в более сложном сценарии."
+    if node.bloom <= 2:
+        return "know", f"Понимает ключевые принципы навыка «{node.name}»."
+    if node.bloom <= 4:
+        return "can", f"Применяет навык «{node.name}» в практическом задании."
+    return "skills", f"Создаёт или оценивает артефакт с использованием навыка «{node.name}»."
+
+
+def _project_outcomes(project: ProjectBlueprint) -> tuple[str, str, str, int]:
+    buckets: dict[str, list[str]] = {"know": [], "can": [], "skills": []}
+    max_outcomes = max(1, int(config.UP_TARGET_OUTCOMES_MAX))
+    min_outcomes = max(1, min(int(config.UP_TARGET_OUTCOMES_MIN), max_outcomes))
+
+    for occurrence in project.occurrences:
+        bucket, outcomes = _occurrence_outcome_sources(occurrence)
+        for outcome in outcomes:
+            text = outcome.strip()
+            if text and text not in buckets[bucket] and sum(len(items) for items in buckets.values()) < max_outcomes:
+                buckets[bucket].append(text)
+
+    for occurrence in project.occurrences:
+        if sum(len(items) for items in buckets.values()) >= min_outcomes:
+            break
+        bucket, outcome = _fallback_outcome(occurrence)
+        if outcome not in buckets[bucket]:
+            buckets[bucket].append(outcome)
+
+    # Even a deliberately small introductory project should expose a complete
+    # ZUN profile instead of a single "demonstrates skill" line.
+    anchor = project.unique_nodes[-1].name if project.unique_nodes else "проектный навык"
+    completion_fallbacks = [
+        ("know", f"Описывает контекст применения навыка «{anchor}»."),
+        ("can", f"Применяет навык «{anchor}» при создании проектного артефакта."),
+        ("skills", f"Оформляет и защищает проверяемый результат по теме «{project.block_key}»."),
+    ]
+    for bucket, outcome in completion_fallbacks:
+        if sum(len(items) for items in buckets.values()) >= min_outcomes:
+            break
+        if outcome not in buckets[bucket]:
+            buckets[bucket].append(outcome)
+
+    return (
+        "\n".join(buckets["know"]),
+        "\n".join(buckets["can"]),
+        "\n".join(buckets["skills"]),
+        sum(len(items) for items in buckets.values()),
+    )
+
+
+def _project_skill_list(project: ProjectBlueprint) -> str:
+    labels: list[str] = []
+    for occurrence in project.occurrences:
+        suffix = ""
+        if occurrence.role == "reinforcement":
+            suffix = " (закрепление)"
+        elif occurrence.role == "assessment":
+            suffix = " (контроль/владение)"
+        label = occurrence.node.name + suffix
+        if label not in labels:
+            labels.append(label)
+    return ", ".join(labels)
+
+
 def _default_group_size(delivery_format: str) -> int:
     bounds = config.UP_FORMAT_GROUP_SIZES.get(delivery_format, (1, 1))
     return int(bounds[0])
 
 
-def _build_block_graph(nodes: list[PlanNode], dag_payload: dict[str, object]) -> tuple[nx.DiGraph, dict[str, int]]:
-    # Делаем граф тематических блоков поверх DAG, чтобы сохранять порядок между областями.
-    position = {
-        str(item.get("id")): index
-        for index, item in enumerate(dag_payload.get("order", []))
-        if isinstance(item, dict) and item.get("id") is not None
-    }
-    by_id = {node.tmp_id: node for node in nodes}
-    block_graph = nx.DiGraph()
-    block_graph.add_nodes_from({node.block_key for node in nodes})
-    for edge in dag_payload.get("final_edges", []):
-        if not isinstance(edge, dict):
-            continue
-        src_id = str(edge.get("src_id") or "")
-        dst_id = str(edge.get("dst_id") or "")
-        if src_id not in by_id or dst_id not in by_id:
-            continue
-        src_block = by_id[src_id].block_key
-        dst_block = by_id[dst_id].block_key
-        if src_block != dst_block:
-            block_graph.add_edge(src_block, dst_block)
-    return block_graph, position
-
-
-def _ordered_superblocks(nodes: list[PlanNode], dag_payload: dict[str, object]) -> list[tuple[str, ...]]:
-    # Схлопываем возможные циклы на уровне тематических блоков и упорядочиваем супер-блоки.
-    block_graph, position = _build_block_graph(nodes, dag_payload)
-    if block_graph.number_of_nodes() == 0:
-        return []
-    condensation = nx.condensation(block_graph)
-
-    def _min_pos(component_id: int) -> int:
-        members = condensation.nodes[component_id]["members"]
-        node_positions = [
-            position.get(node.tmp_id, 10**9)
-            for node in nodes
-            if node.block_key in members
-        ]
-        return min(node_positions, default=10**9)
-
-    ordered_component_ids = list(nx.lexicographical_topological_sort(condensation, key=_min_pos))
-    return [tuple(sorted(condensation.nodes[item]["members"])) for item in ordered_component_ids]
-
-
-def _pack_projects(nodes: list[PlanNode], dag_payload: dict[str, object]) -> list[list[list[PlanNode]]]:
-    # Сначала упаковываем навыки в проекты внутри супер-блока, затем режем блок по лимиту числа проектов.
-    position = {
-        str(item.get("id")): index
-        for index, item in enumerate(dag_payload.get("order", []))
-        if isinstance(item, dict) and item.get("id") is not None
-    }
-    blocks: list[list[list[PlanNode]]] = []
-    by_id = {node.tmp_id: node for node in nodes}
-    for component_blocks in _ordered_superblocks(nodes, dag_payload):
-        component_nodes = sorted(
-            [node for node in nodes if node.block_key in component_blocks],
-            key=lambda item: position.get(item.tmp_id, 10**9),
-        )
-        projects_in_component: list[list[PlanNode]] = []
-        current: list[PlanNode] = []
-        for node in component_nodes:
-            candidate_project = current + [node]
-            if (
-                current
-                and len(candidate_project) <= config.UP_MAX_SKILLS_PER_PROJECT
-                and _estimate_project_hours(candidate_project) <= max(config.UP_HOUR_BANDS)
-            ):
-                current = candidate_project
-            else:
-                if current:
-                    projects_in_component.append(current)
-                current = [node]
-        if current:
-            projects_in_component.append(current)
-        for offset in range(0, len(projects_in_component), config.UP_MAX_PROJECTS_PER_BLOCK):
-            block_projects = projects_in_component[offset : offset + config.UP_MAX_PROJECTS_PER_BLOCK]
-            blocks.append(block_projects)
-    if not blocks and by_id:
-        blocks.append([[node] for node in sorted(nodes, key=lambda item: position.get(item.tmp_id, 10**9))])
-    return blocks
-
-
-def _format_rows(blocks: list[list[list[PlanNode]]], spec: dict[str, object] | None) -> list[dict[str, object]]:
+def _format_rows(blocks: list[CurriculumBlock], spec: dict[str, object] | None) -> list[dict[str, object]]:
     role = str((spec or {}).get("role") or "участник программы").strip()
     rows: list[dict[str, object]] = []
     row_number = 0
     for block_index, block in enumerate(blocks, start=1):
-        block_keys = sorted({project[0].block_key for project in block if project})
-        block_title = f"Блок {block_index}. " + " / ".join(block_keys)
-        all_block_nodes = [node for project in block for node in project]
-        block_goal = "Освоить: " + ", ".join(node.name for node in all_block_nodes)
-        for project_index, project_nodes in enumerate(block, start=1):
+        all_block_nodes = [node for project in block.projects for node in project.unique_nodes]
+        block_keys = sorted({node.block_key for node in all_block_nodes})
+        block_title = _block_title(block_index, block_keys)
+        block_goal = _block_goal(all_block_nodes)
+        for project_index, project in enumerate(block.projects, start=1):
             row_number += 1
+            project_nodes = project.unique_nodes
             effort_hours = _estimate_project_hours(project_nodes)
             required_tools = ", ".join(sorted({tool for node in project_nodes for tool in node.tools}))
-            outcomes_know = "\n".join(dict.fromkeys(outcome for node in project_nodes for outcome in node.outcomes_know))
-            outcomes_can = "\n".join(dict.fromkeys(outcome for node in project_nodes for outcome in node.outcomes_can))
-            outcomes_skills = "\n".join(dict.fromkeys(outcome for node in project_nodes for outcome in node.outcomes_skills))
+            outcomes_know, outcomes_can, outcomes_skills, outcome_count = _project_outcomes(project)
             project_name = _project_name(project_nodes, block_index, project_index)
-            block_key = project_nodes[0].block_key if project_nodes else "Общее"
+            block_key = project.block_key or (project_nodes[0].block_key if project_nodes else "Общее")
             delivery_format = config.UP_DEFAULT_FORMAT
             rows.append(
                 {
@@ -279,7 +290,12 @@ def _format_rows(blocks: list[list[list[PlanNode]]], spec: dict[str, object] | N
                     "outcomes_can": outcomes_can,
                     "outcomes_skills": outcomes_skills,
                     "learning_outcomes": "\n".join(item for item in [outcomes_know, outcomes_can, outcomes_skills] if item),
-                    "skills_list": ", ".join(node.name for node in project_nodes),
+                    "skills_list": _project_skill_list(project),
+                    "node_ids": project.node_ids,
+                    "node_names": [node.name for node in project_nodes],
+                    "occurrence_count": len(project.occurrences),
+                    "outcome_count": outcome_count,
+                    "artifact": project.artifact,
                     "audience_level": _audience_label(spec),
                     "required_tools": required_tools,
                     "materials": "",
@@ -301,23 +317,72 @@ def _format_rows(blocks: list[list[list[PlanNode]]], spec: dict[str, object] | N
 
 
 def _plan_report(rows: list[dict[str, object]], dag_payload: dict[str, object]) -> dict[str, object]:
-    # Проверяем, что порядок строк не нарушает DAG-отношения.
-    order_by_node: dict[str, int] = {}
+    # Проверяем порядок по стабильным tmp_id, а не по отображаемым именам.
+    position_by_node: dict[str, tuple[int, int]] = {}
+    row_by_node: dict[str, int] = {}
     for row in rows:
-        skills = str(row.get("skills_list") or "")
-        for skill_name in [item.strip() for item in skills.split(",") if item.strip()]:
-            order_by_node.setdefault(skill_name, int(row.get("row_number", 0) or 0))
+        row_number = int(row.get("row_number", 0) or 0)
+        node_ids = row.get("node_ids") if isinstance(row.get("node_ids"), list) else []
+        for skill_index, node_id in enumerate(node_ids):
+            node_key = str(node_id)
+            position_by_node.setdefault(node_key, (row_number, skill_index))
+            row_by_node.setdefault(node_key, row_number)
     broken_order: list[str] = []
+    project_violations: list[str] = []
     for edge in dag_payload.get("final_edges", []):
         if not isinstance(edge, dict):
             continue
-        src = str(edge.get("src") or "")
-        dst = str(edge.get("dst") or "")
-        if src and dst and order_by_node.get(src, 0) >= order_by_node.get(dst, 10**9):
+        src_id = str(edge.get("src_id") or "")
+        dst_id = str(edge.get("dst_id") or "")
+        src = str(edge.get("src") or src_id)
+        dst = str(edge.get("dst") or dst_id)
+        if not src_id or not dst_id or src_id not in position_by_node or dst_id not in position_by_node:
+            continue
+        if row_by_node[src_id] == row_by_node[dst_id]:
+            if str(edge.get("relation_type") or "").casefold() == "hard":
+                project_violations.append(f"{src} -> {dst}")
+            continue
+        if position_by_node[src_id] >= position_by_node[dst_id]:
             broken_order.append(f"{src} -> {dst}")
     return {
-        "coverage_ok": not broken_order,
+        "coverage_ok": not broken_order and not project_violations,
         "order_violations": broken_order,
+        "project_violations": project_violations,
+    }
+
+
+def _quality_metrics(rows: list[dict[str, object]], planner_meta: dict[str, object]) -> dict[str, object]:
+    project_count = len(rows)
+    if not project_count:
+        return {
+            "avg_skills_per_project": 0.0,
+            "avg_outcomes_per_project": 0.0,
+            "single_skill_project_count": 0,
+            "overloaded_project_count": 0,
+            "core_thread_count": 0,
+            "repeated_thread_count": 0,
+            "spiral_enabled": bool(config.UP_SPIRAL_ENABLED),
+            "target_skills_per_project": [config.UP_TARGET_SKILLS_MIN, config.UP_TARGET_SKILLS_MAX],
+            "target_outcomes_per_project": [config.UP_TARGET_OUTCOMES_MIN, config.UP_TARGET_OUTCOMES_MAX],
+        }
+    skill_counts = [len(row.get("node_ids") or []) for row in rows]
+    outcome_counts = [int(row.get("outcome_count", 0) or 0) for row in rows]
+    overloaded = [
+        row
+        for row in rows
+        if len(row.get("node_ids") or []) > config.UP_TARGET_SKILLS_MAX
+        or int(row.get("outcome_count", 0) or 0) > config.UP_TARGET_OUTCOMES_MAX
+    ]
+    return {
+        "avg_skills_per_project": round(sum(skill_counts) / project_count, 2),
+        "avg_outcomes_per_project": round(sum(outcome_counts) / project_count, 2),
+        "single_skill_project_count": sum(1 for count in skill_counts if count <= 1),
+        "overloaded_project_count": len(overloaded),
+        "core_thread_count": len(planner_meta.get("core_thread_ids") or []),
+        "repeated_thread_count": int(planner_meta.get("repeated_thread_count", 0) or 0),
+        "spiral_enabled": bool(config.UP_SPIRAL_ENABLED),
+        "target_skills_per_project": [config.UP_TARGET_SKILLS_MIN, config.UP_TARGET_SKILLS_MAX],
+        "target_outcomes_per_project": [config.UP_TARGET_OUTCOMES_MIN, config.UP_TARGET_OUTCOMES_MAX],
     }
 
 
@@ -335,16 +400,19 @@ def run(spec: dict[str, object] | None, candidates: list[SkillCandidate], dag_pa
             "blocks": [],
             "csv_primary_header": CSV_PRIMARY_HEADER,
             "csv_secondary_header": CSV_SECONDARY_HEADER,
-            "report": {"coverage_ok": False, "order_violations": []},
+            "report": {"coverage_ok": False, "order_violations": [], "project_violations": [], "quality_metrics": _quality_metrics([], {})},
         }
 
     nodes = [_node_from_candidate(candidate) for candidate in candidates]
-    blocks = _pack_projects(nodes, dag_payload)
+    blocks, planner_meta = build_curriculum_blocks(nodes, dag_payload)
     rows = _format_rows(blocks, spec)
     total_hours = sum(float(row.get("effort_hours", 0) or 0) for row in rows)
     total_days = sum(float(row.get("effort_days", 0) or 0) for row in rows)
     total_xp = sum(int(row.get("xp", 0) or 0) for row in rows)
     report = _plan_report(rows, dag_payload)
+    report["quality_metrics"] = _quality_metrics(rows, planner_meta)
+    report["planner_meta"] = planner_meta
+    is_invalid = bool(report["order_violations"] or report.get("project_violations"))
 
     # Для UI держим и блочное представление, и плоские CSV-совместимые строки.
     block_payloads: list[dict[str, object]] = []
@@ -367,17 +435,25 @@ def run(spec: dict[str, object] | None, candidates: list[SkillCandidate], dag_pa
         )
 
     return {
-        "status": "built",
-        "message": "Черновик УП построен детерминированно по принятым skills и текущему DAG.",
+        "status": "invalid" if is_invalid else "built",
+        "message": (
+            "Черновик УП невалиден: найдены нарушения порядка DAG. Нужна перенарезка проектов или правка DAG."
+            if is_invalid
+            else "Черновик УП построен детерминированно по принятым skills и текущему DAG."
+        ),
         "title": "Черновик учебного плана",
         "audience_level": _audience_label(spec),
         "source_policy": "accepted_only",
+        "planner_meta": planner_meta,
         "summary": {
             "blocks": len(block_payloads),
             "projects": len(rows),
             "total_hours": int(total_hours) if isfinite(total_hours) else 0,
             "total_days": round(total_days, 2) if isfinite(total_days) else 0.0,
             "total_xp": int(total_xp),
+            "avg_skills_per_project": report["quality_metrics"]["avg_skills_per_project"],
+            "avg_outcomes_per_project": report["quality_metrics"]["avg_outcomes_per_project"],
+            "repeated_thread_count": report["quality_metrics"]["repeated_thread_count"],
         },
         "rows": rows,
         "blocks": block_payloads,

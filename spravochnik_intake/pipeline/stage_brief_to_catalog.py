@@ -13,11 +13,59 @@ from datetime import UTC, datetime, timedelta
 from . import config, llm
 from . import stage_atomize
 from . import stage_normalize
-from .models import Evidence, IndicatorSpec, SkillCandidate
+from . import language
+from .models import BLOOM, Evidence, IndicatorSpec, SkillCandidate
 from .catalog_repo import CatalogRepo
+from .skill_names import canonicalize_skill_name
+
+RUSSIAN_OUTPUT_RULE = (
+    "Все поля name, group, coverage_area, rationale и тексты индикаторов пиши на русском языке. "
+    "Сохраняй на английском только общепринятые технические термины и аббревиатуры: MVP, API, REST, SQL, CI/CD, LLM, SLA, Git, Docker, OKR, unit economics, human-in-the-loop."
+)
 
 
-def normalize_bloom(value: str | None) -> str:
+_BLOOM_BY_SCORE = {score: bloom for bloom, score in BLOOM.items()}
+_HIGH_BLOOM_SIGNAL = re.compile(
+    r"\b("
+    r"созда(е|ё|й|т|ть)|разработ|спроект|собир|постро|сгенерир|"
+    r"оцен|валидир|обоснов|выбер|защит"
+    r")",
+    re.IGNORECASE,
+)
+_ROUTINE_ACTION_SIGNAL = re.compile(
+    r"\b("
+    r"сформулир|формулир|определ|провед|настро|выяв|провер|"
+    r"использ|примен|опис|фиксир|состав"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _seniority_bloom_ceiling(spec: dict[str, object] | None) -> str | None:
+    seniority = str((spec or {}).get("seniority") or (spec or {}).get("target_seniority") or "").strip().casefold()
+    if not seniority:
+        return None
+    if seniority in config.UP_MAX_BLOOM_BY_SENIORITY:
+        return config.UP_MAX_BLOOM_BY_SENIORITY[seniority]
+    for key, ceiling in config.UP_MAX_BLOOM_BY_SENIORITY.items():
+        if key and key in seniority:
+            return ceiling
+    return None
+
+
+def _clamp_bloom_for_audience(level: str, spec: dict[str, object] | None, text: str | None = None) -> str:
+    ceiling = _seniority_bloom_ceiling(spec)
+    if not ceiling or ceiling not in BLOOM or BLOOM[level] <= BLOOM[ceiling]:
+        return level
+    source_text = text or ""
+    has_high_signal = bool(_HIGH_BLOOM_SIGNAL.search(source_text))
+    has_routine_signal = bool(_ROUTINE_ACTION_SIGNAL.search(source_text))
+    if not has_high_signal or has_routine_signal:
+        return _BLOOM_BY_SCORE[BLOOM[ceiling]]
+    return level
+
+
+def normalize_bloom(value: str | None, spec: dict[str, object] | None = None, text: str | None = None) -> str:
     mapping = {
         "remember": "remember",
         "recall": "remember",
@@ -41,7 +89,8 @@ def normalize_bloom(value: str | None) -> str:
         "создаёт": "create",
     }
     key = (value or "understand").strip().casefold()
-    return mapping.get(key, "understand")
+    normalized = mapping.get(key, "understand")
+    return _clamp_bloom_for_audience(normalized, spec, text)
 
 
 def _normalized_spec(raw: dict[str, object]) -> dict[str, object]:
@@ -72,7 +121,7 @@ def _normalized_spec(raw: dict[str, object]) -> dict[str, object]:
         "domain": domain,
         "operator_role": operator_role,
         "program_goal": program_goal,
-        "must_include_areas": must_include_areas,
+        "must_include_areas": [language.localize_area_label(area) for area in must_include_areas],
         "sub_queries": sub_queries,
     }
 
@@ -175,6 +224,7 @@ def _build_coverage_audit(
     spec: dict[str, object],
     cands: list[SkillCandidate],
     coverage_rows: list[dict[str, object]] | None = None,
+    compaction_events: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     # Coverage нужен как продуктовый сигнал: видно, какие обязательные области закрыты, а какие выпали.
     areas = [str(item).strip() for item in spec.get("must_include_areas") or [] if str(item).strip()]
@@ -192,6 +242,17 @@ def _build_coverage_audit(
             "rationale": str(row.get("rationale") or "").strip(),
             "candidate_names": [str(name).strip() for name in row.get("candidate_names") or [] if str(name).strip()],
         }
+    dropped_by_area: dict[str, list[str]] = {}
+    cap_reason_by_area: dict[str, str] = {}
+    for event in compaction_events or []:
+        area = str(event.get("coverage_area") or "").strip()
+        reason = str(event.get("reason") or "").strip()
+        dropped_names = [str(name).strip() for name in event.get("dropped_names") or [] if str(name).strip()]
+        if not area or not dropped_names:
+            continue
+        dropped_by_area.setdefault(area, []).extend(dropped_names)
+        if reason.startswith("program_brief_area_cap"):
+            cap_reason_by_area[area] = reason
 
     audit_rows: list[dict[str, object]] = []
     covered_count = 0
@@ -219,6 +280,14 @@ def _build_coverage_audit(
             candidate_names = coverage_index[area]["candidate_names"] or candidate_names
             rationale = coverage_index[area]["rationale"] or rationale
 
+        dropped_names = list(dict.fromkeys(dropped_by_area.get(area, [])))
+        if dropped_names and area in cap_reason_by_area and status == "covered":
+            status = "partial"
+            rationale = (
+                f"Область покрыта не полностью: часть кандидатов скрыта правилом {cap_reason_by_area[area]}. "
+                "Нужно проверить, не являются ли они важными поднавыками."
+            )
+
         if status == "covered":
             covered_count += 1
         elif status == "partial":
@@ -231,6 +300,7 @@ def _build_coverage_audit(
                 "area": area,
                 "status": status,
                 "candidate_names": candidate_names,
+                "dropped_candidate_names": dropped_names,
                 "rationale": rationale,
             }
         )
@@ -247,8 +317,12 @@ def build_coverage_audit(
     spec: dict[str, object],
     cands: list[SkillCandidate],
     coverage_rows: list[dict[str, object]] | None = None,
+    normalize_report: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    return _build_coverage_audit(spec, cands, coverage_rows)
+    compaction_events = []
+    if isinstance(normalize_report, dict) and isinstance(normalize_report.get("compaction_events"), list):
+        compaction_events = normalize_report["compaction_events"]
+    return _build_coverage_audit(spec, cands, coverage_rows, compaction_events)
 
 
 # --------- decompose ---------
@@ -460,6 +534,18 @@ def _candidate_source_text(candidate: SkillCandidate) -> str:
     return " ".join(part for part in parts if part)
 
 
+def _localize_candidate(candidate: SkillCandidate) -> SkillCandidate:
+    """Normalize catalog-facing labels to Russian without touching technical terms."""
+    localized_name = language.localize_skill_label(candidate.name)
+    if localized_name and localized_name != candidate.name:
+        candidate.source_name = candidate.source_name or candidate.name
+        candidate.name = localized_name
+    candidate.group = language.localize_group_label(candidate.group) or candidate.group
+    if candidate.coverage_area:
+        candidate.coverage_area = language.localize_area_label(candidate.coverage_area) or candidate.coverage_area
+    return candidate
+
+
 def synthesize_draft_from_brief(brief: str, spec: dict) -> tuple[list[SkillCandidate], dict[str, object] | None]:
     """Генерирует первичный shortlist из самого брифа без внешнего поиска.
 
@@ -479,6 +565,8 @@ def synthesize_draft_from_brief(brief: str, spec: dict) -> tuple[list[SkillCandi
         if str(spec.get("artifact_type") or "").strip() in {"program_brief", "mixed"}:
             sys = (
                 "Ты строишь первичный skill portrait выпускника образовательной программы только по тексту брифа, без внешнего поиска. "
+                + RUSSIAN_OUTPUT_RULE
+                + " "
                 "Работай coverage-first по must_include_areas. "
                 "Верни только строгий JSON вида "
                 "{coverage:[{area,status,rationale,candidate_names}],"
@@ -491,6 +579,8 @@ def synthesize_draft_from_brief(brief: str, spec: dict) -> tuple[list[SkillCandi
         else:
             sys = (
                 "Ты строишь первичный skill portrait обучаемого только по тексту брифа, без внешнего поиска. "
+                + RUSSIAN_OUTPUT_RULE
+                + " "
                 "Верни строгий JSON {candidates:[{name,group,coverage_area,indicators:[{text,bloom}],tools}]}. "
                 "Извлекай только learner-skills и graduate outcomes. Название формулируй как skill/action."
             )
@@ -507,19 +597,23 @@ def synthesize_draft_from_brief(brief: str, spec: dict) -> tuple[list[SkillCandi
             name = str(it.get("name") or "").strip()
             if not name:
                 continue
-            out.append(SkillCandidate(
-                tmp_id=f"C{i:02d}",
-                name=name,
-                group=str(it.get("group") or "").strip(),
-                coverage_area=str(it.get("coverage_area") or "").strip() or None,
-                indicators=[
-                    IndicatorSpec(text=ind["text"], bloom=normalize_bloom(ind.get("bloom")))
-                    for ind in it.get("indicators", [])
-                    if ind.get("text")
-                ],
-                tools=[str(tool).strip() for tool in it.get("tools", []) if str(tool).strip()],
-                evidence_ids=[],
-            ))
+            out.append(
+                _localize_candidate(
+                    SkillCandidate(
+                        tmp_id=f"C{i:02d}",
+                        name=name,
+                        group=str(it.get("group") or "").strip(),
+                        coverage_area=str(it.get("coverage_area") or "").strip() or None,
+                        indicators=[
+                            IndicatorSpec(text=ind["text"], bloom=normalize_bloom(ind.get("bloom"), spec, ind.get("text")))
+                            for ind in it.get("indicators", [])
+                            if ind.get("text")
+                        ],
+                        tools=[str(tool).strip() for tool in it.get("tools", []) if str(tool).strip()],
+                        evidence_ids=[],
+                    )
+                )
+            )
         return out, _build_coverage_audit(spec, out, data.get("coverage"))
 
     # Offline/mock режим: сохраняем существующие демо-кандидаты, но без обязательного evidence.
@@ -529,15 +623,19 @@ def synthesize_draft_from_brief(brief: str, spec: dict) -> tuple[list[SkillCandi
     areas = [str(area).strip() for area in spec.get("must_include_areas") or [] if str(area).strip()]
     fallback: list[SkillCandidate] = []
     for i, area in enumerate(areas[:8], 1):
-        fallback.append(SkillCandidate(
-            tmp_id=f"C{i:02d}",
-            name=area,
-            group=str(spec.get("domain") or ""),
-            coverage_area=area,
-            indicators=[IndicatorSpec(text=f"Применяет навык в области: {area}", bloom="apply")],
-            tools=[],
-            evidence_ids=[],
-        ))
+        fallback.append(
+            _localize_candidate(
+                SkillCandidate(
+                    tmp_id=f"C{i:02d}",
+                    name=area,
+                    group=str(spec.get("domain") or ""),
+                    coverage_area=area,
+                    indicators=[IndicatorSpec(text=f"Применяет навык в области: {area}", bloom="apply")],
+                    tools=[],
+                    evidence_ids=[],
+                )
+            )
+        )
     return fallback, _build_coverage_audit(spec, fallback)
 
 
@@ -618,6 +716,8 @@ def synthesize_with_coverage(evidence: list[Evidence], spec: dict) -> tuple[list
         if str(spec.get("artifact_type") or "").strip() in {"program_brief", "mixed"}:
             sys = (
                 "Ты строишь skill portrait выпускника образовательной программы. "
+                + RUSSIAN_OUTPUT_RULE
+                + " "
                 "Работай coverage-first: сначала посмотри на must_include_areas, затем попытайся закрыть их evidence. "
                 "Верни только строгий JSON вида "
                 "{coverage:[{area,status,rationale,candidate_names,evidence_ids}],"
@@ -635,6 +735,8 @@ def synthesize_with_coverage(evidence: list[Evidence], spec: dict) -> tuple[list
         else:
             sys = (
                 "Сгруппируй evidence в навыки-кандидаты выпускника. "
+                + RUSSIAN_OUTPUT_RULE
+                + " "
                 "Строгий JSON {candidates:[{name,group,indicators:[{text,bloom}],tools,evidence_ids}]}. "
                 "evidence_ids только из предоставленных. Навык без evidence не включай. "
                 "Важное правило: извлекай только learner-skills и graduate outcomes. "
@@ -653,19 +755,23 @@ def synthesize_with_coverage(evidence: list[Evidence], spec: dict) -> tuple[list
             ids = [x for x in it.get("evidence_ids", []) if x in ev_ids]
             if not ids:
                 continue
-            out.append(SkillCandidate(
-                tmp_id=f"C{i:02d}",
-                name=it["name"],
-                group=it.get("group", ""),
-                coverage_area=str(it.get("coverage_area") or "").strip() or None,
-                indicators=[
-                    IndicatorSpec(text=ind["text"], bloom=normalize_bloom(ind.get("bloom")))
-                    for ind in it.get("indicators", [])
-                    if ind.get("text")
-                ],
-                tools=it.get("tools", []),
-                evidence_ids=ids,
-            ))
+            out.append(
+                _localize_candidate(
+                    SkillCandidate(
+                        tmp_id=f"C{i:02d}",
+                        name=it["name"],
+                        group=it.get("group", ""),
+                        coverage_area=str(it.get("coverage_area") or "").strip() or None,
+                        indicators=[
+                            IndicatorSpec(text=ind["text"], bloom=normalize_bloom(ind.get("bloom"), spec, ind.get("text")))
+                            for ind in it.get("indicators", [])
+                            if ind.get("text")
+                        ],
+                        tools=it.get("tools", []),
+                        evidence_ids=ids,
+                    )
+                )
+            )
         coverage = _build_coverage_audit(spec, out, data.get("coverage"))
         return out, coverage
     # MOCK: реалистичные кандидаты под бриф (резолв пойдёт против реального каталога)
@@ -688,14 +794,16 @@ def synthesize_with_coverage(evidence: list[Evidence], spec: dict) -> tuple[list
         out = []
         for i, (name, grp, area, inds, tools) in enumerate(proto, 1):
             out.append(
-                SkillCandidate(
-                    tmp_id=f"C{i:02d}",
-                    name=name,
-                    group=grp,
-                    coverage_area=area,
-                    indicators=[IndicatorSpec(text=text, bloom=bloom) for text, bloom in inds],
-                    tools=tools,
-                    evidence_ids=ev_ids[:2] or ev_ids[:1],
+                _localize_candidate(
+                    SkillCandidate(
+                        tmp_id=f"C{i:02d}",
+                        name=name,
+                        group=grp,
+                        coverage_area=area,
+                        indicators=[IndicatorSpec(text=text, bloom=bloom) for text, bloom in inds],
+                        tools=tools,
+                        evidence_ids=ev_ids[:2] or ev_ids[:1],
+                    )
                 )
             )
         return out, _build_coverage_audit(spec, out)
@@ -715,8 +823,18 @@ def synthesize_with_coverage(evidence: list[Evidence], spec: dict) -> tuple[list
         ids = by_kw(*kw)
         if not ids:
             continue
-        out.append(SkillCandidate(tmp_id=f"C{i:02d}", name=name, group=grp,
-            indicators=[IndicatorSpec(text=t, bloom=b) for t, b in inds], tools=tools, evidence_ids=ids))
+        out.append(
+            _localize_candidate(
+                SkillCandidate(
+                    tmp_id=f"C{i:02d}",
+                    name=name,
+                    group=grp,
+                    indicators=[IndicatorSpec(text=t, bloom=b) for t, b in inds],
+                    tools=tools,
+                    evidence_ids=ids,
+                )
+            )
+        )
     return out, _build_coverage_audit(spec, out)
 
 
@@ -760,7 +878,20 @@ def _is_for_resolve(cand: SkillCandidate) -> bool:
 def atomize_candidates(cands: list[SkillCandidate], spec: dict | None = None) -> list[SkillCandidate]:
     if spec:
         _reclassify_program_artifacts(cands, spec)
-    return stage_atomize.run(cands)
+    atomized = stage_atomize.run(cands)
+    for candidate in atomized:
+        _localize_candidate(candidate)
+        if candidate.entity_type == "skill":
+            canonical_name = canonicalize_skill_name(candidate.name)
+            if canonical_name and canonical_name != candidate.name:
+                candidate.source_name = candidate.source_name or candidate.name
+                candidate.name = canonical_name
+        if spec:
+            candidate.indicators = [
+                IndicatorSpec(text=indicator.text, bloom=normalize_bloom(indicator.bloom, spec, indicator.text))
+                for indicator in candidate.indicators
+            ]
+    return atomized
 
 
 def resolve_candidates(cands: list[SkillCandidate], evidence: list[Evidence], repo: CatalogRepo) -> None:
@@ -828,6 +959,8 @@ def triage_candidates(cands: list[SkillCandidate], spec: dict[str, object] | Non
             c.decision = "accepted"
             c.reasons = ["auto_accept_policy"]
             continue
+        if c.resolution in {"matched", "alias"}:
+            r = [reason for reason in r if reason not in {"novel_skill", "single_source", "fuzzy_match_ambiguous"}]
         c.decision = "accepted" if not r else "needs_review"
         c.reasons = r
 

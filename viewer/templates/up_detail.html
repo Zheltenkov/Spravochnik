@@ -9,15 +9,20 @@
         </div>
     </div>
     <div class="review-actions">
-        <span class="status-badge{% if plan.status == 'deferred' %} warn{% endif %}">{{ plan.status_label }}</span>
+        <span class="status-badge{% if plan.status != 'built' and plan.status != 'draft' %} warn{% endif %}">{{ plan.status_label }}</span>
         {% if plan.latest_job_id %}
         <a class="action-btn action-btn-secondary" href="/intake/jobs/{{ plan.latest_job_id }}">Открыть бриф</a>
         {% endif %}
-        {% if plan.row_count %}
+        {% if plan.row_count and plan.status != 'invalid' %}
         <a class="action-btn action-btn-primary" href="/up/plans/{{ plan.id }}/csv">Скачать CSV</a>
+        {% elif plan.row_count %}
+        <span class="action-btn action-btn-light disabled">CSV заблокирован: УП невалиден</span>
         {% endif %}
         <form method="post" action="/up/plans/{{ plan.id }}/rows/new">
             <button type="submit" class="action-btn">Добавить строку</button>
+        </form>
+        <form method="post" action="/up/plans/{{ plan.id }}/delete" onsubmit="return confirm('Удалить этот УП полностью? Связанный справочник не будет затронут.');">
+            <button type="submit" class="action-btn action-btn-danger">Удалить УП</button>
         </form>
     </div>
 </section>
@@ -36,6 +41,18 @@
         УП пока не заполнен. Это нормально для `deferred`-состояния: либо ещё нет принятых skills, либо план нужно начать вручную.
         Можно сразу добавить первую строку и редактировать её в формате шаблона.
     </div>
+</section>
+{% endif %}
+
+{% if plan.report and (plan.report.order_violations or plan.report.project_violations) %}
+<section class="filter-panel">
+    <div class="small"><strong>УП не прошёл проверку DAG.</strong> Экспорт CSV заблокирован до исправления нарезки или графа.</div>
+    {% if plan.report.order_violations %}
+    <div class="small muted">Нарушения порядка: {{ plan.report.order_violations|join(", ") }}</div>
+    {% endif %}
+    {% if plan.report.project_violations %}
+    <div class="small muted">Рёбра внутри одного проекта: {{ plan.report.project_violations|join(", ") }}</div>
+    {% endif %}
 </section>
 {% endif %}
 

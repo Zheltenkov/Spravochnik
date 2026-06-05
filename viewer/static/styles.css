@@ -137,6 +137,14 @@ code {
     gap: 20px;
 }
 
+.page-shell-intake .summary-panel {
+    order: 0;
+}
+
+.page-shell-intake .content-panel {
+    min-width: 0;
+}
+
 .summary-card,
 .entity-card,
 .tree-card,
@@ -571,6 +579,20 @@ details[open] > summary .toggle-glyph::before {
     flex-wrap: wrap;
 }
 
+.job-status-summary .summary-card {
+    padding: 14px 18px;
+}
+
+.job-status-summary .summary-label {
+    font-size: 0.78rem;
+}
+
+.job-status-summary .summary-value {
+    font-size: 1.08rem;
+    line-height: 1.25;
+    font-weight: 620;
+}
+
 .workflow-stepper {
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -644,6 +666,16 @@ details[open] > summary .toggle-glyph::before {
 
 .primary-workspace {
     border-color: rgba(14, 143, 111, 0.24);
+}
+
+.primary-workspace .data-table th,
+.primary-workspace .data-table td {
+    padding: 10px 14px;
+    line-height: 1.35;
+}
+
+.primary-workspace .data-table td:first-child {
+    max-width: 300px;
 }
 
 .filter-panel {
@@ -904,6 +936,32 @@ details[open] > summary .toggle-glyph::before {
     transition: border-color 0.18s ease, background-color 0.18s ease, transform 0.18s ease;
 }
 
+.brief-compose-grid {
+    display: grid;
+    grid-template-columns: minmax(260px, 360px) minmax(0, 1fr);
+    gap: 18px;
+    align-items: stretch;
+}
+
+.brief-upload-panel {
+    display: grid;
+    align-content: start;
+    gap: 10px;
+    min-width: 0;
+}
+
+.brief-text-panel {
+    min-width: 0;
+}
+
+.brief-text-panel textarea {
+    min-height: 360px;
+}
+
+.intake-history-actions {
+    margin: 0 0 14px;
+}
+
 .upload-dropzone:hover,
 .upload-dropzone:focus-visible,
 .upload-dropzone.dragover {
@@ -933,14 +991,16 @@ details[open] > summary .toggle-glyph::before {
 
 .review-card {
     display: grid;
-    gap: 16px;
-    padding: 22px 24px;
+    grid-template-columns: minmax(0, 1fr) minmax(440px, 520px);
+    gap: 14px 18px;
+    padding: 16px 20px;
     background: var(--panel);
     border: 1px solid rgba(217, 207, 191, 0.9);
     border-radius: var(--radius);
 }
 
 .review-card-header {
+    grid-column: 1 / -1;
     display: flex;
     flex-wrap: wrap;
     gap: 10px;
@@ -949,8 +1009,9 @@ details[open] > summary .toggle-glyph::before {
 
 .review-card-grid {
     display: grid;
-    gap: 16px;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 10px 16px;
+    grid-template-columns: minmax(120px, 0.7fr) minmax(220px, 1.1fr) minmax(180px, 0.9fr);
+    min-width: 0;
 }
 
 .review-card-block {
@@ -968,11 +1029,11 @@ details[open] > summary .toggle-glyph::before {
 }
 
 .review-card-label {
-    font-size: 0.88rem;
-    font-weight: 700;
+    font-size: 0.78rem;
+    font-weight: 650;
     color: var(--ink-soft);
     text-transform: uppercase;
-    letter-spacing: 0.04em;
+    letter-spacing: 0.035em;
 }
 
 .review-card-value,
@@ -1026,11 +1087,12 @@ details[open] > summary .toggle-glyph::before {
 }
 
 .review-details-body {
+    max-width: 100%;
     white-space: pre-wrap;
     word-break: break-word;
     overflow-wrap: anywhere;
-    line-height: 1.55;
-    margin-bottom: 10px;
+    line-height: 1.38;
+    margin-bottom: 6px;
 }
 
 .review-form {
@@ -1040,7 +1102,7 @@ details[open] > summary .toggle-glyph::before {
 
 .review-form textarea {
     width: 100%;
-    min-height: 78px;
+    min-height: 64px;
     padding: 10px 12px;
     border: 1px solid var(--line);
     border-radius: 12px;
@@ -1049,10 +1111,31 @@ details[open] > summary .toggle-glyph::before {
     background: var(--panel-strong);
 }
 
+.review-list .decision-cell {
+    align-self: start;
+    width: 100%;
+    min-width: 0;
+    padding: 10px 12px;
+    border: 1px solid rgba(217, 207, 191, 0.72);
+    border-radius: 16px;
+    background: rgba(248, 244, 236, 0.58);
+}
+
 .review-actions {
     display: flex;
     flex-wrap: wrap;
     gap: 8px;
+}
+
+.review-list .review-actions {
+    flex-wrap: nowrap;
+}
+
+.review-list .review-actions .action-btn {
+    flex: 1 1 0;
+    padding-left: 10px;
+    padding-right: 10px;
+    white-space: nowrap;
 }
 
 .up-actions-cell {
@@ -1060,6 +1143,14 @@ details[open] > summary .toggle-glyph::before {
 }
 
 @media (max-width: 1180px) {
+    .review-card {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .review-list .review-actions {
+        flex-wrap: wrap;
+    }
+
     .review-card-grid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
     }
@@ -1077,6 +1168,14 @@ details[open] > summary .toggle-glyph::before {
     .review-card-block-wide,
     .review-card-block-full {
         grid-column: auto;
+    }
+
+    .brief-compose-grid {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .brief-text-panel textarea {
+        min-height: 300px;
     }
 }
 
@@ -1118,18 +1217,102 @@ details[open] > summary .toggle-glyph::before {
 }
 
 .candidate-action-cell {
-    min-width: 320px;
+    min-width: 72px;
+    width: 72px;
 }
 
 .candidate-action-form {
     display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
 }
 
 .candidate-action-form .action-btn {
-    flex: 1 1 150px;
     justify-content: center;
+    white-space: nowrap;
+}
+
+.candidate-action-form .action-btn-icon {
+    width: 42px;
+    min-width: 42px;
+    height: 36px;
+    padding: 0;
+    border-radius: 999px;
+    font-size: 18px;
+    line-height: 1;
+}
+
+.nearest-match {
+    max-width: 220px;
+    margin-top: 6px;
+    line-height: 1.3;
+}
+
+.nearest-match a {
+    color: var(--accent);
+    text-decoration: none;
+}
+
+.nearest-match a:hover {
+    text-decoration: underline;
+}
+
+.match-hint {
+    display: inline-flex;
+    align-items: center;
+    margin-top: 7px;
+    padding: 4px 9px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.match-hint-strong {
+    background: rgba(14, 143, 111, 0.12);
+    color: var(--accent);
+}
+
+.match-hint-medium {
+    background: rgba(217, 156, 73, 0.16);
+    color: #9a6420;
+}
+
+.match-hint-weak {
+    background: rgba(184, 92, 56, 0.14);
+    color: var(--warn);
+}
+
+.match-hint-neutral {
+    background: var(--panel-muted);
+    color: var(--muted);
+}
+
+.match-recommendation {
+    max-width: 260px;
+    margin-top: 6px;
+    line-height: 1.35;
+}
+
+.nearest-preview {
+    max-width: 280px;
+    margin-top: 8px;
+    font-size: 13px;
+}
+
+.nearest-preview summary {
+    cursor: pointer;
+    color: var(--accent);
+}
+
+.nearest-preview ul {
+    margin: 6px 0 0;
+    padding-left: 16px;
+}
+
+.nearest-preview li {
+    margin-bottom: 4px;
+    line-height: 1.35;
 }
 
 .archive-section {

@@ -5,6 +5,9 @@
         <h1>Учебные планы</h1>
         <p>Отдельный реестр УП. Здесь можно открыть черновик, вручную доработать строки и скачать итоговый CSV в формате шаблона.</p>
     </div>
+    <form method="post" action="/up/cleanup-empty" onsubmit="return confirm('Удалить пустые и отложенные черновики УП?');">
+        <button type="submit" class="action-btn action-btn-danger">Очистить пустые черновики</button>
+    </form>
 </section>
 
 {% if plans %}
@@ -32,7 +35,7 @@
                     <div class="small muted">{{ plan.brief_domain or "—" }}</div>
                 </td>
                 <td>
-                    <span class="status-badge{% if plan.status == 'deferred' %} warn{% endif %}">
+                    <span class="status-badge{% if plan.status != 'built' and plan.status != 'draft' %} warn{% endif %}">
                         {{ plan.status_label }}
                     </span>
                 </td>
@@ -43,13 +46,20 @@
                 <td>{{ plan.updated_at }}</td>
                 <td>
                     <div class="review-actions">
+                        {% if plan.status != 'invalid' %}
                         <a class="action-btn action-btn-primary" href="/up/plans/{{ plan.id }}">Открыть УП</a>
+                        {% else %}
+                        <span class="action-btn action-btn-light disabled">Невалиден</span>
+                        {% endif %}
                         {% if plan.latest_job_id %}
                         <a class="action-btn action-btn-secondary" href="/intake/jobs/{{ plan.latest_job_id }}">Открыть бриф</a>
                         {% endif %}
-                        {% if plan.total_projects %}
+                        {% if plan.total_projects and plan.status != 'invalid' %}
                         <a class="action-btn action-btn-secondary" href="/up/plans/{{ plan.id }}/csv">CSV</a>
                         {% endif %}
+                        <form method="post" action="/up/plans/{{ plan.id }}/delete" onsubmit="return confirm('Удалить этот УП? Связанный справочник не будет затронут.');">
+                            <button type="submit" class="action-btn action-btn-danger">Удалить</button>
+                        </form>
                     </div>
                 </td>
             </tr>

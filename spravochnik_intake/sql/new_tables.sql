@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS skill_suggestion (
     id            INTEGER PRIMARY KEY,
     brief_id      INTEGER REFERENCES profile_brief(id) ON DELETE CASCADE,
     suggested_name TEXT NOT NULL,
+    source_name   TEXT,
     group_name    TEXT,
     coverage_area TEXT,
     bloom         TEXT,
@@ -48,6 +49,10 @@ CREATE TABLE IF NOT EXISTS skill_suggestion (
     tools         TEXT,                 -- JSON-список
     resolution    TEXT CHECK (resolution IN ('matched','alias','fuzzy','new')),
     canonical_skill_id INTEGER REFERENCES skill(id) ON DELETE SET NULL,
+    match_score   REAL,
+    nearest_skill_id INTEGER REFERENCES skill(id) ON DELETE SET NULL,
+    nearest_name  TEXT,
+    nearest_group TEXT,
     confidence    REAL,
     council_agreement REAL,
     evidence_ids  TEXT,                 -- JSON-список id из evidence_source
@@ -101,7 +106,7 @@ CREATE TABLE IF NOT EXISTS curriculum_plan (
     id            INTEGER PRIMARY KEY,
     brief_id      INTEGER REFERENCES profile_brief(id) ON DELETE CASCADE,
     source_policy TEXT NOT NULL DEFAULT 'accepted_only',
-    status        TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','built','deferred')),
+    status        TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','built','deferred','invalid')),
     title         TEXT,
     audience_level TEXT,
     total_blocks  INTEGER NOT NULL DEFAULT 0,

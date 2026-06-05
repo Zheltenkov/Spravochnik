@@ -26,6 +26,7 @@ class Evidence(BaseModel):
 class SkillCandidate(BaseModel):
     tmp_id: str
     name: str
+    source_name: Optional[str] = None
     group: str
     coverage_area: Optional[str] = None
     indicators: list[IndicatorSpec]
@@ -43,6 +44,9 @@ class SkillCandidate(BaseModel):
     canonical_name: Optional[str] = None
     canonical_group: Optional[str] = None
     match_score: Optional[float] = None
+    nearest_skill_id: Optional[int] = None
+    nearest_name: Optional[str] = None
+    nearest_group: Optional[str] = None
     # жюри/триаж:
     council_agreement: Optional[float] = None
     council_ran: bool = False

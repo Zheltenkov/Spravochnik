@@ -14,9 +14,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from spravochnik_intake.pipeline import config, storage
+from spravochnik_intake.pipeline import config, stage_atomize, stage_brief_to_catalog, stage_dag_to_up, storage
 from spravochnik_intake.pipeline.catalog_repo import CatalogRepo
 from spravochnik_intake.pipeline.models import IndicatorSpec, SkillCandidate
+from spravochnik_intake.pipeline.skill_names import canonicalize_skill_name
 from viewer.app import (
     apply_candidate_decision,
     build_dag_for_brief,
@@ -144,6 +145,38 @@ def test_accept_promotes_skill_and_alias(monkeypatch: pytest.MonkeyPatch) -> Non
         db_path.unlink(missing_ok=True)
 
 
+def test_accept_promotes_neutral_name_and_original_alias(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "USE_LIVE", False)
+    db_path = _runtime_db_path("neutral")
+    conn = _create_base_catalog_db(db_path)
+    try:
+        brief_id = storage.save_brief(conn, "brief", {"role": "роль", "seniority": "junior", "domain": "домен"})
+        candidate = _candidate("Формулирование ценностного предложения")
+        candidate.source_name = "Сформулировать ценностное предложение"
+        suggestion_id = storage.save_suggestions(conn, brief_id, [candidate], {})["tmp-Формулирование ценностного предложения"]
+
+        apply_candidate_decision(conn, suggestion_id, "accepted", "accepted in test")
+
+        suggestion = conn.execute(
+            "SELECT canonical_skill_id FROM skill_suggestion WHERE id = ?",
+            (suggestion_id,),
+        ).fetchone()
+        skill = conn.execute("SELECT canonical_name FROM skill WHERE id = ?", (suggestion["canonical_skill_id"],)).fetchone()
+        aliases = [
+            row["alias"]
+            for row in conn.execute(
+                "SELECT alias FROM skill_alias WHERE skill_id = ? ORDER BY alias",
+                (suggestion["canonical_skill_id"],),
+            )
+        ]
+
+        assert skill["canonical_name"] == "Формулирование ценностного предложения"
+        assert "Сформулировать ценностное предложение" in aliases
+    finally:
+        conn.close()
+        db_path.unlink(missing_ok=True)
+
+
 def test_merge_moves_aliases_indicators_and_archives_source() -> None:
     db_path = _runtime_db_path("merge")
     conn = _create_base_catalog_db(db_path)
@@ -187,6 +220,224 @@ def test_dag_rebuild_persists_edges_and_curriculum(monkeypatch: pytest.MonkeyPat
     finally:
         conn.close()
         db_path.unlink(missing_ok=True)
+
+
+def test_up_planner_keeps_direct_edges_out_of_same_project() -> None:
+    candidates = [
+        _candidate("A base", group="theme", bloom="apply", decision="accepted"),
+        _candidate("B depends", group="theme", bloom="apply", decision="accepted"),
+        _candidate("C independent", group="theme", bloom="apply", decision="accepted"),
+    ]
+    candidates[0].tmp_id = "A"
+    candidates[1].tmp_id = "B"
+    candidates[2].tmp_id = "C"
+    dag_payload = {
+        "order": [{"id": "A"}, {"id": "B"}, {"id": "C"}],
+        "final_edges": [
+            {
+                "src_id": "A",
+                "dst_id": "B",
+                "src": "A base",
+                "dst": "B depends",
+                "relation_type": "hard",
+                "confidence": 0.9,
+            }
+        ],
+    }
+
+    plan = stage_dag_to_up.run({"role": "tester", "seniority": "junior"}, candidates, dag_payload)
+
+    assert plan["status"] == "built"
+    assert plan["report"]["order_violations"] == []
+    assert plan["report"]["project_violations"] == []
+    assert not any({"A", "B"}.issubset(set(row["node_ids"])) for row in plan["rows"])
+
+
+def test_up_planner_marks_inconsistent_topological_order_invalid() -> None:
+    candidates = [
+        _candidate("A base", group="theme", bloom="apply", decision="accepted"),
+        _candidate("B depends", group="theme", bloom="apply", decision="accepted"),
+    ]
+    candidates[0].tmp_id = "A"
+    candidates[1].tmp_id = "B"
+    dag_payload = {
+        "order": [{"id": "B"}, {"id": "A"}],
+        "final_edges": [
+            {
+                "src_id": "A",
+                "dst_id": "B",
+                "src": "A base",
+                "dst": "B depends",
+                "relation_type": "hard",
+                "confidence": 0.9,
+            }
+        ],
+    }
+
+    plan = stage_dag_to_up.run({"role": "tester", "seniority": "junior"}, candidates, dag_payload)
+
+    assert plan["status"] == "invalid"
+    assert plan["report"]["order_violations"] == ["A base -> B depends"]
+
+
+def test_up_planner_builds_integrative_projects_and_quality_metrics(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "UP_SPIRAL_ENABLED", True)
+    monkeypatch.setattr(config, "UP_MAX_SKILLS_PER_PROJECT", 4)
+    monkeypatch.setattr(config, "UP_TARGET_OUTCOMES_MIN", 3)
+    candidates = [
+        _candidate("A discovery", group="theme", bloom="apply", decision="accepted"),
+        _candidate("B interview", group="theme", bloom="apply", decision="accepted"),
+        _candidate("C map", group="theme", bloom="analyze", decision="accepted"),
+    ]
+    for index, candidate in enumerate(candidates, start=1):
+        candidate.tmp_id = f"S{index}"
+    dag_payload = {
+        "order": [{"id": "S1"}, {"id": "S2"}, {"id": "S3"}],
+        "final_edges": [],
+    }
+
+    plan = stage_dag_to_up.run({"role": "tester", "seniority": "junior"}, candidates, dag_payload)
+
+    assert plan["status"] == "built"
+    assert plan["rows"][0]["node_ids"] == ["S1", "S2", "S3"]
+    assert plan["rows"][0]["outcome_count"] >= 3
+    assert plan["report"]["quality_metrics"]["avg_skills_per_project"] == 3.0
+    assert plan["report"]["quality_metrics"]["single_skill_project_count"] == 0
+
+
+def test_up_planner_localizes_groups_and_keeps_block_titles_compact(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "UP_MAX_SKILLS_PER_PROJECT", 4)
+    candidates = [
+        _candidate("Identify jurisdictional requirements", group="Legal & admin", bloom="apply", decision="accepted"),
+        _candidate("Prepare basic legal documents", group="Legal & admin", bloom="apply", decision="accepted"),
+    ]
+    for index, candidate in enumerate(candidates, start=1):
+        candidate.tmp_id = f"S{index}"
+    dag_payload = {
+        "order": [{"id": "S1"}, {"id": "S2"}],
+        "final_edges": [],
+    }
+
+    plan = stage_dag_to_up.run({"role": "tester", "seniority": "junior"}, candidates, dag_payload)
+
+    assert plan["status"] == "built"
+    assert "Право и администрирование" in plan["rows"][0]["block_title"]
+    assert "Legal" not in plan["rows"][0]["block_title"]
+    assert len(plan["rows"][0]["block_title"]) <= 80
+    assert "Подготовка базовых юридических документов" in plan["rows"][0]["project_name"]
+
+
+def test_up_planner_allows_soft_edges_inside_integrative_project(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "UP_MAX_SKILLS_PER_PROJECT", 4)
+    candidates = [
+        _candidate("A base", group="theme", bloom="apply", decision="accepted"),
+        _candidate("B follows", group="theme", bloom="apply", decision="accepted"),
+    ]
+    candidates[0].tmp_id = "A"
+    candidates[1].tmp_id = "B"
+    dag_payload = {
+        "order": [{"id": "A"}, {"id": "B"}],
+        "final_edges": [
+            {
+                "src_id": "A",
+                "dst_id": "B",
+                "src": "A base",
+                "dst": "B follows",
+                "relation_type": "soft",
+                "confidence": 0.95,
+            }
+        ],
+    }
+
+    plan = stage_dag_to_up.run({"role": "tester", "seniority": "junior"}, candidates, dag_payload)
+
+    assert plan["status"] == "built"
+    assert any({"A", "B"}.issubset(set(row["node_ids"])) for row in plan["rows"])
+    assert plan["report"]["project_violations"] == []
+
+
+def test_up_planner_adds_spiral_thread_occurrence(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "UP_SPIRAL_ENABLED", True)
+    monkeypatch.setattr(config, "UP_MAX_SKILLS_PER_PROJECT", 4)
+    monkeypatch.setattr(config, "UP_MIN_THREAD_OCCURRENCES", 2)
+    monkeypatch.setattr(config, "UP_MAX_THREAD_OCCURRENCES", 2)
+    monkeypatch.setattr(config, "UP_SPIRAL_MIN_GAP", 2)
+    candidates = [
+        _candidate("A core", group="theme", bloom="apply", decision="accepted"),
+        _candidate("B depends", group="theme", bloom="apply", decision="accepted"),
+        _candidate("C independent", group="theme", bloom="apply", decision="accepted"),
+        _candidate("D independent", group="theme", bloom="apply", decision="accepted"),
+        _candidate("E independent", group="theme", bloom="apply", decision="accepted"),
+        _candidate("F late", group="theme", bloom="analyze", decision="accepted"),
+    ]
+    for index, candidate in enumerate(candidates, start=1):
+        candidate.tmp_id = f"S{index}"
+    dag_payload = {
+        "order": [{"id": f"S{index}"} for index in range(1, 7)],
+        "final_edges": [
+            {
+                "src_id": "S1",
+                "dst_id": "S2",
+                "src": "A core",
+                "dst": "B depends",
+                "relation_type": "hard",
+                "confidence": 0.9,
+            }
+        ],
+    }
+
+    plan = stage_dag_to_up.run({"role": "tester", "seniority": "junior"}, candidates, dag_payload)
+
+    assert plan["status"] == "built"
+    assert plan["report"]["quality_metrics"]["repeated_thread_count"] >= 1
+    assert any("контроль/владение" in row["skills_list"] or "закрепление" in row["skills_list"] for row in plan["rows"])
+    assert plan["report"]["project_violations"] == []
+
+
+def test_intro_bloom_create_is_clamped_without_explicit_signal() -> None:
+    seniority = "\u043d\u0430\u0447\u0438\u043d\u0430\u044e\u0449\u0438\u0439"
+    routine = "\u0424\u043e\u0440\u043c\u0443\u043b\u0438\u0440\u0443\u0435\u0442 A/B \u0433\u0438\u043f\u043e\u0442\u0435\u0437\u044b"
+    explicit = "\u0421\u043e\u0437\u0434\u0430\u0451\u0442 \u043f\u0440\u043e\u0442\u043e\u0442\u0438\u043f \u043f\u0440\u043e\u0434\u0443\u043a\u0442\u0430"
+
+    assert stage_brief_to_catalog.normalize_bloom("create", {"seniority": seniority}, routine) == "analyze"
+    assert stage_brief_to_catalog.normalize_bloom("create", {"seniority": seniority}, explicit) == "create"
+
+
+def test_triage_does_not_mark_matched_skill_as_novel() -> None:
+    candidate = _candidate("Existing skill", decision="needs_review")
+    candidate.resolution = "matched"
+    candidate.match_score = 100.0
+    candidate.confidence = 0.98
+    candidate.evidence_ids = []
+
+    stage_brief_to_catalog.triage_candidates([candidate], {"artifact_type": "program_brief"})
+
+    assert "novel_skill" not in candidate.reasons
+    assert "single_source" not in candidate.reasons
+
+
+def test_atomize_batches_live_suspicious_candidates(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "USE_LIVE", True)
+    calls: list[list[str]] = []
+
+    def fake_batch(cands: list[SkillCandidate]) -> dict[str, dict[str, object]]:
+        calls.append([cand.tmp_id for cand in cands])
+        return {cand.tmp_id: {"verdict": "atomic", "rationale": "batch"} for cand in cands}
+
+    def fail_single(_cand: SkillCandidate) -> dict[str, object]:
+        raise AssertionError("single atomize call should not be used when batch returns all decisions")
+
+    monkeypatch.setattr(stage_atomize, "_call_live_batch", fake_batch)
+    monkeypatch.setattr(stage_atomize, "_call_live", fail_single)
+    candidates = [
+        _candidate("Очень длинная формулировка навыка для проверки атомизации", decision="needs_review"),
+        _candidate("Ещё одна длинная формулировка навыка для атомизации", decision="needs_review"),
+    ]
+
+    result = stage_atomize.run(candidates)
+
+    assert calls == [[candidates[0].tmp_id, candidates[1].tmp_id]]
+    assert [candidate.atomicity for candidate in result] == ["atomic", "atomic"]
 
 
 def test_curriculum_csv_writes_a_to_v_and_keeps_o_to_v_empty() -> None:
@@ -290,6 +541,72 @@ def test_catalog_accumulation_resolves_promoted_skill_as_match(monkeypatch: pyte
 
         assert candidate.resolution == "matched"
         assert candidate.canonical_skill_id is not None
+    finally:
+        conn.close()
+        db_path.unlink(missing_ok=True)
+
+
+def test_link_suggestion_to_nearest_uses_existing_skill(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "USE_LIVE", False)
+    db_path = _runtime_db_path("nearest-link")
+    conn = _create_base_catalog_db(db_path)
+    try:
+        group_id = ensure_catalog_group(conn, "research", "Research", 1)
+        existing_skill_id = create_catalog_skill(conn, group_id, "Проведение клиентского интервью", 1, "", "", "manual", "", 1)
+        brief_id = storage.save_brief(conn, "brief", {"role": "роль", "seniority": "junior", "domain": "домен"})
+        candidate = _candidate("Проведение клиентские интервью", decision="needs_review")
+        candidate.nearest_skill_id = existing_skill_id
+        candidate.nearest_name = "Проведение клиентского интервью"
+        candidate.match_score = 82.0
+        suggestion_id = storage.save_suggestions(conn, brief_id, [candidate], {})["tmp-Проведение клиентские интервью"]
+        before_skill_count = conn.execute("SELECT COUNT(*) FROM skill").fetchone()[0]
+
+        link_result = storage.link_suggestion_to_nearest(conn, suggestion_id)
+        apply_candidate_decision(conn, suggestion_id, "accepted", "linked in test")
+
+        after_skill_count = conn.execute("SELECT COUNT(*) FROM skill").fetchone()[0]
+        suggestion = conn.execute("SELECT decision, resolution, canonical_skill_id FROM skill_suggestion WHERE id = ?", (suggestion_id,)).fetchone()
+        alias = conn.execute(
+            "SELECT alias FROM skill_alias WHERE skill_id = ? AND alias = ?",
+            (existing_skill_id, "Проведение клиентские интервью"),
+        ).fetchone()
+
+        assert link_result["status"] == "linked"
+        assert before_skill_count == after_skill_count
+        assert suggestion["decision"] == "accepted"
+        assert suggestion["resolution"] == "alias"
+        assert suggestion["canonical_skill_id"] == existing_skill_id
+        assert alias is not None
+    finally:
+        conn.close()
+        db_path.unlink(missing_ok=True)
+
+
+def test_skill_name_canonicalization_and_resolve_source_alias(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "USE_LIVE", False)
+    assert canonicalize_skill_name("Сформулировать ценностное предложение") == "Формулирование ценностного предложения"
+    assert canonicalize_skill_name("Провести глубинное интервью") == "Проведение глубинных интервью"
+
+    db_path = _runtime_db_path("source-resolve")
+    conn = _create_base_catalog_db(db_path)
+    try:
+        brief_id = storage.save_brief(conn, "brief", {"role": "роль", "seniority": "junior", "domain": "домен"})
+        original = _candidate("Провести глубинное интервью", decision="needs_review")
+        suggestion_id = storage.save_suggestions(conn, brief_id, [original], {})["tmp-Провести глубинное интервью"]
+        apply_candidate_decision(conn, suggestion_id, "accepted", "accepted")
+
+        repo = CatalogRepo(str(db_path))
+        try:
+            candidate = _candidate("Проведение глубинных интервью")
+            candidate.source_name = "Провести глубинное интервью"
+            candidate.resolution = None
+            repo.resolve(candidate)
+        finally:
+            repo.close()
+
+        assert candidate.resolution in {"matched", "alias"}
+        assert candidate.canonical_skill_id is not None
+        assert candidate.match_score == 100.0
     finally:
         conn.close()
         db_path.unlink(missing_ok=True)

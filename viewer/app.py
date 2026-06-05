@@ -67,7 +67,7 @@ REVIEW_REASON_LABELS = {
     "base_text_without_levels": "Есть текст индикатора без уровней",
     "novel_skill": "Новый skill не найден в каталоге",
     "fuzzy_match_ambiguous": "Нечеткое совпадение с каталогом",
-    "low_confidence": "Низкая уверенность модели",
+    "low_confidence": "Низкая уверенность",
     "single_source": "Недостаточно подтверждающих источников",
     "council_split": "Модели не согласились между собой",
     "auto_accept_policy": "Автопринято по policy: уверенность >= 0.95 и согласие жюри = 1.00",
@@ -80,7 +80,6 @@ REVIEW_REASON_LABELS = {
     "redundant_transitive": "Ребро признано транзитивно избыточным",
     "bloom_direction": "Нарушено направление по Блуму",
     "ai_proposed": "Ребро предложено AI и требует проверки",
-    "low_confidence": "Низкая уверенность ребра",
 }
 REVIEW_STATUS_LABELS = {
     "open": "Открыто",
@@ -309,6 +308,10 @@ def column_exists(conn: sqlite3.Connection, table_name: str, column_name: str) -
     return any(row["name"] == column_name for row in conn.execute(f"PRAGMA table_info({table_name})"))
 
 
+def table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    return {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table_name})")}
+
+
 def ensure_runtime_schema(conn: sqlite3.Connection) -> None:
     review_columns = {
         "resolution_note": "TEXT",
@@ -322,6 +325,141 @@ def ensure_runtime_schema(conn: sqlite3.Connection) -> None:
         conn.commit()
 
 
+def format_catalog_similarity(score: float | int | None) -> tuple[str | None, str | None]:
+    """Return UI-ready catalog similarity and novelty scores on a 0..100 scale."""
+    if score is None:
+        return None, None
+    bounded_score = max(0.0, min(100.0, float(score)))
+    return f"{bounded_score:.2f}", f"{100.0 - bounded_score:.2f}"
+
+
+def build_similarity_hint(
+    score: float | int | None,
+    resolution: str | None,
+    has_nearest: bool,
+) -> dict[str, str]:
+    """Explain how a catalog similarity score should be interpreted."""
+    if score is None:
+        return {
+            "label": "Нет данных",
+            "class": "neutral",
+            "recommendation": "Нет ближайшего совпадения для методологической сверки.",
+        }
+    bounded_score = max(0.0, min(100.0, float(score)))
+    normalized_resolution = str(resolution or "").casefold()
+    if normalized_resolution in {"matched", "alias"}:
+        return {
+            "label": "Покрывает",
+            "class": "strong",
+            "recommendation": "Кандидат уже покрыт существующим skill. Используйте canonical skill в DAG.",
+        }
+    if normalized_resolution == "fuzzy" or bounded_score >= 90.0:
+        return {
+            "label": "Почти эквивалент",
+            "class": "strong",
+            "recommendation": "Лучше привязать к существующему skill, если индикаторы покрывают смысл брифа.",
+        }
+    if has_nearest and bounded_score >= 75.0:
+        return {
+            "label": "Частично похоже",
+            "class": "medium",
+            "recommendation": "Проверьте индикаторы ближайшего skill: если они покрывают требование, используйте привязку.",
+        }
+    if has_nearest:
+        return {
+            "label": "Слабое совпадение",
+            "class": "weak",
+            "recommendation": "Не привязывайте автоматически. Обычно это новый skill или кандидат на отклонение.",
+        }
+    return {
+        "label": "Новое",
+        "class": "neutral",
+        "recommendation": "Похожего skill не найдено. Решение: добавить новый или отклонить как нерелевантный.",
+    }
+
+
+def load_nearest_skill_preview(conn: sqlite3.Connection, skill_id: int | None, indicator_limit: int = 3) -> dict[str, object] | None:
+    """Load a compact catalog preview for the nearest matched skill."""
+    if not skill_id or not table_exists(conn, "skill"):
+        return None
+    skill_cols = table_columns(conn, "skill")
+    if "name" in skill_cols and "canonical_name" in skill_cols:
+        name_expr = "COALESCE(s.name, s.canonical_name)"
+    elif "canonical_name" in skill_cols:
+        name_expr = "s.canonical_name"
+    elif "name" in skill_cols:
+        name_expr = "s.name"
+    else:
+        name_expr = "s.normalized_name"
+    canonical_expr = "s.canonical_name" if "canonical_name" in skill_cols else name_expr
+    has_skill_group = table_exists(conn, "skill_group") and "group_id" in skill_cols
+    if has_skill_group:
+        row = conn.execute(
+            f"""
+            SELECT s.id, {name_expr} AS name, {canonical_expr} AS canonical_name, sg.name AS group_name
+            FROM skill s
+            LEFT JOIN skill_group sg ON sg.id = s.group_id
+            WHERE s.id = ?
+            """,
+            (skill_id,),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            f"""
+            SELECT s.id, {name_expr} AS name, {canonical_expr} AS canonical_name, NULL AS group_name
+            FROM skill s
+            WHERE s.id = ?
+            """,
+            (skill_id,),
+        ).fetchone()
+    if not row:
+        return None
+    preview = {
+        "id": int(row["id"]),
+        "name": row["canonical_name"] or row["name"],
+        "group": row["group_name"],
+        "indicators": [],
+    }
+    if table_exists(conn, "indicator"):
+        indicator_cols = table_columns(conn, "indicator")
+        text_col = "text" if "text" in indicator_cols else None
+        if text_col:
+            select_cols = ["id", text_col]
+            if "indicator_type" in indicator_cols:
+                select_cols.append("indicator_type")
+            if "complexity_label" in indicator_cols:
+                select_cols.append("complexity_label")
+            if "complexity_band" in indicator_cols:
+                select_cols.append("complexity_band")
+            order_sql = "sort_order, id" if "sort_order" in indicator_cols else "id"
+            active_filter = "AND COALESCE(is_active, 1) = 1" if "is_active" in indicator_cols else ""
+            rows = conn.execute(
+                f"""
+                SELECT {', '.join(select_cols)}
+                FROM indicator
+                WHERE skill_id = ?
+                {active_filter}
+                ORDER BY {order_sql}
+                LIMIT ?
+                """,
+                (skill_id, indicator_limit),
+            ).fetchall()
+            preview["indicators"] = [
+                {
+                    "text": str(indicator[text_col] or ""),
+                    "type": str(indicator["indicator_type"] or "") if "indicator_type" in indicator.keys() else "",
+                    "complexity": (
+                        str(indicator["complexity_label"] or "")
+                        if "complexity_label" in indicator.keys()
+                        else str(indicator["complexity_band"] or "") if "complexity_band" in indicator.keys() else ""
+                    ),
+                }
+                for indicator in rows
+                if str(indicator[text_col] or "").strip()
+            ]
+    return preview
+
+
 def ensure_intake_runtime_schema(conn: sqlite3.Connection, db_path: Path) -> None:
     resolved = str(db_path.resolve())
     schema_ready = (
@@ -329,7 +467,11 @@ def ensure_intake_runtime_schema(conn: sqlite3.Connection, db_path: Path) -> Non
         and table_exists(conn, "curriculum_plan")
         and table_exists(conn, "curriculum_plan_row")
         and column_exists(conn, "skill_suggestion", "coverage_area")
+        and column_exists(conn, "skill_suggestion", "source_name")
         and column_exists(conn, "skill_suggestion", "indicators_json")
+        and column_exists(conn, "skill_suggestion", "match_score")
+        and column_exists(conn, "skill_suggestion", "nearest_skill_id")
+        and column_exists(conn, "skill_suggestion", "nearest_name")
     )
     if resolved not in INTAKE_SCHEMA_READY or not schema_ready:
         from spravochnik_intake.pipeline import storage as intake_storage
@@ -713,7 +855,7 @@ def build_deferred_curriculum_plan_payload(message: str, audience_level: str = "
         "blocks": [],
         "csv_primary_header": [],
         "csv_secondary_header": [],
-        "report": {"coverage_ok": False, "order_violations": []},
+        "report": {"coverage_ok": False, "order_violations": [], "project_violations": []},
     }
 
 
@@ -813,7 +955,9 @@ def hydrate_job_result_payload(conn: sqlite3.Connection, result: dict[str, objec
 
     suggestion_rows = conn.execute(
         """
-        SELECT id, suggested_name, group_name, entity_type, atomicity, decision, confidence, council_agreement, resolution
+        SELECT id, suggested_name, source_name, group_name, entity_type, atomicity, decision,
+               confidence, council_agreement, resolution, match_score,
+               nearest_skill_id, nearest_name, nearest_group
         FROM skill_suggestion
         WHERE brief_id = ?
         ORDER BY id
@@ -881,7 +1025,28 @@ def hydrate_job_result_payload(conn: sqlite3.Connection, result: dict[str, objec
         council_agreement_value = float(row["council_agreement"]) if row["council_agreement"] is not None else None
         candidate["confidence"] = f"{confidence_value:.2f}" if confidence_value is not None else "—"
         candidate["council_agreement"] = f"{council_agreement_value:.2f}" if council_agreement_value is not None else None
+        match_score_value = float(row["match_score"]) if row["match_score"] is not None else None
+        candidate["match_score"], candidate["novelty_score"] = format_catalog_similarity(match_score_value)
         candidate["resolution"] = row["resolution"] or candidate.get("resolution")
+        candidate["source_name"] = row["source_name"] or candidate.get("source_name")
+        candidate["nearest_skill_id"] = row["nearest_skill_id"] or candidate.get("nearest_skill_id")
+        candidate["nearest_name"] = row["nearest_name"] or candidate.get("nearest_name")
+        candidate["nearest_group"] = row["nearest_group"] or candidate.get("nearest_group")
+        nearest_id = None
+        try:
+            nearest_id = int(candidate["nearest_skill_id"]) if candidate.get("nearest_skill_id") else None
+        except (TypeError, ValueError):
+            nearest_id = None
+        candidate["similarity_hint"] = build_similarity_hint(
+            match_score_value,
+            str(candidate.get("resolution") or ""),
+            bool(nearest_id),
+        )
+        nearest_preview = load_nearest_skill_preview(conn, nearest_id)
+        if nearest_preview:
+            candidate["nearest_preview"] = nearest_preview
+            candidate["nearest_name"] = candidate.get("nearest_name") or nearest_preview.get("name")
+            candidate["nearest_group"] = candidate.get("nearest_group") or nearest_preview.get("group")
         default_review_status = (
             "resolved"
             if candidate["decision"] == "accepted"
@@ -1025,6 +1190,7 @@ def apply_candidate_decision(
     suggestion_id: int,
     target_decision: str,
     resolution_note: str | None = None,
+    rebuild_dag: bool = False,
 ) -> int | None:
     from spravochnik_intake.pipeline import storage
 
@@ -1070,7 +1236,8 @@ def apply_candidate_decision(
         storage.revert_suggestion_promotion(conn, suggestion_id)
     clear_brief_dag_artifacts(conn, brief_id)
     conn.commit()
-    build_dag_for_brief(conn, brief_id)
+    if rebuild_dag:
+        build_dag_for_brief(conn, brief_id)
     return brief_id
 
 
@@ -1090,9 +1257,11 @@ def load_accepted_skill_candidates(conn: sqlite3.Connection, brief_id: int):
             ss.evidence_ids,
             ss.resolution,
             ss.canonical_skill_id,
+            s.canonical_name,
             ss.confidence,
             ss.council_agreement
         FROM skill_suggestion ss
+        LEFT JOIN skill s ON s.id = ss.canonical_skill_id
         WHERE ss.brief_id = ?
           AND ss.entity_type = 'skill'
           AND ss.atomicity = 'atomic'
@@ -1140,6 +1309,8 @@ def load_accepted_skill_candidates(conn: sqlite3.Connection, brief_id: int):
             atomicity="atomic",
             resolution=row["resolution"],
             canonical_skill_id=row["canonical_skill_id"],
+            canonical_name=row["canonical_name"],
+            canonical_group=None,
             decision="accepted",
         )
         cands.append(candidate)
@@ -1600,7 +1771,7 @@ def run_intake_pipeline(
         else:
             notify("search", "Внешний поиск не потребовался: кандидаты закрылись текущим каталогом.")
 
-        coverage = stage_brief_to_catalog.build_coverage_audit(spec, candidates)
+        coverage = stage_brief_to_catalog.build_coverage_audit(spec, candidates, normalize_report=normalize_report)
         council_metrics_preview = {
             "sent_to_council": len(stage_brief_to_catalog.select_council_candidates(candidates)),
         }
@@ -1663,6 +1834,7 @@ def run_intake_pipeline(
         "candidates": [
             {
                 "name": candidate.name,
+                "source_name": candidate.source_name,
                 "group": candidate.group,
                 "coverage_area": candidate.coverage_area or (
                     by_tid[candidate.parent_tmp_id].coverage_area
@@ -1677,6 +1849,12 @@ def run_intake_pipeline(
                 "parent_name": by_tid[candidate.parent_tmp_id].name if candidate.parent_tmp_id and candidate.parent_tmp_id in by_tid else None,
                 "resolution": candidate.resolution,
                 "canonical_name": candidate.canonical_name,
+                "match_score": format_catalog_similarity(candidate.match_score)[0],
+                "novelty_score": format_catalog_similarity(candidate.match_score)[1],
+                "nearest_skill_id": candidate.nearest_skill_id,
+                "nearest_name": candidate.nearest_name,
+                "nearest_group": candidate.nearest_group,
+                "similarity_hint": build_similarity_hint(candidate.match_score, candidate.resolution, bool(candidate.nearest_skill_id)),
                 "confidence": f"{candidate.confidence:.2f}" if candidate.confidence else "—",
                 "council_agreement": None if candidate.council_agreement is None else f"{candidate.council_agreement:.2f}",
                 "decision": candidate.decision,
@@ -1966,6 +2144,7 @@ def curriculum_plan_status_label(status: str | None) -> str:
         "draft": "Черновик",
         "built": "Собран",
         "deferred": "Отложен",
+        "invalid": "Невалиден",
     }
     return mapping.get((status or "").strip().casefold(), "Неизвестно")
 
@@ -2117,6 +2296,12 @@ def build_curriculum_plan_payload_from_rows(
     message = str(payload.get("message") or default_message)
     if rows and "пока не стро" in message.casefold():
         message = default_message
+    report = payload.get("report") if isinstance(payload.get("report"), dict) else {}
+    report = {
+        "coverage_ok": bool(report.get("coverage_ok", False)),
+        "order_violations": report.get("order_violations") if isinstance(report.get("order_violations"), list) else [],
+        "project_violations": report.get("project_violations") if isinstance(report.get("project_violations"), list) else [],
+    }
 
     built_payload = {
         "plan_id": int(plan_meta["id"]),
@@ -2138,7 +2323,7 @@ def build_curriculum_plan_payload_from_rows(
         "blocks": block_payloads,
         "csv_primary_header": payload.get("csv_primary_header") or CSV_PRIMARY_HEADER,
         "csv_secondary_header": payload.get("csv_secondary_header") or CSV_SECONDARY_HEADER,
-        "report": payload.get("report") if isinstance(payload.get("report"), dict) else {"coverage_ok": False, "order_violations": []},
+        "report": report,
     }
     return built_payload
 
@@ -2434,6 +2619,113 @@ def delete_curriculum_plan_row(conn: sqlite3.Connection, plan_id: int, row_id: i
     conn.execute("DELETE FROM curriculum_plan_row WHERE id = ? AND plan_id = ?", (row_id, plan_id))
     conn.commit()
     sync_curriculum_plan_payload(conn, plan_id)
+
+
+def reset_curriculum_plan_payload_in_jobs(conn: sqlite3.Connection, brief_id: int, message: str) -> None:
+    if not table_exists(conn, "intake_job"):
+        return
+    rows = conn.execute(
+        """
+        SELECT id, result_payload
+        FROM intake_job
+        WHERE result_payload IS NOT NULL
+          AND json_valid(result_payload)
+          AND json_extract(result_payload, '$.brief_id') = ?
+        """,
+        (brief_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(str(row["result_payload"] or "{}"))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        payload["curriculum_plan"] = build_deferred_curriculum_plan_payload(message)
+        persisted = payload.get("persisted")
+        if isinstance(persisted, dict):
+            persisted["curriculum_plan_rows"] = 0
+        conn.execute(
+            "UPDATE intake_job SET result_payload = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(payload, ensure_ascii=False), datetime.now(UTC).isoformat(), row["id"]),
+        )
+
+
+def delete_curriculum_plan(conn: sqlite3.Connection, plan_id: int) -> bool:
+    if not table_exists(conn, "curriculum_plan"):
+        return False
+    row = conn.execute("SELECT id, brief_id FROM curriculum_plan WHERE id = ?", (plan_id,)).fetchone()
+    if not row:
+        return False
+    brief_id = row["brief_id"]
+    if table_exists(conn, "curriculum_plan_row"):
+        conn.execute("DELETE FROM curriculum_plan_row WHERE plan_id = ?", (plan_id,))
+    conn.execute("DELETE FROM curriculum_plan WHERE id = ?", (plan_id,))
+    if isinstance(brief_id, int):
+        reset_curriculum_plan_payload_in_jobs(conn, brief_id, "УП был удалён вручную.")
+    conn.commit()
+    return True
+
+
+def cleanup_empty_curriculum_plans(conn: sqlite3.Connection) -> int:
+    if not table_exists(conn, "curriculum_plan"):
+        return 0
+    rows = conn.execute(
+        """
+        SELECT cp.id
+        FROM curriculum_plan cp
+        WHERE cp.status = 'deferred'
+           OR cp.total_projects = 0
+           OR NOT EXISTS (
+                SELECT 1
+                FROM curriculum_plan_row cpr
+                WHERE cpr.plan_id = cp.id
+           )
+        """
+    ).fetchall()
+    deleted = 0
+    for row in rows:
+        if delete_curriculum_plan(conn, int(row["id"])):
+            deleted += 1
+    return deleted
+
+
+def clear_intake_workspace(conn: sqlite3.Connection) -> dict[str, int]:
+    """Clear transient intake artifacts while keeping canonical catalog tables intact."""
+    stats: dict[str, int] = {}
+
+    if table_exists(conn, "review_queue"):
+        stats["review_queue"] = conn.execute("DELETE FROM review_queue WHERE source_ref LIKE 'brief:%'").rowcount
+
+    if table_exists(conn, "skill_prerequisite") and column_exists(conn, "skill_prerequisite", "brief_id"):
+        stats["skill_prerequisite"] = conn.execute("DELETE FROM skill_prerequisite WHERE brief_id IS NOT NULL").rowcount
+
+    if table_exists(conn, "curriculum_plan_row") and table_exists(conn, "curriculum_plan"):
+        stats["curriculum_plan_row"] = conn.execute(
+            """
+            DELETE FROM curriculum_plan_row
+            WHERE plan_id IN (SELECT id FROM curriculum_plan WHERE brief_id IS NOT NULL)
+            """
+        ).rowcount
+
+    if table_exists(conn, "curriculum_plan"):
+        stats["curriculum_plan"] = conn.execute("DELETE FROM curriculum_plan WHERE brief_id IS NOT NULL").rowcount
+
+    if table_exists(conn, "skill_suggestion"):
+        stats["skill_suggestion"] = conn.execute("DELETE FROM skill_suggestion WHERE brief_id IS NOT NULL").rowcount
+
+    if table_exists(conn, "evidence_source"):
+        stats["evidence_source"] = conn.execute("DELETE FROM evidence_source WHERE brief_id IS NOT NULL").rowcount
+
+    if table_exists(conn, "intake_job"):
+        stats["intake_job"] = conn.execute("DELETE FROM intake_job").rowcount
+
+    if table_exists(conn, "profile_brief"):
+        stats["profile_brief"] = conn.execute("DELETE FROM profile_brief").rowcount
+
+    ACTIVE_INTAKE_JOB_IDS.clear()
+    conn.commit()
+    return {key: int(value or 0) for key, value in stats.items()}
 
 
 def list_catalog_groups(conn: sqlite3.Connection) -> list[dict[str, object]]:
@@ -3956,6 +4248,7 @@ def create_app(db_path: Path, summary_path: Path):
 
     def render(template_name: str, context: dict[str, object]) -> str:
         template = env.get_template(template_name)
+        current_summary = refresh_summary_counts(summary, db_path)
         shared = {
             "nav": [
                 {"label": "Брифы", "href": "/intake", "prefixes": ["/intake"]},
@@ -3970,12 +4263,12 @@ def create_app(db_path: Path, summary_path: Path):
             "secondary_nav": [
                 {"label": "Иерархия", "href": "/catalog-admin/groups", "prefixes": ["/catalog-admin/groups", "/catalog-admin/skills"]},
                 {"label": "Архив", "href": "/catalog-admin/archive", "prefixes": ["/catalog-admin/archive"]},
-                {"label": "Старый просмотр", "href": "/competencies", "prefixes": ["/competencies"]},
+                {"label": "Справочник компетенций", "href": "/competencies", "prefixes": ["/competencies"]},
                 {"label": "Профили", "href": "/profiles", "prefixes": ["/profiles"]},
             ],
             "complexity_options": COMPLEXITY_OPTIONS,
             "intake_progress_steps": INTAKE_PROGRESS_STEPS,
-            "summary": summary,
+            "summary": current_summary,
             "request_path": context.get("request_path", "/"),
         }
         merged = {**shared, **context}
@@ -4293,6 +4586,11 @@ def create_app(db_path: Path, summary_path: Path):
                     location += "?" + "&".join(redirect_parts)
                 return redirect_response(start_response, location)
 
+            if path == "/intake/jobs/clear" and method == "POST":
+                ensure_intake_runtime_schema(conn, db_path)
+                clear_intake_workspace(conn)
+                return redirect_response(start_response, "/intake")
+
             if path == "/competencies":
                 query = query_params.get("q", [""])[0].strip()
                 scope = query_params.get("scope", ["all"])[0]
@@ -4425,6 +4723,11 @@ def create_app(db_path: Path, summary_path: Path):
                 )
                 return html_response(start_response, html)
 
+            if path == "/up/cleanup-empty" and method == "POST":
+                ensure_intake_runtime_schema(conn, db_path)
+                cleanup_empty_curriculum_plans(conn)
+                return redirect_response(start_response, "/up")
+
             if path.startswith("/up/plans/"):
                 ensure_intake_runtime_schema(conn, db_path)
                 segments = [part for part in path.strip("/").split("/") if part]
@@ -4436,10 +4739,21 @@ def create_app(db_path: Path, summary_path: Path):
                 else:
                     return not_found(start_response)
 
+                if len(segments) == 4 and segments[3] == "delete" and method == "POST":
+                    delete_curriculum_plan(conn, plan_id)
+                    return redirect_response(start_response, "/up")
+
                 if len(segments) == 4 and segments[3] == "csv" and method == "GET":
                     plan_payload = get_curriculum_plan(conn, plan_id)
                     if not plan_payload:
                         return not_found(start_response, "Curriculum plan not found")
+                    if str(plan_payload.get("status") or "").casefold() == "invalid":
+                        return response(
+                            start_response,
+                            "CSV export is blocked: curriculum plan has DAG order violations.".encode("utf-8"),
+                            status="409 Conflict",
+                            content_type="text/plain; charset=utf-8",
+                        )
                     filename = f"curriculum_plan_{plan_id}.csv"
                     return response(
                         start_response,
@@ -4617,22 +4931,45 @@ def create_app(db_path: Path, summary_path: Path):
                 except ValueError:
                     return not_found(start_response, "Invalid suggestion id")
                 action = form_data.get("candidate_action", "")
-                if action not in {"accept", "reject", "review"}:
+                if action not in {"accept", "link", "reject", "review"}:
                     return not_found(start_response, "Invalid candidate action")
                 target_decision = "needs_review"
                 resolution_note = "Возвращено на review из intake-таблицы."
                 if action == "accept":
                     target_decision = "accepted"
                     resolution_note = "Подтверждено из intake-таблицы."
+                elif action == "link":
+                    from spravochnik_intake.pipeline import storage as intake_storage
+
+                    link_result = intake_storage.link_suggestion_to_nearest(conn, suggestion_id)
+                    if link_result.get("status") != "linked":
+                        return not_found(start_response, "Nearest catalog skill not found")
+                    target_decision = "accepted"
+                    resolution_note = f"Покрыто существующим skill: {link_result.get('canonical_name') or link_result.get('skill_id')}."
                 elif action == "reject":
                     target_decision = "rejected"
                     resolution_note = "Отклонено из intake-таблицы."
+                wants_json = (
+                    "application/json" in str(environ.get("HTTP_ACCEPT", ""))
+                    or str(environ.get("HTTP_X_REQUESTED_WITH", "")) == "fetch"
+                )
                 apply_candidate_decision(
                     conn,
                     suggestion_id,
                     target_decision,
                     resolution_note,
+                    rebuild_dag=not wants_json,
                 )
+                if wants_json:
+                    return json_response(
+                        start_response,
+                        {
+                            "ok": True,
+                            "suggestion_id": suggestion_id,
+                            "decision": target_decision,
+                            "message": "Решение сохранено. DAG можно пересобрать отдельной кнопкой.",
+                        },
+                    )
                 return redirect_response(start_response, f"/intake/jobs/{job_id}")
 
             if path.startswith("/intake/jobs/") and path.endswith("/plan.csv") and method == "GET":

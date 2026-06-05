@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import networkx as nx
 from . import config, llm
+from . import language
 from .models import PrereqEdge, SkillCandidate
 
 
@@ -21,20 +22,20 @@ def looks_corrupted(text: str | None) -> bool:
 
 def display_name(cand: SkillCandidate) -> str:
     if cand.canonical_name and cand.resolution in {"matched", "alias", "fuzzy"}:
-        return cand.canonical_name
+        return language.localize_skill_label(cand.canonical_name)
     if cand.canonical_name and looks_corrupted(cand.name):
-        return cand.canonical_name
-    return cand.name
+        return language.localize_skill_label(cand.canonical_name)
+    return language.localize_skill_label(cand.name)
 
 
 def display_group(cand: SkillCandidate) -> str:
     if cand.canonical_group and cand.resolution in {"matched", "alias", "fuzzy"}:
-        return cand.canonical_group
+        return language.localize_group_label(cand.canonical_group) or language.localize_area_label(cand.canonical_group)
     if cand.canonical_group and looks_corrupted(cand.group):
-        return cand.canonical_group
+        return language.localize_group_label(cand.canonical_group) or language.localize_area_label(cand.canonical_group)
     if looks_corrupted(cand.group):
         return "Группа требует проверки"
-    return cand.group
+    return language.localize_group_label(cand.group) or language.localize_area_label(cand.group) or cand.group
 
 
 def _graph_candidates(cands: list[SkillCandidate]) -> list[SkillCandidate]:
@@ -63,8 +64,12 @@ def propose_edges(cands: list[SkillCandidate]) -> list[PrereqEdge]:
             edges.append(PrereqEdge(src=sa, dst=sb, relation_type="hard", confidence=0.9, source="syllabus"))
     if config.USE_LIVE:
         cl = [{"id": c.tmp_id, "name": c.name, "bloom": c.bloom} for c in cands]
-        sys = ("Предложи рёбра пререквизитов. JSON {edges:[{src,dst,confidence,rationale}]}. "
-               "src/dst только из id.")
+        sys = (
+            "Предложи только мягкие методические зависимости между навыками для построения учебной последовательности. "
+            "Это не строгие hard prerequisites: hard-связи появляются только из явно заданных структурных правил. "
+            "JSON {edges:[{src,dst,confidence,rationale}]}. src/dst только из id. "
+            "rationale пиши на русском языке."
+        )
         try:
             data = json.loads(llm.content(llm.chat(config.MODEL_PLAN,
                 [{"role": "system", "content": sys}, {"role": "user", "content": json.dumps(cl, ensure_ascii=False)}],
@@ -146,7 +151,7 @@ def build_topological_waves(DAG: nx.DiGraph, cands: list[SkillCandidate]) -> tup
     waves: list[list[str]] = []
     order: list[str] = []
     for generation in nx.topological_generations(DAG):
-        wave = sorted(generation, key=lambda tid: by_tid[tid].bloom)
+        wave = sorted(generation, key=lambda tid: (by_tid[tid].bloom, display_name(by_tid[tid])))
         waves.append(wave)
         order.extend(wave)
     return waves, order
@@ -227,7 +232,12 @@ def build_dag_payload(
                 "src": display_names[src],
                 "dst": display_names[dst],
                 "source": edge.source if edge else "pipeline",
-                "relation_type": edge.relation_type if edge else "hard",
+                "relation_type": edge.relation_type if edge else "soft",
+                "relation_label": (
+                    "Структурный пререквизит"
+                    if edge and edge.relation_type == "hard"
+                    else "Мягкая методическая связь"
+                ),
                 "confidence": edge.confidence if edge else DAG[src][dst].get("conf"),
                 "decision": edge.decision if edge else "accept",
                 "reasons": edge.reasons if edge else [],

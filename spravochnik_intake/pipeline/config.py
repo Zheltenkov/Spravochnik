@@ -41,6 +41,24 @@ def _env_structural_rules(name: str) -> list[tuple[str, str]]:
     return rules
 
 
+def _env_bloom_ceiling(name: str) -> dict[str, str]:
+    raw = os.environ.get(
+        name,
+        "intro:analyze,junior:analyze,junior+:analyze,начинающий:analyze,базовый:analyze",
+    )
+    ceilings: dict[str, str] = {}
+    for chunk in raw.split(","):
+        item = chunk.strip()
+        if not item or ":" not in item:
+            continue
+        seniority, bloom = item.split(":", 1)
+        seniority_key = seniority.strip().casefold()
+        bloom_value = bloom.strip().casefold()
+        if seniority_key and bloom_value:
+            ceilings[seniority_key] = bloom_value
+    return ceilings
+
+
 _load_dotenv()
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPEN_ROUTER_API_KEY", "")
@@ -74,7 +92,7 @@ COUNCIL_AGREE_OK = float(os.environ.get("COUNCIL_AGREE_OK", "0.67"))
 AUTO_ACCEPT_CONFIDENCE = float(os.environ.get("AUTO_ACCEPT_CONFIDENCE", "0.95"))
 AUTO_ACCEPT_COUNCIL_AGREEMENT = float(os.environ.get("AUTO_ACCEPT_COUNCIL_AGREEMENT", "1.0"))
 AUTO_ACCEPT_NEW_FOR_PROGRAM_BRIEF = _env_bool("AUTO_ACCEPT_NEW_FOR_PROGRAM_BRIEF", False)
-PROGRAM_BRIEF_MAX_SKILLS_PER_AREA = int(os.environ.get("PROGRAM_BRIEF_MAX_SKILLS_PER_AREA", "2"))
+PROGRAM_BRIEF_MAX_SKILLS_PER_AREA = int(os.environ.get("PROGRAM_BRIEF_MAX_SKILLS_PER_AREA", "4"))
 FUZZY_MATCH_MIN = int(os.environ.get("FUZZY_MATCH_MIN", "90"))      # rapidfuzz score для fuzzy-резолва
 GRAY_SEARCH_MAX_QUERIES = int(os.environ.get("GRAY_SEARCH_MAX_QUERIES", "3"))
 
@@ -86,8 +104,21 @@ STRUCTURAL_PREREQ_RULES = _env_structural_rules("STRUCTURAL_PREREQ_RULES")
 # Стадия 3->4: DAG -> учебный план (верхний планировщик)
 UP_HOURS_PER_DAY = float(os.environ.get("UP_HOURS_PER_DAY", "2.94"))
 UP_XP_PER_HOUR = int(os.environ.get("UP_XP_PER_HOUR", "10"))
-UP_MAX_SKILLS_PER_PROJECT = int(os.environ.get("UP_MAX_SKILLS_PER_PROJECT", "2"))
+UP_MAX_SKILLS_PER_PROJECT = int(os.environ.get("UP_MAX_SKILLS_PER_PROJECT", "4"))
+UP_TARGET_SKILLS_MIN = int(os.environ.get("UP_TARGET_SKILLS_MIN", "2"))
+UP_TARGET_SKILLS_MAX = int(os.environ.get("UP_TARGET_SKILLS_MAX", "4"))
+UP_TARGET_OUTCOMES_MIN = int(os.environ.get("UP_TARGET_OUTCOMES_MIN", "3"))
+UP_TARGET_OUTCOMES_MAX = int(os.environ.get("UP_TARGET_OUTCOMES_MAX", "5"))
+UP_SPIRAL_ENABLED = _env_bool("UP_SPIRAL_ENABLED", True)
+UP_CORE_THREAD_MIN = int(os.environ.get("UP_CORE_THREAD_MIN", "4"))
+UP_CORE_THREAD_MAX = int(os.environ.get("UP_CORE_THREAD_MAX", "8"))
+UP_MIN_THREAD_OCCURRENCES = int(os.environ.get("UP_MIN_THREAD_OCCURRENCES", "2"))
+UP_MAX_THREAD_OCCURRENCES = int(os.environ.get("UP_MAX_THREAD_OCCURRENCES", "3"))
+UP_SPIRAL_MIN_GAP = int(os.environ.get("UP_SPIRAL_MIN_GAP", "2"))
+UP_SPIRAL_GAP_GROWTH = int(os.environ.get("UP_SPIRAL_GAP_GROWTH", "2"))
 UP_MAX_PROJECTS_PER_BLOCK = int(os.environ.get("UP_MAX_PROJECTS_PER_BLOCK", "3"))
+UP_MAX_THEMES_PER_BLOCK = int(os.environ.get("UP_MAX_THEMES_PER_BLOCK", "2"))
+UP_MAX_BLOOM_BY_SENIORITY = _env_bloom_ceiling("UP_MAX_BLOOM_BY_SENIORITY")
 UP_GENERATED_COLUMNS = list("ABCDEFGHIJKLMN")
 UP_IGNORED_COLUMNS = list("OPQRSTUV")
 UP_BLOOM_KNOW = {"remember", "understand"}

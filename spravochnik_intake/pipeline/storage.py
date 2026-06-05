@@ -11,11 +11,16 @@ from .models import Evidence, PrereqEdge, SkillCandidate
 _REQUIRED_COLS = {
     "skill_suggestion": [
         ("coverage_area", "TEXT"),
+        ("source_name", "TEXT"),
         ("indicators_json", "TEXT"),
         ("entity_type", "TEXT NOT NULL DEFAULT 'skill'"),
         ("atomicity", "TEXT NOT NULL DEFAULT 'unknown'"),
         ("parent_suggestion_id", "INTEGER"),
         ("atomize_rationale", "TEXT"),
+        ("match_score", "REAL"),
+        ("nearest_skill_id", "INTEGER"),
+        ("nearest_name", "TEXT"),
+        ("nearest_group", "TEXT"),
     ],
     "skill_prerequisite": [
         ("brief_id", "INTEGER"),
@@ -53,12 +58,67 @@ def _supports_superseded(con: sqlite3.Connection) -> bool:
     return bool(row and row[0] and "superseded" in row[0])
 
 
+def _quoted_columns(columns: list[str]) -> str:
+    return ", ".join(f'"{column}"' for column in columns)
+
+
+def _copy_common_columns(con: sqlite3.Connection, source_table: str, target_table: str) -> None:
+    source_cols = _existing_cols(con, source_table)
+    target_cols = _existing_cols(con, target_table)
+    common = [column for column in target_cols if column in source_cols]
+    if not common:
+        return
+    column_sql = _quoted_columns(common)
+    con.execute(f'INSERT INTO "{target_table}"({column_sql}) SELECT {column_sql} FROM "{source_table}"')
+
+
+def _ensure_curriculum_plan_accepts_invalid(con: sqlite3.Connection, sql_path: str) -> None:
+    """Rebuild old curriculum_plan tables whose CHECK does not allow invalid.
+
+    SQLite cannot alter CHECK constraints in place. The rebuild preserves parent
+    and row records, then recreates indexes through the idempotent schema.
+    """
+
+    if not _table_exists(con, "curriculum_plan"):
+        return
+    row = con.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='curriculum_plan'").fetchone()
+    table_sql = str(row[0] or "") if row else ""
+    if "invalid" in table_sql:
+        return
+
+    child_exists = _table_exists(con, "curriculum_plan_row")
+    fk_state = int(con.execute("PRAGMA foreign_keys").fetchone()[0] or 0)
+    con.commit()
+    con.execute("PRAGMA foreign_keys = OFF")
+    try:
+        con.execute("DROP TABLE IF EXISTS _curriculum_plan_row_backup")
+        if child_exists:
+            con.execute("CREATE TEMP TABLE _curriculum_plan_row_backup AS SELECT * FROM curriculum_plan_row")
+            con.execute("DROP TABLE curriculum_plan_row")
+        con.execute("DROP INDEX IF EXISTS idx_curriculum_plan_brief_policy")
+        con.execute("ALTER TABLE curriculum_plan RENAME TO _curriculum_plan_old")
+        con.executescript(Path(sql_path).read_text(encoding="utf-8"))
+        _copy_common_columns(con, "_curriculum_plan_old", "curriculum_plan")
+        con.execute("DROP TABLE _curriculum_plan_old")
+        if child_exists:
+            _copy_common_columns(con, "_curriculum_plan_row_backup", "curriculum_plan_row")
+            con.execute("DROP TABLE _curriculum_plan_row_backup")
+        con.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_curriculum_plan_brief_policy "
+            "ON curriculum_plan(brief_id, source_policy)"
+        )
+        con.commit()
+    finally:
+        con.execute(f"PRAGMA foreign_keys = {fk_state}")
+
+
 def _review_queue_entity_type(candidate: SkillCandidate) -> str:
     return _REVIEW_QUEUE_ENTITY_TYPE_MAP.get(candidate.entity_type, "block")
 
 
 def apply_migration(con: sqlite3.Connection, sql_path: str) -> None:
     con.executescript(Path(sql_path).read_text(encoding="utf-8"))
+    _ensure_curriculum_plan_accepts_invalid(con, sql_path)
     for table, cols in _REQUIRED_COLS.items():
         existing = _existing_cols(con, table)
         for name, decl in cols:
@@ -115,7 +175,9 @@ def _ensure_skill_group(con: sqlite3.Connection, group_name: str | None) -> int 
 def _load_skill_suggestion_row(con: sqlite3.Connection, suggestion_id: int) -> sqlite3.Row | None:
     return con.execute(
         """
-        SELECT id, brief_id, suggested_name, group_name, coverage_area, resolution, canonical_skill_id, decision, entity_type, atomicity
+        SELECT id, brief_id, suggested_name, source_name, group_name, coverage_area, resolution,
+               canonical_skill_id, nearest_skill_id, nearest_name, nearest_group,
+               decision, entity_type, atomicity
         FROM skill_suggestion
         WHERE id = ?
         """,
@@ -138,7 +200,11 @@ def _find_skill_by_normalized_name(con: sqlite3.Connection, normalized_name: str
 
 
 def _ensure_skill_alias(con: sqlite3.Connection, skill_id: int, alias: str, source: str) -> bool:
+    if not alias or not alias.strip():
+        return False
     normalized_alias = _normalize_catalog_key(alias)
+    if not normalized_alias:
+        return False
     exists = con.execute(
         "SELECT 1 FROM skill_alias WHERE skill_id = ? AND normalized_alias = ?",
         (skill_id, normalized_alias),
@@ -244,6 +310,9 @@ def promote_suggestion_to_catalog(con: sqlite3.Connection, suggestion_id: int) -
             con.execute(f"UPDATE skill SET {', '.join(updates)} WHERE id = ?", tuple(params))
 
     created_alias = _ensure_skill_alias(con, skill_id, str(row["suggested_name"]), "intake_accept")
+    source_name = str(row["source_name"] or "").strip()
+    if source_name and source_name.casefold() != str(row["suggested_name"] or "").strip().casefold():
+        created_alias = _ensure_skill_alias(con, skill_id, source_name, "intake_original") or created_alias
     canonical_name = str(skill_row["canonical_name"] if skill_row else row["suggested_name"])
     resolution_after = "matched" if _normalize_catalog_key(canonical_name) == normalized_name else "alias"
     con.execute(
@@ -396,6 +465,37 @@ def revert_suggestion_promotion(con: sqlite3.Connection, suggestion_id: int) -> 
     }
 
 
+def link_suggestion_to_nearest(con: sqlite3.Connection, suggestion_id: int) -> dict[str, object]:
+    """Accept coverage by the nearest existing catalog skill without creating a new skill."""
+    row = con.execute(
+        """
+        SELECT ss.id, ss.nearest_skill_id, s.canonical_name
+        FROM skill_suggestion ss
+        LEFT JOIN skill s ON s.id = ss.nearest_skill_id
+        WHERE ss.id = ?
+        """,
+        (suggestion_id,),
+    ).fetchone()
+    if not row or row["nearest_skill_id"] is None:
+        return {"status": "missing_nearest", "suggestion_id": suggestion_id}
+    con.execute(
+        """
+        UPDATE skill_suggestion
+        SET canonical_skill_id = nearest_skill_id,
+            resolution = 'alias'
+        WHERE id = ?
+        """,
+        (suggestion_id,),
+    )
+    con.commit()
+    return {
+        "status": "linked",
+        "suggestion_id": suggestion_id,
+        "skill_id": int(row["nearest_skill_id"]),
+        "canonical_name": row["canonical_name"],
+    }
+
+
 def sync_promotions_for_brief(con: sqlite3.Connection, brief_id: int) -> dict[str, int]:
     promoted = 0
     reverted = 0
@@ -464,13 +564,15 @@ def save_suggestions(con: sqlite3.Connection, brief_id: int, cands: list[SkillCa
         if stored_decision == "superseded" and not allow_superseded:
             stored_decision = "rejected"
         con.execute(
-            """INSERT INTO skill_suggestion(brief_id, suggested_name, group_name, coverage_area, bloom,
-               indicators_json, tools, resolution, canonical_skill_id, confidence, council_agreement,
+            """INSERT INTO skill_suggestion(brief_id, suggested_name, source_name, group_name, coverage_area, bloom,
+               indicators_json, tools, resolution, canonical_skill_id, match_score,
+               nearest_skill_id, nearest_name, nearest_group, confidence, council_agreement,
                evidence_ids, decision, entity_type, atomicity, parent_suggestion_id, atomize_rationale)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 brief_id,
                 c.name,
+                c.source_name,
                 c.group,
                 c.coverage_area,
                 max((i.bloom for i in c.indicators), default=None),
@@ -478,6 +580,10 @@ def save_suggestions(con: sqlite3.Connection, brief_id: int, cands: list[SkillCa
                 json.dumps(c.tools, ensure_ascii=False),
                 c.resolution,
                 c.canonical_skill_id,
+                c.match_score,
+                c.nearest_skill_id,
+                c.nearest_name,
+                c.nearest_group,
                 c.confidence,
                 c.council_agreement,
                 json.dumps([ev_idmap.get(x) for x in c.evidence_ids]),

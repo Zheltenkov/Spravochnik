@@ -80,6 +80,59 @@
 </section>
 
 <section class="filter-panel">
+    <h2>Положение в структуре компетенций</h2>
+    <p class="muted">
+        Здесь видно, в какие компетенции входит skill. Если skill принят через intake, система пытается создать эту связь автоматически.
+        Методолог может перенести skill в более точную компетенцию вручную.
+    </p>
+
+    {% if competency_links %}
+    <div class="merge-candidates">
+        {% for link in competency_links %}
+        <form class="merge-row" method="post" action="/catalog-admin/skills/{{ skill.id }}" onsubmit="return confirm('Отвязать skill от этой компетенции? Индикаторные строки этой связи будут удалены, сам skill останется в каталоге.');">
+            <input type="hidden" name="action" value="unlink_competency">
+            <input type="hidden" name="competency_skill_id" value="{{ link.competency_skill_id }}">
+            <div>
+                <strong>{{ link.competency_title }}</strong>
+                <div class="small muted">
+                    {{ link.profile_name }} · competency {{ link.competency_status }} · profile link {{ link.profile_competency_state }} · skill link {{ link.competency_skill_state }}
+                </div>
+                <div class="small muted">
+                    competency_skill #{{ link.competency_skill_id }} · {{ link.indicator_row_count }} indicator rows
+                </div>
+            </div>
+            <button type="submit" class="action-btn action-btn-light">Отвязать</button>
+        </form>
+        {% endfor %}
+    </div>
+    {% else %}
+    <p class="status-message warn">Skill пока не входит ни в одну competency. Для полноценного справочника его нужно связать с компетенцией.</p>
+    {% endif %}
+
+    <form class="admin-form admin-form-inline" method="get" action="/catalog-admin/skills/{{ skill.id }}">
+        <label>
+            <span>Найти competency</span>
+            <input type="text" name="competency_query" value="{{ competency_query or '' }}" placeholder="Например: Исследования и продукт">
+        </label>
+        <button type="submit" class="action-btn">Найти</button>
+    </form>
+
+    <form class="admin-form admin-form-inline" method="post" action="/catalog-admin/skills/{{ skill.id }}">
+        <input type="hidden" name="action" value="link_competency">
+        <label>
+            <span>Название competency</span>
+            <input type="text" name="competency_title" list="competency-options" placeholder="Введите существующую или новую competency">
+        </label>
+        <datalist id="competency-options">
+            {% for option in competency_options %}
+            <option value="{{ option.title }}"></option>
+            {% endfor %}
+        </datalist>
+        <button type="submit" class="action-btn action-btn-primary">Привязать skill</button>
+    </form>
+</section>
+
+<section class="filter-panel">
     <h2>Алиасы и слияние дублей</h2>
     <div class="admin-grid">
         <div class="admin-span-2">

@@ -6,7 +6,7 @@ import sqlite3
 import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path
-from . import config
+from . import competency_catalog, config
 from .models import Evidence, PrereqEdge, SkillCandidate
 
 _REQUIRED_COLS = {
@@ -730,7 +730,7 @@ def _load_skill_suggestion_row(con: sqlite3.Connection, suggestion_id: int) -> s
         """
         SELECT id, brief_id, suggested_name, source_name, group_name, coverage_area, resolution,
                canonical_skill_id, nearest_skill_id, nearest_name, nearest_group,
-               decision, entity_type, atomicity
+               decision, entity_type, atomicity, indicators_json
         FROM skill_suggestion
         WHERE id = ?
         """,
@@ -919,6 +919,14 @@ def promote_suggestion_to_catalog(con: sqlite3.Connection, suggestion_id: int) -
                 1 if created_alias else 0,
             ),
         )
+    competency_link = competency_catalog.ensure_skill_competency_link(
+        con,
+        skill_id=skill_id,
+        skill_name=str(row["suggested_name"]).strip(),
+        competency_title=row["coverage_area"] or row["group_name"],
+        indicators=row["indicators_json"],
+        source_note=f"intake_accept:suggestion:{suggestion_id}",
+    )
     con.commit()
     return {
         "status": "promoted",
@@ -927,6 +935,7 @@ def promote_suggestion_to_catalog(con: sqlite3.Connection, suggestion_id: int) -
         "created_skill": created_skill,
         "created_alias": created_alias,
         "resolution_after": resolution_after,
+        "competency_link": competency_link,
     }
 
 
@@ -982,6 +991,7 @@ def revert_suggestion_promotion(con: sqlite3.Connection, suggestion_id: int) -> 
             con.execute("UPDATE skill SET status = 'candidate', is_active = 0 WHERE id = ?", (skill_id,))
         else:
             con.execute("UPDATE skill SET status = 'candidate' WHERE id = ?", (skill_id,))
+        competency_catalog.remove_intake_competency_links_for_skill(con, skill_id)
 
     resolution_after = "new"
     canonical_skill_id: int | None = None

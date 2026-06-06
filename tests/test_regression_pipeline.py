@@ -42,6 +42,7 @@ from viewer.app import (
     merge_catalog_skills,
     load_brief_spec_for_plan,
     open_db,
+    update_review_status,
     update_intake_job,
 )
 
@@ -88,6 +89,126 @@ def _create_base_catalog_db(db_path: Path) -> sqlite3.Connection:
             updated_at TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE ingest_run (
+            id INTEGER PRIMARY KEY,
+            started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            finished_at TEXT,
+            source_root TEXT NOT NULL,
+            status TEXT NOT NULL,
+            summary_json TEXT
+        );
+
+        CREATE TABLE source_workbook (
+            id INTEGER PRIMARY KEY,
+            ingest_run_id INTEGER NOT NULL,
+            file_path TEXT NOT NULL,
+            file_name TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            last_modified_utc TEXT,
+            source_kind TEXT NOT NULL,
+            UNIQUE(ingest_run_id, file_path)
+        );
+
+        CREATE TABLE source_sheet (
+            id INTEGER PRIMARY KEY,
+            source_workbook_id INTEGER NOT NULL,
+            sheet_name TEXT NOT NULL,
+            sheet_order INTEGER NOT NULL,
+            is_skipped INTEGER NOT NULL DEFAULT 0,
+            skip_reason TEXT,
+            UNIQUE(source_workbook_id, sheet_order)
+        );
+
+        CREATE TABLE source_block (
+            id INTEGER PRIMARY KEY,
+            source_sheet_id INTEGER NOT NULL,
+            block_no INTEGER NOT NULL,
+            header_row_number INTEGER NOT NULL,
+            level_row_number INTEGER,
+            end_row_number INTEGER,
+            raw_title TEXT,
+            raw_description TEXT,
+            raw_prerequisites TEXT,
+            raw_scale_signature TEXT,
+            UNIQUE(source_sheet_id, block_no)
+        );
+
+        CREATE TABLE profile (
+            id INTEGER PRIMARY KEY,
+            slug TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            notes TEXT
+        );
+
+        CREATE TABLE profile_source (
+            id INTEGER PRIMARY KEY,
+            profile_id INTEGER NOT NULL,
+            source_workbook_id INTEGER NOT NULL,
+            version_label TEXT,
+            is_primary INTEGER NOT NULL DEFAULT 1,
+            UNIQUE(profile_id, source_workbook_id)
+        );
+
+        CREATE TABLE competency (
+            id INTEGER PRIMARY KEY,
+            normalized_title TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL,
+            description TEXT,
+            status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'candidate', 'deprecated'))
+        );
+
+        CREATE TABLE profile_competency (
+            id INTEGER PRIMARY KEY,
+            profile_id INTEGER NOT NULL,
+            competency_id INTEGER NOT NULL,
+            source_block_id INTEGER NOT NULL,
+            scale_id INTEGER,
+            title_in_source TEXT,
+            description_in_source TEXT,
+            prerequisites_text TEXT,
+            sort_order INTEGER NOT NULL,
+            review_state TEXT NOT NULL DEFAULT 'accepted' CHECK (review_state IN ('accepted', 'needs_review', 'draft')),
+            UNIQUE(profile_id, source_block_id)
+        );
+
+        CREATE TABLE competency_skill (
+            id INTEGER PRIMARY KEY,
+            profile_competency_id INTEGER NOT NULL,
+            skill_id INTEGER,
+            source_skill_name TEXT NOT NULL,
+            skill_order INTEGER NOT NULL,
+            review_state TEXT NOT NULL DEFAULT 'accepted' CHECK (review_state IN ('accepted', 'needs_review', 'draft')),
+            UNIQUE(profile_competency_id, skill_order)
+        );
+
+        CREATE TABLE dimension (
+            id INTEGER PRIMARY KEY,
+            code TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL
+        );
+
+        CREATE TABLE indicator_row (
+            id INTEGER PRIMARY KEY,
+            competency_skill_id INTEGER NOT NULL,
+            dimension_id INTEGER NOT NULL,
+            source_row_number INTEGER NOT NULL,
+            inherited_skill INTEGER NOT NULL DEFAULT 0,
+            inherited_dimension INTEGER NOT NULL DEFAULT 0,
+            base_text TEXT,
+            raw_number TEXT,
+            notes TEXT,
+            UNIQUE(competency_skill_id, source_row_number)
+        );
+
+        INSERT INTO dimension(code, title)
+        VALUES
+            ('knowledge', 'Знает'),
+            ('understanding', 'Понимает'),
+            ('ability', 'Умеет'),
+            ('proficiency', 'Владеет'),
+            ('unspecified', 'Не указано');
         """
     )
     raw.commit()
@@ -147,6 +268,75 @@ def test_accept_promotes_skill_and_alias(monkeypatch: pytest.MonkeyPatch) -> Non
             (suggestion["canonical_skill_id"], "Методологический smoke skill"),
         ).fetchone()
         assert alias["source"] == "intake_accept"
+
+        structural_link = conn.execute(
+            """
+            SELECT
+                c.title AS competency_title,
+                c.status AS competency_status,
+                p.slug AS profile_slug,
+                pc.review_state AS profile_competency_state,
+                cs.id AS competency_skill_id,
+                cs.review_state AS competency_skill_state,
+                COUNT(ir.id) AS indicator_rows
+            FROM competency_skill cs
+            JOIN profile_competency pc ON pc.id = cs.profile_competency_id
+            JOIN competency c ON c.id = pc.competency_id
+            JOIN profile p ON p.id = pc.profile_id
+            LEFT JOIN indicator_row ir ON ir.competency_skill_id = cs.id
+            WHERE cs.skill_id = ?
+            GROUP BY cs.id, c.id, p.id
+            """,
+            (suggestion["canonical_skill_id"],),
+        ).fetchone()
+        assert structural_link["competency_title"] == "Тестовая группа"
+        assert structural_link["competency_status"] == "candidate"
+        assert structural_link["profile_slug"] == "intake-accepted-skills"
+        assert structural_link["profile_competency_state"] == "needs_review"
+        assert structural_link["competency_skill_state"] == "needs_review"
+        assert structural_link["indicator_rows"] == 1
+
+        competency_review = conn.execute(
+            """
+            SELECT rq.id, rq.status, rq.reason_code, rq.details
+            FROM review_queue rq
+            JOIN competency c ON c.id = rq.entity_id
+            WHERE rq.entity_type = 'competency'
+              AND c.title = ?
+              AND rq.reason_code = 'new_competency_candidate'
+            """,
+            ("Тестовая группа",),
+        ).fetchone()
+        assert competency_review["status"] == "open"
+        assert "Тестовая группа" in competency_review["details"]
+
+        flat_indicator = conn.execute(
+            """
+            SELECT indicator_type, source_indicator_row_id
+            FROM indicator
+            WHERE skill_id = ? AND text = ?
+            """,
+            (suggestion["canonical_skill_id"], "Применяет: Методологический smoke skill"),
+        ).fetchone()
+        assert flat_indicator["indicator_type"] == "Умеет"
+        assert flat_indicator["source_indicator_row_id"] is not None
+
+        update_review_status(conn, int(competency_review["id"]), "resolved", "competency accepted in test")
+        accepted_link = conn.execute(
+            """
+            SELECT c.status AS competency_status,
+                   pc.review_state AS profile_competency_state,
+                   cs.review_state AS competency_skill_state
+            FROM competency_skill cs
+            JOIN profile_competency pc ON pc.id = cs.profile_competency_id
+            JOIN competency c ON c.id = pc.competency_id
+            WHERE cs.id = ?
+            """,
+            (structural_link["competency_skill_id"],),
+        ).fetchone()
+        assert accepted_link["competency_status"] == "active"
+        assert accepted_link["profile_competency_state"] == "accepted"
+        assert accepted_link["competency_skill_state"] == "accepted"
 
         review = conn.execute("SELECT status, resolution_note FROM review_queue WHERE entity_id = ?", (suggestion_id,)).fetchone()
         assert review["status"] == "resolved"
@@ -1079,6 +1269,14 @@ def test_skill_name_canonicalization_and_resolve_source_alias(monkeypatch: pytes
     monkeypatch.setattr(config, "USE_LIVE", False)
     assert canonicalize_skill_name("Сформулировать ценностное предложение") == "Формулирование ценностного предложения"
     assert canonicalize_skill_name("Провести глубинное интервью") == "Проведение глубинных интервью"
+    assert canonicalize_skill_name("Выбирать метод проверки и запускать эксперимент") == "Выбор метода проверки и запуска эксперимента"
+    assert canonicalize_skill_name("Синтезировать инсайты пользователей") == "Синтез инсайтов пользователей"
+    assert canonicalize_skill_name("Формулирование проблемную гипотезу") == "Формулирование проблемной гипотезы"
+    assert canonicalize_skill_name("Оформить спецификацию") == "Оформление спецификации"
+    assert canonicalize_skill_name("Дизайн экспериментов") == "Проектирование экспериментов"
+    assert canonicalize_skill_name("Ключевого сообщения") == "Формулирование ключевого сообщения продукта"
+    assert canonicalize_skill_name("Сценариев использования") == "Описание сценариев использования"
+    assert canonicalize_skill_name("Инцидентного реагирования") == "Организация инцидентного реагирования"
 
     db_path = _runtime_db_path("source-resolve")
     conn = _create_base_catalog_db(db_path)

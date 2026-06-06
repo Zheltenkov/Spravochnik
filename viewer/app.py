@@ -81,6 +81,7 @@ REVIEW_REASON_LABELS = {
     "single_source": "Недостаточно подтверждающих источников",
     "council_split": "Модели не согласились между собой",
     "catalog_match_suspicious": "Подозрительный match с каталогом: нужно проверить смысл и группу canonical skill",
+    "new_competency_candidate": "Новая competency требует подтверждения",
     "missing_observable_action": "Название не похоже на наблюдаемый навык: нет действия или отглагольного существительного",
     "auto_accept_policy": "Автопринято по policy: уверенность >= 0.95 и согласие жюри = 1.00",
     "composite_decomposed": "Кандидат разбит на атомарные части",
@@ -2204,12 +2205,13 @@ def refresh_catalog_skill_complexity(conn: sqlite3.Connection, skill_id: int, co
 
 
 def update_review_status(conn: sqlite3.Connection, review_id: int, new_status: str, resolution_note: str) -> None:
+    from spravochnik_intake.pipeline import competency_catalog
     from spravochnik_intake.pipeline import storage
 
     repair_intake_review_links(conn)
     review_row = conn.execute(
         """
-        SELECT id, entity_id, source_ref, reason_code, details
+        SELECT id, entity_type, entity_id, source_ref, reason_code, details
         FROM review_queue
         WHERE id = ?
         """,
@@ -2233,7 +2235,15 @@ def update_review_status(conn: sqlite3.Connection, review_id: int, new_status: s
     brief_id = parse_brief_id(review_row["source_ref"])
     suggestion_id = review_row["entity_id"]
     details = parse_review_details_json(review_row["details"])
-    if brief_id is not None and details.get("review_kind") == "prerequisite_edge":
+    if review_row["entity_type"] == "competency" and suggestion_id:
+        competency_id = int(suggestion_id)
+        if new_status == "resolved":
+            competency_catalog.resolve_competency_candidate(conn, competency_id=competency_id, accepted=True)
+        elif new_status == "ignored":
+            competency_catalog.resolve_competency_candidate(conn, competency_id=competency_id, accepted=False)
+        else:
+            competency_catalog.reopen_competency_candidate(conn, competency_id=competency_id)
+    elif brief_id is not None and details.get("review_kind") == "prerequisite_edge":
         if new_status in {"resolved", "ignored"}:
             save_prerequisite_edge_decision(
                 conn,
@@ -4768,6 +4778,8 @@ def create_app(db_path: Path, summary_path: Path):
             except ValueError:
                 return not_found(start_response)
 
+            from spravochnik_intake.pipeline import competency_catalog
+
             catalog_conn = open_db(db_path)
             try:
                 if method == "POST":
@@ -4808,6 +4820,22 @@ def create_app(db_path: Path, summary_path: Path):
                         if target_skill_id:
                             merge_catalog_skills(catalog_conn, skill_id, target_skill_id)
                             return redirect_response(start_response, f"/catalog-admin/skills/{target_skill_id}")
+                    elif action == "link_competency":
+                        skill = get_catalog_skill(catalog_conn, skill_id)
+                        if skill:
+                            competency_catalog.ensure_skill_competency_link(
+                                catalog_conn,
+                                skill_id=skill_id,
+                                skill_name=str(skill.get("name") or "Skill"),
+                                competency_title=form_data.get("competency_title", ""),
+                                indicators=None,
+                                source_note="manual_catalog_admin",
+                            )
+                            catalog_conn.commit()
+                    elif action == "unlink_competency":
+                        competency_skill_id = int(form_data.get("competency_skill_id", "0") or 0)
+                        if competency_skill_id:
+                            competency_catalog.remove_competency_skill_link(catalog_conn, competency_skill_id)
                     elif action == "create_indicator":
                         create_catalog_indicator(
                             catalog_conn,
@@ -4841,6 +4869,9 @@ def create_app(db_path: Path, summary_path: Path):
                 aliases = list_skill_aliases(catalog_conn, skill_id)
                 merge_query = (query_params.get("merge_query") or [""])[0].strip()
                 merge_candidates = search_catalog_skills(catalog_conn, merge_query, exclude_skill_id=skill_id) if merge_query else []
+                competency_query = (query_params.get("competency_query") or [""])[0].strip()
+                competency_links = competency_catalog.list_skill_competency_links(catalog_conn, skill_id)
+                competency_options = competency_catalog.list_competency_options(catalog_conn, competency_query)
                 html = render(
                     "catalog_admin_skill_detail.html",
                     {
@@ -4850,6 +4881,9 @@ def create_app(db_path: Path, summary_path: Path):
                         "aliases": aliases,
                         "merge_query": merge_query,
                         "merge_candidates": merge_candidates,
+                        "competency_query": competency_query,
+                        "competency_links": competency_links,
+                        "competency_options": competency_options,
                         "request_path": path,
                     },
                 )

@@ -812,7 +812,9 @@ def synthesize_draft_from_brief(brief: str, spec: dict) -> tuple[list[SkillCandi
                 "status в coverage: covered|partial|uncovered. "
                 "Кандидаты должны быть learner-skills/graduate outcomes, а не роли, staffing, бюджет, ресурсы программы или решения команды запуска. "
                 "На одну область дай 1-2 наиболее важных skill-кандидата. "
-                "Название формулируй как наблюдаемый навык/action."
+                "Название формулируй как нейтральную запись для справочника через отглагольное существительное: "
+                "'Проведение интервью', 'Формулирование гипотезы', 'Настройка CI/CD'. "
+                "Не используй инфинитивы и повелительные формулировки: плохо 'Провести интервью', 'Выбрать метрику', 'Запустить эксперимент'."
             )
         else:
             sys = (
@@ -820,7 +822,8 @@ def synthesize_draft_from_brief(brief: str, spec: dict) -> tuple[list[SkillCandi
                 + RUSSIAN_OUTPUT_RULE
                 + " "
                 "Верни строгий JSON {candidates:[{name,group,coverage_area,indicators:[{text,bloom}],tools}]}. "
-                "Извлекай только learner-skills и graduate outcomes. Название формулируй как skill/action."
+                "Извлекай только learner-skills и graduate outcomes. "
+                "Название формулируй как нейтральную запись для справочника через отглагольное существительное, не инфинитив."
             )
         data = json.loads(llm.content(llm.chat(
             config.MODEL_PLAN,
@@ -962,9 +965,9 @@ def synthesize_with_coverage(evidence: list[Evidence], spec: dict) -> tuple[list
                 "candidates:[{name,group,coverage_area,indicators:[{text,bloom}],tools,evidence_ids}]}. "
                 "status в coverage: covered|partial|uncovered. "
                 "Кандидаты должны быть только learner-skills/graduate outcomes. "
-                "Название кандидата формулируй как наблюдаемый навык или действие, а не как роль/должность человека. "
+                "Название кандидата формулируй как нейтральную запись для справочника через отглагольное существительное, а не как роль/должность человека. "
                 "Хорошо: 'Проведение проблемных интервью', 'Настройка CI/CD', 'Планирование работ'. "
-                "Плохо: 'Исследователь', 'Маркетолог', 'Стратег', 'Инженер'. "
+                "Плохо: 'Исследователь', 'Маркетолог', 'Стратег', 'Инженер', 'Провести интервью', 'Запустить эксперимент'. "
                 "Не включай staffing decisions, преподавателей, бюджет, ресурсы программы, критерии набора, состав когорты, функции команды запуска, outsourcing-решения, роли операторов программы. "
                 "Старайся не концентрироваться только в одной инженерной зоне: распределяй кандидатов по разным must_include_areas. "
                 "На одну область давай 1-2 наиболее важных атомарных skill-кандидата, если evidence это поддерживает. "
@@ -978,7 +981,7 @@ def synthesize_with_coverage(evidence: list[Evidence], spec: dict) -> tuple[list
                 "Строгий JSON {candidates:[{name,group,indicators:[{text,bloom}],tools,evidence_ids}]}. "
                 "evidence_ids только из предоставленных. Навык без evidence не включай. "
                 "Важное правило: извлекай только learner-skills и graduate outcomes. "
-                "Название кандидата формулируй как skill/action, а не как роль или должность. "
+                "Название кандидата формулируй как нейтральный skill label для справочника, а не как роль или должность. "
                 "Не включай staffing decisions, роли команды запуска программы, размер когорты, критерии набора, загрузку преподавателей, бюджет, ресурсы программы, outsourcing-решения. "
                 "Если бриф про образовательную программу, ориентируйся на target_role и must_include_areas выпускника."
             )

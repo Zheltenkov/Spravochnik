@@ -7,7 +7,7 @@ import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path
 from . import competency_catalog, config
-from .models import Evidence, PrereqEdge, SkillCandidate
+from .models import Evidence, SkillCandidate
 
 _REQUIRED_COLS = {
     "skill_suggestion": [
@@ -136,6 +136,10 @@ def apply_migration(con: sqlite3.Connection, sql_path: str) -> None:
         con.execute("CREATE INDEX IF NOT EXISTS idx_skill_prerequisite_brief ON skill_prerequisite(brief_id)")
     if _existing_cols(con, "review_queue"):
         con.execute("CREATE INDEX IF NOT EXISTS idx_review_queue_source_ref ON review_queue(source_ref, status)")
+    if _table_exists(con, "skill_set_item"):
+        con.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_skill_set_item_unique ON skill_set_item(skill_set_id, skill_id, role, COALESCE(plan_row_id, 0))"
+        )
     con.commit()
 
 
@@ -787,6 +791,216 @@ def _existing_promotion(con: sqlite3.Connection, suggestion_id: int) -> sqlite3.
     ).fetchone()
 
 
+def _skillset_code(*parts: object) -> str:
+    return "skillset-" + "-".join(_slug_catalog_key(str(part)) for part in parts if str(part or "").strip())
+
+
+def _accepted_atomic_skill_rows(con: sqlite3.Connection, brief_id: int) -> list[sqlite3.Row]:
+    if not _table_exists(con, "skill_suggestion"):
+        return []
+    return con.execute(
+        """
+        SELECT
+            ss.id AS suggestion_id,
+            ss.canonical_skill_id AS skill_id,
+            ss.suggested_name,
+            ss.group_name,
+            ss.coverage_area,
+            ss.confidence,
+            s.canonical_name
+        FROM skill_suggestion ss
+        JOIN skill s ON s.id = ss.canonical_skill_id
+        WHERE ss.brief_id = ?
+          AND ss.entity_type = 'skill'
+          AND ss.atomicity = 'atomic'
+          AND ss.decision = 'accepted'
+          AND ss.canonical_skill_id IS NOT NULL
+        ORDER BY COALESCE(ss.coverage_area, ss.group_name, ''), ss.id
+        """,
+        (brief_id,),
+    ).fetchall()
+
+
+def upsert_skill_set(
+    con: sqlite3.Connection,
+    *,
+    code: str,
+    title: str,
+    source_type: str,
+    source_id: int | None = None,
+    source_ref: str = "",
+    description: str = "",
+    status: str = "active",
+    metadata: dict[str, object] | None = None,
+) -> int | None:
+    """Create or update a reusable skill set without touching catalog taxonomy."""
+    if not _table_exists(con, "skill_set"):
+        return None
+    normalized_code = _skillset_code(code)
+    metadata_json = json.dumps(metadata or {}, ensure_ascii=False)
+    con.execute(
+        """
+        INSERT INTO skill_set(
+            code, title, description, source_type, source_id, source_ref,
+            status, metadata_json, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(code) DO UPDATE SET
+            title = excluded.title,
+            description = excluded.description,
+            source_type = excluded.source_type,
+            source_id = excluded.source_id,
+            source_ref = excluded.source_ref,
+            status = excluded.status,
+            metadata_json = excluded.metadata_json,
+            updated_at = excluded.updated_at
+        """,
+        (
+            normalized_code,
+            title.strip(),
+            description.strip(),
+            source_type,
+            source_id,
+            source_ref.strip(),
+            status,
+            metadata_json,
+            _utc_now_iso(),
+        ),
+    )
+    row = con.execute("SELECT id FROM skill_set WHERE code = ?", (normalized_code,)).fetchone()
+    return int(row["id"]) if row else None
+
+
+def replace_skill_set_items(
+    con: sqlite3.Connection,
+    skill_set_id: int,
+    items: list[dict[str, object]],
+) -> int:
+    """Rewrite skill-set membership idempotently."""
+    if not _table_exists(con, "skill_set_item"):
+        return 0
+    con.execute("DELETE FROM skill_set_item WHERE skill_set_id = ?", (skill_set_id,))
+    inserted = 0
+    for index, item in enumerate(items, start=1):
+        skill_id = int(item.get("skill_id") or 0)
+        if not skill_id:
+            continue
+        con.execute(
+            """
+            INSERT OR IGNORE INTO skill_set_item(
+                skill_set_id, skill_id, suggestion_id, plan_row_id, role,
+                weight, sort_order, rationale
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                skill_set_id,
+                skill_id,
+                item.get("suggestion_id"),
+                item.get("plan_row_id"),
+                str(item.get("role") or "target"),
+                float(item.get("weight") or 1.0),
+                int(item.get("sort_order") or index),
+                str(item.get("rationale") or ""),
+            ),
+        )
+        inserted += 1
+    return inserted
+
+
+def sync_brief_skill_set(con: sqlite3.Connection, brief_id: int) -> dict[str, object]:
+    """Persist accepted atomic skills as a reusable skill set for the brief."""
+    rows = _accepted_atomic_skill_rows(con, brief_id)
+    if not _table_exists(con, "skill_set"):
+        return {"status": "skipped", "brief_id": brief_id, "item_count": 0}
+    if not rows:
+        code = _skillset_code(f"brief-{brief_id}-accepted")
+        existing = con.execute("SELECT id FROM skill_set WHERE code = ?", (code,)).fetchone()
+        if existing:
+            skill_set_id = int(existing["id"])
+            if _table_exists(con, "skill_set_item"):
+                con.execute("DELETE FROM skill_set_item WHERE skill_set_id = ?", (skill_set_id,))
+            con.execute(
+                "UPDATE skill_set SET status = 'archived', updated_at = ? WHERE id = ?",
+                (_utc_now_iso(), skill_set_id),
+            )
+        return {"status": "archived_empty", "brief_id": brief_id, "item_count": 0}
+    skill_set_id = upsert_skill_set(
+        con,
+        code=f"brief-{brief_id}-accepted",
+        title=f"Набор skills по брифу #{brief_id}",
+        source_type="brief",
+        source_id=brief_id,
+        source_ref=f"brief:{brief_id}",
+        description="Принятые методологом атомарные skills, используемые для DAG и УП.",
+        metadata={
+            "brief_id": brief_id,
+            "item_count": len(rows),
+            "coverage_areas": sorted({str(row["coverage_area"] or row["group_name"] or "").strip() for row in rows if str(row["coverage_area"] or row["group_name"] or "").strip()}),
+        },
+    )
+    if skill_set_id is None:
+        return {"status": "skipped", "brief_id": brief_id, "item_count": 0}
+    items = [
+        {
+            "skill_id": int(row["skill_id"]),
+            "suggestion_id": int(row["suggestion_id"]),
+            "role": "target",
+            "weight": 1.0,
+            "sort_order": index,
+            "rationale": f"accepted_atomic:{row['suggestion_id']}",
+        }
+        for index, row in enumerate(rows, start=1)
+    ]
+    item_count = replace_skill_set_items(con, skill_set_id, items)
+    return {"status": "synced", "brief_id": brief_id, "skill_set_id": skill_set_id, "item_count": item_count}
+
+
+def sync_curriculum_plan_skill_set(
+    con: sqlite3.Connection,
+    *,
+    brief_id: int,
+    plan_id: int,
+    plan_payload: dict[str, object],
+) -> dict[str, object]:
+    """Persist the skill set used by a curriculum plan without changing plan rows."""
+    rows = _accepted_atomic_skill_rows(con, brief_id)
+    if not rows or not _table_exists(con, "skill_set"):
+        return {"status": "skipped", "plan_id": plan_id, "item_count": 0}
+    report = plan_payload.get("report") if isinstance(plan_payload.get("report"), dict) else {}
+    quality_metrics = report.get("quality_metrics") if isinstance(report.get("quality_metrics"), dict) else {}
+    skill_set_id = upsert_skill_set(
+        con,
+        code=f"curriculum-plan-{plan_id}-skills",
+        title=f"Набор skills для УП #{plan_id}",
+        source_type="curriculum_plan",
+        source_id=plan_id,
+        source_ref=f"curriculum_plan:{plan_id};brief:{brief_id}",
+        description="Skills, на которых построен сохранённый черновик учебного плана.",
+        metadata={
+            "brief_id": brief_id,
+            "plan_id": plan_id,
+            "item_count": len(rows),
+            "quality_metrics": quality_metrics,
+        },
+    )
+    if skill_set_id is None:
+        return {"status": "skipped", "plan_id": plan_id, "item_count": 0}
+    items = [
+        {
+            "skill_id": int(row["skill_id"]),
+            "suggestion_id": int(row["suggestion_id"]),
+            "role": "target",
+            "weight": 1.0,
+            "sort_order": index,
+            "rationale": f"curriculum_plan:{plan_id}",
+        }
+        for index, row in enumerate(rows, start=1)
+    ]
+    item_count = replace_skill_set_items(con, skill_set_id, items)
+    return {"status": "synced", "plan_id": plan_id, "skill_set_id": skill_set_id, "item_count": item_count}
+
+
 def promote_suggestion_to_catalog(con: sqlite3.Connection, suggestion_id: int) -> dict[str, object]:
     row = _load_skill_suggestion_row(con, suggestion_id)
     if not row:
@@ -927,6 +1141,7 @@ def promote_suggestion_to_catalog(con: sqlite3.Connection, suggestion_id: int) -
         indicators=row["indicators_json"],
         source_note=f"intake_accept:suggestion:{suggestion_id}",
     )
+    skill_set = sync_brief_skill_set(con, int(row["brief_id"]))
     con.commit()
     return {
         "status": "promoted",
@@ -936,6 +1151,7 @@ def promote_suggestion_to_catalog(con: sqlite3.Connection, suggestion_id: int) -
         "created_alias": created_alias,
         "resolution_after": resolution_after,
         "competency_link": competency_link,
+        "skill_set": skill_set,
     }
 
 
@@ -1018,6 +1234,7 @@ def revert_suggestion_promotion(con: sqlite3.Connection, suggestion_id: int) -> 
         """,
         (_utc_now_iso(), suggestion_id),
     )
+    sync_brief_skill_set(con, int(row["brief_id"]))
     con.commit()
     return {
         "status": "reverted",
@@ -1124,6 +1341,12 @@ def save_suggestions(con: sqlite3.Connection, brief_id: int, cands: list[SkillCa
     for c in ordered:
         parent_db_id = tmp_to_db.get(c.parent_tmp_id) if c.parent_tmp_id else None
         stored_decision = c.decision
+        if (
+            stored_decision == "needs_review"
+            and c.atomicity == "composite"
+            and "composite_decomposed" in (c.reasons or [])
+        ):
+            stored_decision = "superseded"
         if stored_decision == "superseded" and not allow_superseded:
             stored_decision = "rejected"
         con.execute(
@@ -1159,7 +1382,7 @@ def save_suggestions(con: sqlite3.Connection, brief_id: int, cands: list[SkillCa
         )
         tmp_to_db[c.tmp_id] = con.execute("SELECT last_insert_rowid()").fetchone()[0]
         # спорное -> в существующую review_queue (переиспользуем механизм каталога)
-        if c.decision == "needs_review":
+        if stored_decision == "needs_review":
             rq_entity_type = _review_queue_entity_type(c)
             primary_reason = c.reasons[0] if c.reasons else "needs_review"
             severity = "warning" if primary_reason in {"novel_skill", "council_split", "fuzzy_match_ambiguous", "low_confidence"} else "info"
@@ -1233,7 +1456,7 @@ def save_prerequisite_reviews(con: sqlite3.Connection, brief_id: int, edge_revie
         con.execute(
             """
             INSERT INTO review_queue(entity_type, entity_id, source_ref, reason_code, severity, details, status)
-            VALUES ('skill', NULL, ?, ?, ?, ?, 'open')
+            VALUES ('prerequisite_edge', NULL, ?, ?, ?, ?, 'open')
             """,
             (
                 f"brief:{brief_id}",
@@ -1266,6 +1489,14 @@ def clear_curriculum_plan(con: sqlite3.Connection, brief_id: int, source_policy:
         (brief_id, source_policy),
     ).fetchall()
     for row in plan_rows:
+        if _table_exists(con, "skill_set") and _table_exists(con, "skill_set_item"):
+            skill_set_rows = con.execute(
+                "SELECT id FROM skill_set WHERE source_type = 'curriculum_plan' AND source_id = ?",
+                (row["id"],),
+            ).fetchall()
+            for skill_set_row in skill_set_rows:
+                con.execute("DELETE FROM skill_set_item WHERE skill_set_id = ?", (skill_set_row["id"],))
+            con.execute("DELETE FROM skill_set WHERE source_type = 'curriculum_plan' AND source_id = ?", (row["id"],))
         con.execute("DELETE FROM curriculum_plan_row WHERE plan_id = ?", (row["id"],))
     con.execute(
         "DELETE FROM curriculum_plan WHERE brief_id = ? AND source_policy = ?",
@@ -1357,5 +1588,11 @@ def save_curriculum_plan(
             ),
         )
         row_count += 1
+    skill_set = sync_curriculum_plan_skill_set(
+        con,
+        brief_id=brief_id,
+        plan_id=plan_id,
+        plan_payload=plan_payload,
+    )
     con.commit()
-    return {"plan_id": plan_id, "row_count": row_count}
+    return {"plan_id": plan_id, "row_count": row_count, "skill_set_id": int(skill_set.get("skill_set_id") or 0)}

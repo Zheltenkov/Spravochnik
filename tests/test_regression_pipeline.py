@@ -25,13 +25,20 @@ from spravochnik_intake.pipeline import (
 )
 from spravochnik_intake.pipeline.catalog_repo import CatalogRepo
 from spravochnik_intake.pipeline.curriculum import PlanNode, ProjectBlueprint, SkillOccurrence
+from spravochnik_intake.pipeline.curriculum import planner as curriculum_planner
 from spravochnik_intake.pipeline.models import IndicatorSpec, SkillCandidate
-from spravochnik_intake.pipeline.skill_names import canonicalize_skill_name
+from spravochnik_intake.pipeline.skill_names import canonicalize_skill_name, looks_like_genitive_fragment
 from viewer.app import (
     apply_candidate_decision,
+    apply_brief_catalog_decisions,
+    build_candidate_recommended_action,
     build_curriculum_plan_payload_from_rows,
+    build_curriculum_plan_for_brief,
     build_dag_for_brief,
+    build_intake_workspace_state,
+    build_intake_quality_metrics,
     build_intake_workflow_steps,
+    clear_intake_workspace,
     create_intake_job,
     create_catalog_indicator,
     create_catalog_skill,
@@ -39,12 +46,24 @@ from viewer.app import (
     ensure_catalog_group,
     ensure_intake_runtime_schema,
     get_intake_job,
+    get_brief_catalog_apply_state,
     merge_catalog_skills,
     load_brief_spec_for_plan,
+    load_llm_usage_summary,
+    list_candidate_competencies,
+    list_catalog_groups,
+    list_skill_sets,
+    merge_candidate_competency,
+    move_candidate_competency_skill,
     open_db,
+    repair_dirty_profile_names,
+    rename_candidate_competency,
     update_review_status,
     update_intake_job,
 )
+from viewer.migrations import apply_runtime_migrations
+from viewer.observability import build_decision_rationale, build_job_observability
+from viewer.route_zones import detect_route_zone, get_secondary_nav, show_secondary_nav
 
 RUNTIME_DIR = PROJECT_ROOT / "test_runtime"
 RUNTIME_DIR.mkdir(exist_ok=True)
@@ -202,6 +221,16 @@ def _create_base_catalog_db(db_path: Path) -> sqlite3.Connection:
             UNIQUE(competency_skill_id, source_row_number)
         );
 
+        CREATE TABLE indicator_level_cell (
+            id INTEGER PRIMARY KEY,
+            indicator_row_id INTEGER NOT NULL,
+            proficiency_level_id INTEGER,
+            raw_level_label TEXT NOT NULL,
+            raw_value TEXT NOT NULL,
+            value_kind TEXT NOT NULL,
+            sort_order INTEGER NOT NULL
+        );
+
         INSERT INTO dimension(code, title)
         VALUES
             ('knowledge', 'Знает'),
@@ -237,8 +266,9 @@ def _candidate(name: str, *, group: str = "Тестовая группа", bloom
     )
 
 
-def test_accept_promotes_skill_and_alias(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_accept_then_batch_apply_promotes_skill_and_alias(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(config, "USE_LIVE", False)
+    monkeypatch.setattr(config, "USE_UP_TEMPLATE_CONSILIUM", False)
     db_path = _runtime_db_path("accept")
     conn = _create_base_catalog_db(db_path)
     try:
@@ -255,6 +285,17 @@ def test_accept_promotes_skill_and_alias(monkeypatch: pytest.MonkeyPatch) -> Non
             (suggestion_id,),
         ).fetchone()
         assert suggestion["decision"] == "accepted"
+        assert suggestion["resolution"] == "new"
+        assert suggestion["canonical_skill_id"] is None
+        assert conn.execute("SELECT COUNT(*) FROM skill_promotion_log WHERE status = 'active'").fetchone()[0] == 0
+
+        apply_result = apply_brief_catalog_decisions(conn, brief_id)
+        assert apply_result["catalog_state"]["catalog_applied"] is True
+
+        suggestion = conn.execute(
+            "SELECT decision, resolution, canonical_skill_id FROM skill_suggestion WHERE id = ?",
+            (suggestion_id,),
+        ).fetchone()
         assert suggestion["resolution"] in {"matched", "alias"}
         assert suggestion["canonical_skill_id"] is not None
 
@@ -296,6 +337,19 @@ def test_accept_promotes_skill_and_alias(monkeypatch: pytest.MonkeyPatch) -> Non
         assert structural_link["competency_skill_state"] == "needs_review"
         assert structural_link["indicator_rows"] == 1
 
+        level_cell = conn.execute(
+            """
+            SELECT ilc.raw_level_label, ilc.raw_value, ilc.value_kind
+            FROM indicator_level_cell ilc
+            JOIN indicator_row ir ON ir.id = ilc.indicator_row_id
+            WHERE ir.competency_skill_id = ?
+            """,
+            (structural_link["competency_skill_id"],),
+        ).fetchone()
+        assert level_cell["raw_level_label"] == "Умеет"
+        assert level_cell["raw_value"] == "Применяет: Методологический smoke skill"
+        assert level_cell["value_kind"] == "text"
+
         competency_review = conn.execute(
             """
             SELECT rq.id, rq.status, rq.reason_code, rq.details
@@ -320,6 +374,21 @@ def test_accept_promotes_skill_and_alias(monkeypatch: pytest.MonkeyPatch) -> Non
         ).fetchone()
         assert flat_indicator["indicator_type"] == "Умеет"
         assert flat_indicator["source_indicator_row_id"] is not None
+
+        skill_set = conn.execute(
+            """
+            SELECT ss.id, ss.source_type, ss.source_id, COUNT(ssi.id) AS item_count
+            FROM skill_set ss
+            JOIN skill_set_item ssi ON ssi.skill_set_id = ss.id
+            WHERE ss.source_type = 'brief'
+              AND ss.source_id = ?
+            GROUP BY ss.id
+            """,
+            (brief_id,),
+        ).fetchone()
+        assert skill_set["item_count"] == 1
+        assert skill_set["source_id"] == brief_id
+        assert any(item["source_type"] == "brief" and item["skill_count"] == 1 for item in list_skill_sets(conn))
 
         update_review_status(conn, int(competency_review["id"]), "resolved", "competency accepted in test")
         accepted_link = conn.execute(
@@ -346,8 +415,71 @@ def test_accept_promotes_skill_and_alias(monkeypatch: pytest.MonkeyPatch) -> Non
         db_path.unlink(missing_ok=True)
 
 
+def test_catalog_apply_allows_duplicate_candidates_to_one_canonical_skill(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "USE_LIVE", False)
+    monkeypatch.setattr(config, "USE_UP_TEMPLATE_CONSILIUM", False)
+    db_path = _runtime_db_path("duplicate-candidate-catalog-state")
+    conn = _create_base_catalog_db(db_path)
+    try:
+        brief_id = storage.save_brief(conn, "brief", {"role": "роль", "seniority": "junior", "domain": "домен"})
+        first = _candidate("Расчёт unit economics", group="Финансы", decision="accepted")
+        second = _candidate("Расчёт unit economics", group="Финансы", decision="accepted")
+        first.tmp_id = "S1"
+        second.tmp_id = "S2"
+        storage.save_suggestions(conn, brief_id, [first, second], {})
+
+        apply_brief_catalog_decisions(conn, brief_id)
+        state = get_brief_catalog_apply_state(conn, brief_id)
+
+        assert state["accepted_atomic"] == 2
+        assert state["active_promotions"] == 2
+        assert state["active_promoted_skills"] == 1
+        assert state["skill_set_items"] == 1
+        assert state["catalog_applied"] is True
+    finally:
+        conn.close()
+        db_path.unlink(missing_ok=True)
+
+
+def test_clear_intake_workspace_reverts_promotions_and_transient_data(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "USE_LIVE", False)
+    monkeypatch.setattr(config, "USE_UP_TEMPLATE_CONSILIUM", False)
+    db_path = _runtime_db_path("clear-intake")
+    conn = _create_base_catalog_db(db_path)
+    try:
+        brief_id = storage.save_brief(conn, "brief", {"role": "роль", "seniority": "junior", "domain": "домен"})
+        suggestion_id = storage.save_suggestions(conn, brief_id, [_candidate("Навык для очистки intake")], {})[
+            "tmp-Навык для очистки intake"
+        ]
+        apply_candidate_decision(conn, suggestion_id, "accepted", "accepted before cleanup")
+        apply_brief_catalog_decisions(conn, brief_id)
+        assert conn.execute("SELECT COUNT(*) FROM skill_promotion_log WHERE status = 'active'").fetchone()[0] == 1
+
+        stats = clear_intake_workspace(conn)
+
+        assert stats["skill_promotions_reverted"] == 1
+        assert conn.execute("SELECT COUNT(*) FROM intake_job").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM skill_suggestion").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM skill_set WHERE source_type IN ('brief', 'curriculum_plan')").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM skill_set_item").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM skill_promotion_log").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM review_queue WHERE source_ref LIKE 'brief:%'").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM indicator WHERE source_scale_title = 'intake-live'").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM indicator_row WHERE COALESCE(notes, '') LIKE 'intake_accept:%'").fetchone()[0] == 0
+        skill = conn.execute(
+            "SELECT status, is_active FROM skill WHERE canonical_name = ?",
+            ("Навык для очистки intake",),
+        ).fetchone()
+        assert skill["status"] == "candidate"
+        assert int(skill["is_active"]) == 0
+    finally:
+        conn.close()
+        db_path.unlink(missing_ok=True)
+
+
 def test_accept_promotes_neutral_name_and_original_alias(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(config, "USE_LIVE", False)
+    monkeypatch.setattr(config, "USE_UP_TEMPLATE_CONSILIUM", False)
     db_path = _runtime_db_path("neutral")
     conn = _create_base_catalog_db(db_path)
     try:
@@ -357,6 +489,7 @@ def test_accept_promotes_neutral_name_and_original_alias(monkeypatch: pytest.Mon
         suggestion_id = storage.save_suggestions(conn, brief_id, [candidate], {})["tmp-Формулирование ценностного предложения"]
 
         apply_candidate_decision(conn, suggestion_id, "accepted", "accepted in test")
+        apply_brief_catalog_decisions(conn, brief_id)
 
         suggestion = conn.execute(
             "SELECT canonical_skill_id FROM skill_suggestion WHERE id = ?",
@@ -400,8 +533,30 @@ def test_merge_moves_aliases_indicators_and_archives_source() -> None:
         db_path.unlink(missing_ok=True)
 
 
+def test_catalog_group_list_hides_empty_generated_groups_but_keeps_manual() -> None:
+    db_path = _runtime_db_path("groups")
+    conn = _create_base_catalog_db(db_path)
+    try:
+        manual_id = ensure_catalog_group(conn, "manual-empty", "Manual Empty", 10, "active", "manual")
+        conn.execute(
+            """
+            INSERT INTO skill_group(code, name, sort_order, status, source, updated_at)
+            VALUES ('group-generated-empty', 'Generated Empty', 20, 'active', 'derived', CURRENT_TIMESTAMP)
+            """
+        )
+        visible_names = {str(row["name"]) for row in list_catalog_groups(conn)}
+
+        assert manual_id
+        assert "Manual Empty" in visible_names
+        assert "Generated Empty" not in visible_names
+    finally:
+        conn.close()
+        db_path.unlink(missing_ok=True)
+
+
 def test_dag_rebuild_persists_edges_and_curriculum(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(config, "USE_LIVE", False)
+    monkeypatch.setattr(config, "USE_UP_TEMPLATE_CONSILIUM", False)
     db_path = _runtime_db_path("dag")
     conn = _create_base_catalog_db(db_path)
     try:
@@ -411,6 +566,7 @@ def test_dag_rebuild_persists_edges_and_curriculum(monkeypatch: pytest.MonkeyPat
             _candidate("SQL запросы", bloom="apply", decision="accepted"),
         ]
         storage.save_suggestions(conn, brief_id, candidates, {})
+        apply_brief_catalog_decisions(conn, brief_id)
 
         result = build_dag_for_brief(conn, brief_id)
 
@@ -530,6 +686,10 @@ def test_up_detail_payload_keeps_quality_metrics() -> None:
                         "core_thread_count": 1,
                         "repeated_thread_count": 1,
                         "spiral_enabled": True,
+                        "enriched_project_count": 1,
+                        "enrichment_completeness_pct": 100.0,
+                        "artifact_field_count": 1,
+                        "validation_criteria_count": 1,
                         "target_skills_per_project": [2, 4],
                         "target_outcomes_per_project": [3, 5],
                     },
@@ -549,6 +709,12 @@ def test_up_detail_payload_keeps_quality_metrics() -> None:
             "outcomes_know": "Знает",
             "outcomes_can": "Умеет",
             "outcomes_skills": "Владеет",
+            "project_summary": "Собрать проектный артефакт.",
+            "artifact": "Проверяемый артефакт",
+            "materials": "Материалы",
+            "storytelling": "Кейс",
+            "validation_criteria": "Критерии",
+            "delivery_format": "индивидуальный",
             "skills_list": "Skill A, Skill B",
             "effort_hours": 8,
             "effort_days": 1,
@@ -561,6 +727,183 @@ def test_up_detail_payload_keeps_quality_metrics() -> None:
     assert payload["report"]["quality_metrics"]["avg_skills_per_project"] == 2.0
     assert payload["report"]["quality_metrics"]["avg_outcomes_per_project"] == 3.0
     assert payload["report"]["quality_metrics"]["repeated_thread_count"] == 1
+    assert payload["report"]["quality_metrics"]["enrichment_completeness_pct"] == 100.0
+    assert payload["report"]["quality_metrics"]["enriched_project_count"] == 1
+
+
+def test_llm_usage_summary_and_intake_quality_metrics(monkeypatch: pytest.MonkeyPatch) -> None:
+    usage_path = RUNTIME_DIR / f"llm-usage-{uuid.uuid4().hex}.jsonl"
+    records = [
+        {
+            "job_id": 7,
+            "stage": "draft",
+            "model": "openai/gpt-5-mini",
+            "latency_ms": 1000,
+            "prompt_tokens": 1000,
+            "completion_tokens": 500,
+            "total_tokens": 1500,
+        },
+        {
+            "job_id": 7,
+            "stage": "draft",
+            "model": "openai/gpt-5-mini",
+            "latency_ms": 3000,
+            "prompt_tokens": 2000,
+            "completion_tokens": 1000,
+            "total_tokens": 3000,
+        },
+    ]
+    usage_path.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
+    monkeypatch.setattr(config, "LLM_USAGE_LOG_PATH", str(usage_path))
+    monkeypatch.setattr(config, "LLM_PRICE_USD_PER_1M", {"openai/gpt-5-mini": (1.0, 2.0)})
+
+    usage = load_llm_usage_summary(7)
+
+    assert usage["total_tokens"] == 4500
+    assert usage["prompt_tokens"] == 3000
+    assert usage["completion_tokens"] == 1500
+    assert usage["total_latency_ms"] == 4000
+    assert usage["avg_latency_ms"] == 2000
+    assert usage["estimated_cost_label"] == "$0.0060"
+    assert usage["rows"][0]["avg_latency_ms"] == 2000
+    assert usage["rows"][0]["estimated_cost_label"] == "$0.0060"
+
+    result = {
+        "candidates": [
+            {"entity_type": "skill", "atomicity": "atomic", "decision": "accepted", "resolution": "matched", "reasons": ""},
+            {
+                "entity_type": "skill",
+                "atomicity": "atomic",
+                "decision": "needs_review",
+                "resolution": "alias",
+                "reasons": "catalog_match_suspicious",
+            },
+            {"entity_type": "skill", "atomicity": "atomic", "decision": "rejected", "resolution": "fuzzy", "reasons": ""},
+        ],
+        "curriculum_plan": {
+            "rows": [
+                {
+                    "project_summary": "Описание",
+                    "artifact": "Артефакт",
+                    "materials": "Материалы",
+                    "storytelling": "Контекст задания",
+                    "validation_criteria": "Критерии",
+                }
+            ],
+            "report": {
+                "quality_metrics": {
+                    "single_skill_project_count": 1,
+                    "avg_skills_per_project": 1.0,
+                    "avg_outcomes_per_project": 3.0,
+                }
+            },
+        },
+    }
+
+    metrics = build_intake_quality_metrics(result, usage)
+
+    assert metrics is not None
+    assert metrics["accepted_count"] == 1
+    assert metrics["review_count"] == 1
+    assert metrics["rejected_count"] == 1
+    assert metrics["catalog_match_count"] == 3
+    assert metrics["false_match_count"] == 2
+    assert metrics["false_match_rate_pct"] == 66.7
+    assert metrics["llm_estimated_cost_label"] == "$0.0060"
+    assert metrics["single_skill_project_count"] == 1
+    assert metrics["enrichment_completeness_pct"] == 100.0
+    usage_path.unlink(missing_ok=True)
+
+
+def test_ui_route_state_hides_catalog_secondary_nav_outside_catalog() -> None:
+    assert detect_route_zone("/intake/jobs/1") == "intake"
+    assert detect_route_zone("/reviews") == "reviews"
+    assert detect_route_zone("/catalog-admin/candidate-competencies") == "catalog"
+    assert detect_route_zone("/up/1") == "curriculum"
+    assert not show_secondary_nav("/intake/jobs/1")
+    assert not get_secondary_nav("/up")
+    assert show_secondary_nav("/catalog-admin/groups")
+    assert [item["label"] for item in get_secondary_nav("/catalog-admin/groups")] == [
+        "Skills и индикаторы",
+        "Компетенции",
+        "Кандидатные компетенции",
+        "Профили",
+        "Шаблоны УП",
+        "Архив",
+    ]
+
+
+def test_runtime_migration_ledger_is_recorded() -> None:
+    db_path = _runtime_db_path("migration-ledger")
+    conn = _create_base_catalog_db(db_path)
+    try:
+        row = conn.execute(
+            "SELECT migration_id, status, checksum FROM schema_migration WHERE migration_id = 'intake_runtime_schema'"
+        ).fetchone()
+        assert row is not None
+        assert row["status"] == "applied"
+        assert len(row["checksum"]) == 64
+
+        results = apply_runtime_migrations(conn, PROJECT_ROOT / "spravochnik_intake" / "sql" / "new_tables.sql")
+        assert results[0].migration_id == "intake_runtime_schema"
+        assert results[0].applied is True
+    finally:
+        conn.close()
+        db_path.unlink(missing_ok=True)
+
+
+def test_job_observability_keeps_prompt_versions_and_stage_latency() -> None:
+    usage = {
+        "rows": [
+            {
+                "stage": "draft",
+                "model": "openai/gpt-5-mini",
+                "prompt_version": "draft-skills:v2",
+                "calls": 2,
+                "total_tokens": 1500,
+                "total_latency_ms": 2500,
+                "avg_latency_ms": 1250,
+                "estimated_cost_label": "$0.0010",
+            },
+            {
+                "stage": "draft",
+                "model": "openai/gpt-5-mini",
+                "prompt_version": "draft-skills:v2",
+                "calls": 1,
+                "total_tokens": 500,
+                "total_latency_ms": 500,
+                "avg_latency_ms": 500,
+                "estimated_cost_label": "$0.0003",
+            },
+        ]
+    }
+
+    observability = build_job_observability(usage)
+
+    assert observability["model_version_rows"][0]["prompt_version"] == "draft-skills:v2"
+    assert observability["stage_latency_rows"][0]["stage"] == "draft"
+    assert observability["stage_latency_rows"][0]["calls"] == 3
+    assert observability["stage_latency_rows"][0]["total_latency_ms"] == 3000
+    assert observability["stage_latency_rows"][0]["avg_latency_ms"] == 1000
+
+
+def test_decision_rationale_explains_match_council_and_validator_reasons() -> None:
+    rationale = build_decision_rationale(
+        {
+            "decision": "needs_review",
+            "resolution": "new",
+            "match_score": "80.70",
+            "nearest_name": "Проведение интервью",
+            "nearest_group": "Исследования",
+            "confidence": "0.57",
+            "council_agreement": "0.67",
+            "reasons": "novel_skill, low_confidence",
+        }
+    )
+
+    assert "Проведение интервью" in rationale["match_evidence"]
+    assert "Согласие жюри 0.67" in rationale["council_rationale"]
+    assert "low_confidence" in rationale["validator_reasons"]
 
 
 def test_up_planner_localizes_groups_and_keeps_block_titles_compact(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -582,7 +925,43 @@ def test_up_planner_localizes_groups_and_keeps_block_titles_compact(monkeypatch:
     assert "Право и администрирование" in plan["rows"][0]["block_title"]
     assert "Legal" not in plan["rows"][0]["block_title"]
     assert len(plan["rows"][0]["block_title"]) <= 80
-    assert plan["rows"][0]["project_name"] == "Практический проект: Право и администрирование"
+    assert plan["rows"][0]["project_name"] == "Право и администрирование"
+
+
+def test_up_project_titles_are_not_cut_mid_word_or_parenthesis() -> None:
+    long_ru = "Формулирование целевого сегмента, ценностного предложения и ключевых сценариев использования"
+    mixed_parenthesis = "Исследование продукта и проверка гипотез (customer discovery, validation)"
+
+    ru_title = stage_dag_to_up._clean_project_title(long_ru)
+    mixed_title = stage_dag_to_up._clean_project_title(mixed_parenthesis)
+
+    assert not ru_title.endswith("ценностног")
+    assert not ru_title.endswith("и")
+    assert ru_title.endswith("…") or "ценностного" in ru_title
+    assert "(customer" not in mixed_title
+    assert mixed_title == "Исследование продукта и проверка гипотез"
+
+
+def test_up_template_long_project_pattern_falls_back_to_template_title() -> None:
+    node = PlanNode(
+        tmp_id="S1",
+        name="Базовый юридический комплект для запуска цифрового продукта",
+        group="Юриспруденция",
+        block_key="Основы правовых, финансовых и административных вопросов цифрового продукта",
+        bloom=3,
+        outcomes_know=(),
+        outcomes_can=(),
+        outcomes_skills=(),
+        tools=(),
+    )
+    template = {
+        "title": "Комплект юридико-финансовых документов для запуска",
+        "project_name_pattern": "{theme}: Юридико-финансовый комплект для {skills}",
+    }
+
+    title = curriculum_planner._template_title_for([node], node.block_key, "document", template)
+
+    assert title == "Комплект юридико-финансовых документов для запуска"
 
 
 def test_up_planner_uses_dynamic_catalog_themes_without_local_archetypes(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -605,7 +984,7 @@ def test_up_planner_uses_dynamic_catalog_themes_without_local_archetypes(monkeyp
 
     assert plan["status"] == "built"
     assert plan["report"]["quality_metrics"]["artifact_first"] is True
-    assert all(name.startswith("Практический проект:") for name in project_names)
+    assert all(not name.startswith("Практический проект:") for name in project_names)
     assert any("Фермерство" in name for name in project_names)
     assert any("Животноводство" in name for name in project_names)
 
@@ -654,6 +1033,8 @@ def test_up_row_enricher_fills_fields_without_changing_node_ids(monkeypatch: pyt
     assert row["storytelling"]
     assert "Критерии проверки" in row["materials"]
     assert row["validation_criteria"]
+    assert plan["report"]["quality_metrics"]["enriched_project_count"] == len(plan["rows"])
+    assert plan["report"]["quality_metrics"]["enrichment_completeness_pct"] == 100.0
 
 
 def test_storage_loads_db_backed_artifact_templates() -> None:
@@ -826,6 +1207,39 @@ def test_template_proposals_generate_and_accept() -> None:
         assert accepted["status"] == "accepted"
         assert templates
         assert templates[0]["scopes"][0]["scope_name"] == "выявление проблемы и понимание клиента"
+    finally:
+        conn.close()
+        db_path.unlink(missing_ok=True)
+
+
+def test_catalog_apply_auto_generates_template_proposals(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "USE_UP_TEMPLATE_CONSILIUM", False)
+    db_path = _runtime_db_path("template-proposals-auto")
+    conn = _create_base_catalog_db(db_path)
+    try:
+        brief_id = storage.save_brief(
+            conn,
+            "Бриф про customer discovery и MVP.",
+            {"role": "основатель", "seniority": "junior", "domain": "стартап"},
+        )
+        candidates = [
+            _candidate("Проводит интервью с пользователями", group="Исследование клиентов", decision="accepted"),
+            _candidate("Формулирует инсайты проблемы", group="Исследование клиентов", decision="accepted"),
+        ]
+        for index, candidate in enumerate(candidates, start=1):
+            candidate.tmp_id = f"S{index}"
+            candidate.coverage_area = "выявление проблемы и понимание клиента"
+        storage.save_suggestions(conn, brief_id, candidates, {})
+        dag_payload = {"order": [{"id": "S1"}, {"id": "S2"}], "final_edges": [], "waves": [[{"id": "S1"}, {"id": "S2"}]]}
+
+        apply_result = apply_brief_catalog_decisions(conn, brief_id)
+        proposals = storage.load_curriculum_artifact_template_proposals(conn, brief_id)
+        plan = build_curriculum_plan_for_brief(conn, brief_id, candidates, dag_payload)
+
+        assert apply_result["catalog_state"]["catalog_applied"] is True
+        assert proposals
+        assert plan["status"] == "built"
+        assert plan["template_proposal_count"] == len(proposals)
     finally:
         conn.close()
         db_path.unlink(missing_ok=True)
@@ -1197,8 +1611,258 @@ def test_intake_status_labels_and_workflow_steps() -> None:
         assert job["current_stage_label"] == "Поиск evidence по серой зоне"
 
         steps = build_intake_workflow_steps(job, None, None)
-        assert [step["label"] for step in steps] == ["Бриф", "Проверка", "Справочник пополнен", "УП"]
+        assert [step["label"] for step in steps] == [
+            "Бриф",
+            "Проверка навыков",
+            "Справочник и набор навыков",
+            "Шаблоны УП",
+            "DAG и УП",
+        ]
         assert steps[1]["status"] == "active"
+    finally:
+        conn.close()
+        db_path.unlink(missing_ok=True)
+
+
+def test_repair_dirty_profile_name_and_slug() -> None:
+    db_path = _runtime_db_path("dirty-profile")
+    conn = _create_base_catalog_db(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO profile(slug, name, source_kind)
+            VALUES ('project-manager______warning', 'Project manager______warning', 'role_profile')
+            """
+        )
+        conn.commit()
+
+        updated = repair_dirty_profile_names(conn)
+        profile = conn.execute("SELECT name, slug FROM profile").fetchone()
+
+        assert updated == 2
+        assert profile["name"] == "Project manager"
+        assert profile["slug"] == "project-manager"
+    finally:
+        conn.close()
+        db_path.unlink(missing_ok=True)
+
+
+def test_workspace_state_blocks_up_until_reviews_and_candidate_competencies_are_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "USE_LIVE", False)
+    monkeypatch.setattr(config, "USE_UP_TEMPLATE_CONSILIUM", False)
+    db_path = _runtime_db_path("workspace-state")
+    conn = _create_base_catalog_db(db_path)
+    try:
+        brief_id = storage.save_brief(conn, "brief", {"role": "роль", "seniority": "junior", "domain": "домен"})
+        candidates = [
+            _candidate("Accepted workspace skill", decision="accepted"),
+            _candidate("Review workspace skill", decision="needs_review"),
+        ]
+        storage.save_suggestions(conn, brief_id, candidates, {})
+        job_id = create_intake_job(
+            conn,
+            source_kind="text",
+            source_name=None,
+            file_path=None,
+            brief_text="brief",
+            use_council=False,
+        )
+        update_intake_job(
+            conn,
+            job_id,
+            status="succeeded",
+            current_stage="done",
+            progress_note="done",
+            result_payload={
+                "brief_id": brief_id,
+                "candidates": [
+                    {"name": candidate.name, "group": candidate.group, "entity_type": "skill", "atomicity": "atomic"}
+                    for candidate in candidates
+                ],
+            },
+            mark_finished=True,
+        )
+
+        apply_brief_catalog_decisions(conn, brief_id)
+        job = get_intake_job(conn, job_id)
+        assert job is not None
+        result = job["result_payload"]
+        workspace = build_intake_workspace_state(conn, job, result, None)
+
+        assert workspace["next_step"]["code"] == "open_reviews"
+        assert workspace["catalog_summary"]["total"] == 1
+        assert len(list_candidate_competencies(conn)) == 1
+        assert {blocker["code"] for blocker in workspace["blockers"]} >= {
+            "open_skill_reviews",
+            "open_competency_reviews",
+        }
+    finally:
+        conn.close()
+        db_path.unlink(missing_ok=True)
+
+
+def test_workspace_state_routes_to_dag_edge_review_before_opening_up(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "USE_LIVE", False)
+    db_path = _runtime_db_path("workspace-edge-review")
+    conn = _create_base_catalog_db(db_path)
+    try:
+        brief_id = storage.save_brief(conn, "brief", {"role": "роль", "seniority": "junior", "domain": "домен"})
+        conn.execute(
+            """
+            INSERT INTO review_queue(entity_type, source_ref, reason_code, severity, details, status)
+            VALUES ('prerequisite_edge', ?, 'ai_proposed', 'info', ?, 'open')
+            """,
+            (
+                f"brief:{brief_id}",
+                json.dumps({"review_kind": "prerequisite_edge", "edge_key": "S1->S2"}, ensure_ascii=False),
+            ),
+        )
+        job_id = create_intake_job(
+            conn,
+            source_kind="text",
+            source_name=None,
+            file_path=None,
+            brief_text="brief",
+            use_council=False,
+        )
+        update_intake_job(
+            conn,
+            job_id,
+            status="succeeded",
+            current_stage="done",
+            progress_note="done",
+            result_payload={
+                "brief_id": brief_id,
+                "catalog_state": {"accepted_atomic": 2, "active_promotions": 2, "skill_set_items": 2},
+                "dag": {"status": "built", "nodes": 2, "edges": 0},
+                "curriculum_plan": {"plan_id": 1, "row_count": 1},
+            },
+            mark_finished=True,
+        )
+
+        job = get_intake_job(conn, job_id)
+        assert job is not None
+        workspace = build_intake_workspace_state(conn, job, job["result_payload"], None)
+
+        assert workspace["next_step"]["code"] == "review_dag_edges"
+        assert workspace["open_edge_reviews"] == 1
+        assert any(blocker["code"] == "open_prerequisite_edges" for blocker in workspace["blockers"])
+    finally:
+        conn.close()
+        db_path.unlink(missing_ok=True)
+
+
+def test_prerequisite_edge_review_decision_does_not_rebuild_dag_inline(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "USE_LIVE", False)
+    rebuild_calls: list[int] = []
+
+    def fail_if_rebuilt(_conn: sqlite3.Connection, rebuilt_brief_id: int) -> dict[str, object]:
+        rebuild_calls.append(rebuilt_brief_id)
+        raise AssertionError("Edge review decisions must not rebuild DAG synchronously")
+
+    monkeypatch.setattr("viewer.app.build_dag_for_brief", fail_if_rebuilt)
+    db_path = _runtime_db_path("edge-review-fast")
+    conn = _create_base_catalog_db(db_path)
+    try:
+        brief_id = storage.save_brief(conn, "brief", {"role": "роль", "seniority": "junior", "domain": "домен"})
+        review_id = conn.execute(
+            """
+            INSERT INTO review_queue(entity_type, source_ref, reason_code, severity, details, status)
+            VALUES ('prerequisite_edge', ?, 'ai_proposed', 'info', ?, 'open')
+            """,
+            (
+                f"brief:{brief_id}",
+                json.dumps(
+                    {
+                        "review_kind": "prerequisite_edge",
+                        "edge_key": "S1->S2",
+                        "edge_label": "Навык 1 -> Навык 2",
+                    },
+                    ensure_ascii=False,
+                ),
+            ),
+        ).lastrowid
+
+        update_review_status(conn, int(review_id), "resolved", "edge accepted")
+
+        decision = conn.execute(
+            """
+            SELECT decision, resolution_note
+            FROM prerequisite_edge_decision
+            WHERE brief_id = ? AND edge_key = 'S1->S2'
+            """,
+            (brief_id,),
+        ).fetchone()
+
+        assert rebuild_calls == []
+        assert decision is not None
+        assert decision["decision"] == "accepted"
+        assert decision["resolution_note"] == "edge accepted"
+    finally:
+        conn.close()
+        db_path.unlink(missing_ok=True)
+
+
+def test_candidate_competency_rename_move_and_merge(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "USE_LIVE", False)
+    monkeypatch.setattr(config, "USE_UP_TEMPLATE_CONSILIUM", False)
+    db_path = _runtime_db_path("candidate-competency-actions")
+    conn = _create_base_catalog_db(db_path)
+    try:
+        target_id = conn.execute(
+            """
+            INSERT INTO competency(normalized_title, title, description, status)
+            VALUES ('existing research', 'Existing Research', '', 'active')
+            """
+        ).lastrowid
+        brief_id = storage.save_brief(conn, "brief", {"role": "роль", "seniority": "junior", "domain": "домен"})
+        candidates = [
+            _candidate("Skill A", group="Candidate A", decision="accepted"),
+            _candidate("Skill B", group="Candidate B", decision="accepted"),
+        ]
+        storage.save_suggestions(conn, brief_id, candidates, {})
+        apply_brief_catalog_decisions(conn, brief_id)
+
+        candidate_rows = list_candidate_competencies(conn)
+        by_title = {row["title"]: row for row in candidate_rows}
+        rename_result = rename_candidate_competency(conn, int(by_title["Candidate A"]["competency_id"]), "Renamed Candidate A")
+        assert rename_result["status"] == "renamed"
+
+        renamed = next(row for row in list_candidate_competencies(conn) if row["title"] == "Renamed Candidate A")
+        skill_link_id = int(renamed["skills"][0]["competency_skill_id"])
+        move_result = move_candidate_competency_skill(conn, skill_link_id, int(target_id))
+        assert move_result["status"] == "moved"
+        moved_link = conn.execute(
+            """
+            SELECT c.title
+            FROM competency_skill cs
+            JOIN profile_competency pc ON pc.id = cs.profile_competency_id
+            JOIN competency c ON c.id = pc.competency_id
+            JOIN skill s ON s.id = cs.skill_id
+            WHERE s.canonical_name = 'Skill A'
+            """
+        ).fetchone()
+        assert moved_link["title"] == "Existing Research"
+
+        remaining = next(row for row in list_candidate_competencies(conn) if row["title"] == "Candidate B")
+        merge_result = merge_candidate_competency(conn, int(remaining["competency_id"]), int(target_id))
+        assert merge_result["status"] == "merged"
+        assert merge_result["moved"] == 1
+        merged_link = conn.execute(
+            """
+            SELECT c.title
+            FROM competency_skill cs
+            JOIN profile_competency pc ON pc.id = cs.profile_competency_id
+            JOIN competency c ON c.id = pc.competency_id
+            JOIN skill s ON s.id = cs.skill_id
+            WHERE s.canonical_name = 'Skill B'
+            """
+        ).fetchone()
+        assert merged_link["title"] == "Existing Research"
+        rejected_candidate = conn.execute(
+            "SELECT status FROM competency WHERE title = 'Candidate B'"
+        ).fetchone()
+        assert rejected_candidate["status"] == "deprecated"
     finally:
         conn.close()
         db_path.unlink(missing_ok=True)
@@ -1206,6 +1870,7 @@ def test_intake_status_labels_and_workflow_steps() -> None:
 
 def test_catalog_accumulation_resolves_promoted_skill_as_match(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(config, "USE_LIVE", False)
+    monkeypatch.setattr(config, "USE_UP_TEMPLATE_CONSILIUM", False)
     db_path = _runtime_db_path("accumulation")
     conn = _create_base_catalog_db(db_path)
     try:
@@ -1213,6 +1878,7 @@ def test_catalog_accumulation_resolves_promoted_skill_as_match(monkeypatch: pyte
         skill_name = "Повторно используемый каталоговый skill"
         suggestion_id = storage.save_suggestions(conn, brief_id, [_candidate(skill_name)], {})[f"tmp-{skill_name}"]
         apply_candidate_decision(conn, suggestion_id, "accepted", "accepted")
+        apply_brief_catalog_decisions(conn, brief_id)
 
         repo = CatalogRepo(str(db_path))
         try:
@@ -1231,6 +1897,7 @@ def test_catalog_accumulation_resolves_promoted_skill_as_match(monkeypatch: pyte
 
 def test_link_suggestion_to_nearest_uses_existing_skill(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(config, "USE_LIVE", False)
+    monkeypatch.setattr(config, "USE_UP_TEMPLATE_CONSILIUM", False)
     db_path = _runtime_db_path("nearest-link")
     conn = _create_base_catalog_db(db_path)
     try:
@@ -1246,6 +1913,7 @@ def test_link_suggestion_to_nearest_uses_existing_skill(monkeypatch: pytest.Monk
 
         link_result = storage.link_suggestion_to_nearest(conn, suggestion_id)
         apply_candidate_decision(conn, suggestion_id, "accepted", "linked in test")
+        apply_brief_catalog_decisions(conn, brief_id)
 
         after_skill_count = conn.execute("SELECT COUNT(*) FROM skill").fetchone()[0]
         suggestion = conn.execute("SELECT decision, resolution, canonical_skill_id FROM skill_suggestion WHERE id = ?", (suggestion_id,)).fetchone()
@@ -1267,6 +1935,7 @@ def test_link_suggestion_to_nearest_uses_existing_skill(monkeypatch: pytest.Monk
 
 def test_skill_name_canonicalization_and_resolve_source_alias(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(config, "USE_LIVE", False)
+    monkeypatch.setattr(config, "USE_UP_TEMPLATE_CONSILIUM", False)
     assert canonicalize_skill_name("Сформулировать ценностное предложение") == "Формулирование ценностного предложения"
     assert canonicalize_skill_name("Провести глубинное интервью") == "Проведение глубинных интервью"
     assert canonicalize_skill_name("Выбирать метод проверки и запускать эксперимент") == "Выбор метода проверки и запуска эксперимента"
@@ -1277,6 +1946,12 @@ def test_skill_name_canonicalization_and_resolve_source_alias(monkeypatch: pytes
     assert canonicalize_skill_name("Ключевого сообщения") == "Формулирование ключевого сообщения продукта"
     assert canonicalize_skill_name("Сценариев использования") == "Описание сценариев использования"
     assert canonicalize_skill_name("Инцидентного реагирования") == "Организация инцидентного реагирования"
+    assert canonicalize_skill_name("Релизного процесса") == "Организация релизного процесса"
+    assert canonicalize_skill_name("Пробных доступов") == "Проектирование пробных доступов"
+    assert canonicalize_skill_name("Автоматических тестов") == "Разработка автоматических тестов"
+    assert canonicalize_skill_name("Каналов привлечения") == "Выбор каналов привлечения"
+    assert looks_like_genitive_fragment("Релизных контрольных точек")
+    assert not looks_like_genitive_fragment("Организация релизного процесса")
 
     db_path = _runtime_db_path("source-resolve")
     conn = _create_base_catalog_db(db_path)
@@ -1285,6 +1960,7 @@ def test_skill_name_canonicalization_and_resolve_source_alias(monkeypatch: pytes
         original = _candidate("Провести глубинное интервью", decision="needs_review")
         suggestion_id = storage.save_suggestions(conn, brief_id, [original], {})["tmp-Провести глубинное интервью"]
         apply_candidate_decision(conn, suggestion_id, "accepted", "accepted")
+        apply_brief_catalog_decisions(conn, brief_id)
 
         repo = CatalogRepo(str(db_path))
         try:
@@ -1301,3 +1977,29 @@ def test_skill_name_canonicalization_and_resolve_source_alias(monkeypatch: pytes
     finally:
         conn.close()
         db_path.unlink(missing_ok=True)
+
+
+def test_candidate_recommended_action_is_explicit_for_methodologist() -> None:
+    assert build_candidate_recommended_action(82.0, "new", True, "Проведение интервью")["code"] == "link"
+    assert build_candidate_recommended_action(12.0, "new", False, None)["code"] == "create"
+    assert build_candidate_recommended_action(91.0, "fuzzy", True, "Проведение интервью")["code"] == "link"
+    assert (
+        build_candidate_recommended_action(
+            99.0,
+            "matched",
+            True,
+            "Code review",
+            ["catalog_match_suspicious"],
+        )["code"]
+        == "check"
+    )
+    assert (
+        build_candidate_recommended_action(
+            100.0,
+            "alias",
+            True,
+            "Ценностное предложение",
+            "Подозрительный match с каталогом: нужно проверить смысл и группу canonical skill",
+        )["code"]
+        == "check"
+    )

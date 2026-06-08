@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+    <div>
+        <h1>Наборы skills</h1>
+        <p>Skillset — это reusable набор навыков под цель: бриф, УП или ручную методологическую сборку. Это не группа каталога.</p>
+    </div>
+</section>
+
+<section class="filter-panel">
+    <div class="small muted">
+        Автоматические наборы появляются после принятия atomic skills и после сохранения УП. Пустые/архивные наборы здесь не показываются.
+    </div>
+</section>
+
+<section class="table-wrap">
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Набор</th>
+                <th>Источник</th>
+                <th>Статус</th>
+                <th>Skills</th>
+                <th>Роли</th>
+                <th>Обновлён</th>
+                <th>Открыть</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% if skill_sets %}
+            {% for skill_set in skill_sets %}
+            <tr>
+                <td>
+                    <strong>{{ skill_set.title }}</strong>
+                    <div class="small muted">{{ skill_set.code }}</div>
+                    {% if skill_set.description %}<div class="small muted">{{ skill_set.description }}</div>{% endif %}
+                </td>
+                <td>
+                    {{ skill_set.source_type }}
+                    {% if skill_set.source_id %}<div class="small muted">id {{ skill_set.source_id }}</div>{% endif %}
+                </td>
+                <td><span class="status-badge">{{ skill_set.status }}</span></td>
+                <td>{{ skill_set.skill_count }}</td>
+                <td class="small">
+                    target {{ skill_set.target_count }},
+                    prerequisite {{ skill_set.prerequisite_count }},
+                    reinforcement {{ skill_set.reinforcement_count }},
+                    assessment {{ skill_set.assessment_count }}
+                </td>
+                <td class="small muted">{{ skill_set.updated_at or skill_set.created_at }}</td>
+                <td><a class="action-btn action-btn-secondary" href="/catalog-admin/skillsets/{{ skill_set.id }}">Открыть</a></td>
+            </tr>
+            {% endfor %}
+        {% else %}
+            <tr>
+                <td colspan="7" class="small muted">
+                    Наборы пока не собраны. Примите skills в intake или перестройте УП, чтобы система создала skillset.
+                </td>
+            </tr>
+        {% endif %}
+        </tbody>
+    </table>
+</section>
+{% endblock %}

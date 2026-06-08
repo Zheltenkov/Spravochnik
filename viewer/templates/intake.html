@@ -2,22 +2,34 @@
 {% block content %}
 <section class="hero">
     <div>
-        <h1>Заливка брифа</h1>
-        <p>Вставьте свободный текст «кого готовим» или загрузите файл. Система декомпозирует бриф,
-        сопоставит навыки с каталогом и отправит спорные случаи в <a href="/reviews">очередь проверки</a>.</p>
+        <h1>{% if job %}Рабочий стол брифа #{{ job.id }}{% else %}Рабочий стол брифа{% endif %}</h1>
+        <p>
+            {% if job %}
+            Единый маршрут: проверить навыки, применить принятые решения в справочник, подтвердить шаблоны, построить DAG и УП.
+            {% else %}
+            Загрузите бриф. Система декомпозирует его в навыки, сопоставит с каталогом и подготовит очередь решений для методолога.
+            {% endif %}
+        </p>
     </div>
+    {% if job %}
+    <div class="review-actions">
+        <a class="action-btn action-btn-secondary" href="/intake">Новый бриф</a>
+        <a class="action-btn action-btn-secondary" href="/reviews">Открытые решения</a>
+    </div>
+    {% endif %}
 </section>
 
+{% if not job %}
 <section class="filter-panel">
     <form class="admin-form" method="post" action="/intake" enctype="multipart/form-data" id="intake-form">
         <input type="hidden" name="brief_file_path" id="brief-file-path" value="{{ brief_file_path or '' }}">
-        <input type="file" name="brief_file" id="brief-file-input" accept=".txt,.md,.csv,.docx" hidden>
         <div class="brief-compose-grid">
             <div class="brief-upload-panel">
-                <div class="upload-dropzone" id="brief-dropzone" role="button" tabindex="0" aria-controls="brief-file-input">
+                <label class="upload-dropzone" id="brief-dropzone" for="brief-file-input" role="button" tabindex="0" aria-controls="brief-file-input">
                     <div class="upload-dropzone-title">Загрузить документ</div>
-                    <div class="upload-dropzone-subtitle">Перетащите файл сюда или нажмите. Поддерживаются `.txt`, `.md`, `.csv`, `.docx`; после выбора обработка стартует автоматически.</div>
-                </div>
+                    <div class="upload-dropzone-subtitle">Перетащите файл сюда или нажмите на область. Поддерживаются `.txt`, `.md`, `.csv`, `.docx`; после выбора обработка стартует автоматически.</div>
+                    <input class="brief-file-input-native" type="file" name="brief_file" id="brief-file-input" accept=".txt,.md,.csv,.docx" aria-label="Выбрать документ для обработки">
+                </label>
                 <div class="small muted" id="picker-status">Файл пока не выбран.</div>
                 {% if upload_name %}
                 <div class="small muted">Источник файла: {{ upload_name }}</div>
@@ -37,84 +49,191 @@
         </div>
     </form>
 </section>
+{% endif %}
 
 {% if job %}
-<section class="hero hero-compact">
-    <div>
-        <h1>Задача intake #{{ job.id }}</h1>
-        <p>
-            Статус:
-            <span class="status-badge{% if job.status == 'failed' %} warn{% endif %}">{{ job.status_label }}</span>
-        </p>
-        <div class="small muted">
-            Источник: {{ 'документ' if job.source_kind == 'file' else 'текстовый бриф' }}
-            {% if job.source_name %} · {{ job.source_name }}{% endif %}
-            {% if job.created_at %} · создано {{ job.created_at }}{% endif %}
-        </div>
-    </div>
-</section>
-
-<section class="intake-progress-card">
-    <div class="intake-progress-head">
-        <div>
-            <div class="intake-progress-title">Прогресс обработки</div>
-            <div class="small muted">Стадии обновляются автоматически во время выполнения intake-задачи.</div>
-        </div>
-        <div class="intake-progress-percent" id="job-progress-percent">0%</div>
-    </div>
-    <div class="intake-progress-track" aria-hidden="true">
-        <div class="intake-progress-fill" id="job-progress-fill"></div>
-    </div>
-    <div class="intake-progress-steps" id="job-progress-steps">
-        {% for step in intake_progress_steps %}
-        <span class="intake-progress-step" data-stage="{{ step.code }}">{{ step.label }}</span>
-        {% endfor %}
-    </div>
-</section>
-
-<section class="chips-row job-status-summary">
-    <div class="summary-card">
-        <div class="summary-label">Этап</div>
-        <div class="summary-value" id="job-stage">{{ job.current_stage_label or 'Постановка в очередь' }}</div>
-    </div>
-    <div class="summary-card">
-        <div class="summary-label">Прогресс</div>
-        <div class="summary-value" id="job-progress">{{ job.progress_note or 'Задача поставлена в очередь.' }}</div>
-    </div>
-    <div class="summary-card">
-        <div class="summary-label">Council</div>
-        <div class="summary-value">{{ 'включен' if job.use_council else 'выключен' }}</div>
-    </div>
-</section>
-{% if workflow_steps %}
-<section class="workflow-stepper" aria-label="Маршрут брифа">
-    {% for step in workflow_steps %}
-    <a class="workflow-step workflow-step-{{ step.status }}" href="{{ step.href }}">
-        <span class="workflow-step-index">{{ loop.index }}</span>
-        <span class="workflow-step-body">
-            <span class="workflow-step-label">{{ step.label }}</span>
-            <span class="workflow-step-description">{{ step.description }}</span>
+<details class="collapse-panel workspace-control-panel" {% if job.status in ['pending', 'running', 'failed'] %}open{% endif %}>
+    <summary>
+        <span class="workspace-control-summary-main">
+            <strong>Контроль брифа</strong>
+            <span class="status-badge{% if job.status == 'failed' %} warn{% endif %}" id="job-status-badge">{{ job.status_label }}</span>
+            {% if workspace_state and workspace_state.next_step %}
+            <span class="workspace-control-summary-text">Следующий шаг: {{ workspace_state.next_step["label"] }}</span>
+            {% else %}
+            <span class="workspace-control-summary-text">{{ job.current_stage_label or 'Постановка в очередь' }}</span>
+            {% endif %}
+            {% if workspace_state and workspace_state.blockers %}
+            <span class="pill">{{ workspace_state.blockers|length }} блокеров</span>
+            {% endif %}
         </span>
-    </a>
-    {% endfor %}
-</section>
-{% endif %}
-{% if dag_build_state %}
-<section class="filter-panel">
-    <div class="small muted">
-        DAG по брифу #{{ dag_build_state.brief_id }}:
-        accepted atomic = {{ dag_build_state.accepted_atomic_count }},
-        pending atomic = {{ dag_build_state.pending_atomic_count }},
-        open review = {{ dag_build_state.open_review_count }}.
+        <span class="intake-progress-percent" id="job-progress-percent">0%</span>
+    </summary>
+    <div class="workspace-control-body">
+        <section class="workspace-control-card workspace-control-progress">
+            <div class="workspace-control-card-head">
+                <div>
+                    <div class="sub-label">Ход обработки</div>
+                    <h2 id="job-stage">{{ job.current_stage_label or 'Постановка в очередь' }}</h2>
+                </div>
+                <span class="small muted">{{ job.created_at|datetime_local if job.created_at else '—' }}</span>
+            </div>
+            <div class="small muted intake-run-source">
+                Источник: {{ 'документ' if job.source_kind == 'file' else 'текстовый бриф' }}
+                {% if job.source_name %} · {{ job.source_name }}{% endif %}
+            </div>
+            <section class="intake-progress-card">
+                <div class="intake-progress-head">
+                    <div class="small muted" id="job-progress">{{ job.progress_note or 'Задача поставлена в очередь.' }}</div>
+                </div>
+                <div class="intake-progress-track" aria-hidden="true">
+                    <div class="intake-progress-fill" id="job-progress-fill"></div>
+                </div>
+                <div class="intake-progress-steps" id="job-progress-steps">
+                    {% for step in intake_progress_steps %}
+                    <span class="intake-progress-step" data-stage="{{ step.code }}">{{ step.label }}</span>
+                    {% endfor %}
+                </div>
+            </section>
+            <div class="job-status-summary compact-status-row">
+                <span class="pill">Жюри: {{ 'включено' if job.use_council else 'выключено' }}</span>
+                <span class="pill ghost">Создано: {{ job.created_at|datetime_local if job.created_at else '—' }}</span>
+            </div>
+        </section>
+
+        {% if workspace_state and workspace_state.next_step %}
+        <section class="workspace-next-step workspace-control-card">
+            <div>
+                <div class="sub-label">Следующий шаг</div>
+                <h2>{{ workspace_state.next_step["label"] }}</h2>
+                <p class="small muted">{{ workspace_state.next_step["description"] }}</p>
+            </div>
+            <div class="review-actions">
+                {% if workspace_state.next_step["method"] == 'post' %}
+                <form method="post" action="{{ workspace_state.next_step["href"] }}">
+                    <button type="submit" class="action-btn action-btn-primary" {% if workspace_state.next_step["disabled"] %}disabled{% endif %}>Выполнить следующий шаг</button>
+                </form>
+                {% else %}
+                <a class="action-btn action-btn-primary {% if workspace_state.next_step["disabled"] %}is-disabled{% endif %}" href="{{ workspace_state.next_step["href"] }}">Выполнить следующий шаг</a>
+                {% endif %}
+            </div>
+        </section>
+        {% endif %}
+
+        {% if workspace_state and workspace_state.blockers %}
+        <section class="workspace-control-card workspace-blockers">
+            <div class="summary-head">
+                <h2>Что блокирует УП</h2>
+                <span class="pill">{{ workspace_state.blockers|length }} блокеров</span>
+            </div>
+            <div class="workspace-blocker-grid">
+                {% for blocker in workspace_state.blockers %}
+                <a class="workspace-blocker workspace-blocker-{{ blocker.severity }}" href="{{ blocker.href }}">
+                    <span class="workspace-blocker-count">{{ blocker.count }}</span>
+                    <span class="workspace-blocker-body">
+                        <strong>{{ blocker.label }}</strong>
+                        <span>{{ blocker.description }}</span>
+                    </span>
+                </a>
+                {% endfor %}
+            </div>
+        </section>
+        {% endif %}
+
+        {% if result and result.catalog_state %}
+        <section class="workspace-control-card catalog-state-summary">
+            <div class="summary-head">
+                <h2>Состояние справочника</h2>
+                <span class="pill">для DAG и УП</span>
+            </div>
+            <div class="chips-row compact-summary-row">
+                <div class="summary-card{% if not result.catalog_state.catalog_applied and result.catalog_state.accepted_atomic %} summary-card-warn{% endif %}">
+                    <div class="summary-label">Применено в справочник</div>
+                    <div class="summary-value">{{ result.catalog_state.active_promotions }} / {{ result.catalog_state.accepted_atomic }}</div>
+                    <div class="small muted">принятые навыки → навык / синоним / компетенция</div>
+                </div>
+                <div class="summary-card">
+                    <div class="summary-label">Набор навыков брифа</div>
+                    <div class="summary-value">{{ result.catalog_state.skill_set_items }}</div>
+                    <div class="small muted">источник DAG и УП</div>
+                </div>
+                <div class="summary-card{% if result.catalog_state.open_template_proposals %} summary-card-warn{% endif %}">
+                    <div class="summary-label">Шаблоны УП</div>
+                    <div class="summary-value">{{ result.catalog_state.template_proposals }}</div>
+                    <div class="small muted">открыто {{ result.catalog_state.open_template_proposals }}, принято {{ result.catalog_state.accepted_template_proposals }}</div>
+                </div>
+            </div>
+        </section>
+        {% endif %}
+
+        {% if workspace_state and workspace_state.catalog_summary and workspace_state.catalog_summary.total %}
+        <section class="workspace-control-card catalog-apply-summary">
+            <div class="summary-head">
+                <h2>Что попало в справочник</h2>
+                <span class="pill">{{ workspace_state.catalog_summary.total }} записей</span>
+            </div>
+            <div class="catalog-summary-list">
+                {% for item in workspace_state.catalog_summary["items"] %}
+                <a class="catalog-summary-item" href="/catalog-admin/skills/{{ item.skill_id }}">
+                    <strong>{{ item.canonical_name }}</strong>
+                    <span>{{ item.group_name or 'Без группы' }}</span>
+                    {% if item.suggested_name and item.suggested_name != item.canonical_name %}<small>из: {{ item.suggested_name }}</small>{% endif %}
+                </a>
+                {% endfor %}
+            </div>
+        </section>
+        {% endif %}
+
+        {% if workflow_steps %}
+        <section class="workspace-control-card workflow-stepper" aria-label="Маршрут брифа">
+            {% for step in workflow_steps %}
+            <a class="workflow-step workflow-step-{{ step.status }}" href="{{ step.href }}">
+                <span class="workflow-step-index">{{ loop.index }}</span>
+                <span class="workflow-step-body">
+                    <span class="workflow-step-label">{{ step.label }}</span>
+                    <span class="workflow-step-description">{{ step.description }}</span>
+                </span>
+            </a>
+            {% endfor %}
+        </section>
+        {% endif %}
+
+        {% if recent_jobs %}
+        <details class="workspace-control-card workspace-history-card">
+            <summary>Последние intake-задачи ({{ recent_jobs|length }})</summary>
+            <form class="review-actions intake-history-actions" method="post" action="/intake/jobs/clear" onsubmit="return confirm('Очистить историю intake-задач, брифы, очередь review по брифам и черновики УП? Канонический справочник не будет удалён.');">
+                <button type="submit" class="action-btn action-btn-danger">Очистить историю intake</button>
+            </form>
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Задача</th>
+                        <th>Источник</th>
+                        <th>Статус</th>
+                        <th>Этап</th>
+                        <th>Жюри</th>
+                        <th>Открыть</th>
+                    </tr>
+                </thead>
+                <tbody>
+                {% for recent in recent_jobs %}
+                    <tr>
+                        <td>#{{ recent.id }}<div class="small muted">{{ recent.created_at|datetime_local }}</div></td>
+                        <td>{{ recent.source_name or ('Текстовый бриф' if recent.source_kind == 'text' else 'Документ') }}</td>
+                        <td><span class="status-badge{% if recent.status == 'failed' %} warn{% endif %}">{{ recent.status_label }}</span></td>
+                        <td>{{ recent.current_stage_label }}</td>
+                        <td>{{ 'вкл' if recent.use_council else 'выкл' }}</td>
+                        <td><a href="/intake/jobs/{{ recent.id }}">Открыть</a></td>
+                    </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </details>
+        {% endif %}
     </div>
-    <form class="review-actions" method="post" action="/intake/jobs/{{ job.id }}/build-dag">
-        <button type="submit" class="action-btn action-btn-primary">Пересобрать DAG</button>
-    </form>
-</section>
-{% endif %}
+</details>
 {% endif %}
 
-{% if recent_jobs %}
+{% if recent_jobs and not job %}
 <section class="table-wrap">
     <details class="collapse-panel">
         <summary>Последние intake-задачи ({{ recent_jobs|length }})</summary>
@@ -124,22 +243,22 @@
         <table class="data-table">
             <thead>
                 <tr>
-                    <th>Последние intake-задачи</th>
+                    <th>Задача</th>
                     <th>Источник</th>
                     <th>Статус</th>
                     <th>Этап</th>
-                    <th>Council</th>
+                    <th>Жюри</th>
                     <th>Открыть</th>
                 </tr>
             </thead>
             <tbody>
             {% for recent in recent_jobs %}
                 <tr>
-                    <td>#{{ recent.id }}<div class="small muted">{{ recent.created_at }}</div></td>
+                    <td>#{{ recent.id }}<div class="small muted">{{ recent.created_at|datetime_local }}</div></td>
                     <td>{{ recent.source_name or ('Текстовый бриф' if recent.source_kind == 'text' else 'Документ') }}</td>
                     <td><span class="status-badge{% if recent.status == 'failed' %} warn{% endif %}">{{ recent.status_label }}</span></td>
                     <td>{{ recent.current_stage_label }}</td>
-                    <td>{{ 'on' if recent.use_council else 'off' }}</td>
+                    <td>{{ 'вкл' if recent.use_council else 'выкл' }}</td>
                     <td><a href="/intake/jobs/{{ recent.id }}">Открыть</a></td>
                 </tr>
             {% endfor %}
@@ -150,112 +269,199 @@
 {% endif %}
 
 {% if result %}
-<section class="hero hero-compact workflow-focus">
-    <div>
+{% set accepted_candidate_count = result.candidates|selectattr('decision', 'equalto', 'accepted')|list|length %}
+{% set candidate_count = result.candidates|length %}
+{% set all_candidates_accepted = candidate_count > 0 and accepted_candidate_count == candidate_count %}
+<section class="hero hero-compact workflow-focus candidate-review-hero" id="candidate-review">
+    <div class="candidate-review-copy">
         <h1>Проверка кандидатов</h1>
         <p class="small muted">
-            Главный рабочий блок методолога. `Похожесть` — насколько кандидат похож на текущий каталог,
-            `Новизна` — обратная метрика: чем выше, тем меньше похожих записей найдено.
-            `Увер. модели` — уверенность синтеза/триажа, `Согласие жюри` — panel agreement.
-            При `Увер. модели >= 0.95` и `Согласие жюри = 1.00`
-            skill принимается автоматически, но его можно вернуть на review.
+            Рабочий блок методолога: принять новый навык, привязать к каталогу или отклонить.
+            <br>
+            Похожесть = близость к каталогу. Новизна = насколько мало похожих записей найдено.
+            Уверенность и жюри показывают, можно ли доверять автопроверке.
         </p>
     </div>
-    <div class="review-actions">
+    <div class="review-actions candidate-review-actions">
         <a class="action-btn action-btn-secondary" href="/reviews">Открыть очередь</a>
-        <a class="action-btn action-btn-primary" href="/catalog-admin/groups">Открыть справочник</a>
+        <a class="action-btn action-btn-secondary" href="/catalog-admin/groups">Открыть справочник</a>
     </div>
 </section>
-<section class="table-wrap primary-workspace">
-    <table class="data-table data-table-wide">
-        <thead><tr>
-            <th>Навык</th><th>Coverage area</th><th>Группа</th><th>Bloom</th><th>Резолв против каталога</th>
-            <th>Похожесть с каталогом</th><th>Новизна</th><th>Увер. модели</th><th>Жюри</th><th>Решение</th><th>Причины</th><th>Действие</th>
-        </tr></thead>
-        <tbody>
+<section class="candidate-card-workspace primary-workspace">
+    <details class="collapse-panel candidate-list-panel{% if all_candidates_accepted %} candidate-list-panel-complete{% endif %}" data-candidate-list-panel{% if not all_candidates_accepted %} open{% endif %}>
+        <summary>
+            <span data-candidate-list-summary>{{ 'Принятые навыки' if all_candidates_accepted else 'Карточки навыков' }}</span>
+            <span class="pill" data-candidate-list-count>{{ accepted_candidate_count if all_candidates_accepted else candidate_count }}</span>
+        </summary>
+    <div class="candidate-card-list">
         {% for c in result.candidates %}
-            <tr data-candidate-row="{{ c.suggestion_id or '' }}">
-                <td>
-                    <strong>{{ c.name }}</strong>
-                    {% if c.source_name and c.source_name != c.name %}<div class="small muted">исходно: {{ c.source_name }}</div>{% endif %}
-                    <div class="small muted">инструменты: {{ c.tools }}</div>
-                    {% if c.parent_name %}<div class="small muted">из декомпозиции: {{ c.parent_name }}</div>{% endif %}
-                    {% if c.entity_type != 'skill' %}<div class="small muted">тип: {{ c.entity_type }}</div>{% endif %}
-                </td>
-                <td>{% if c.coverage_area %}{{ c.coverage_area }}{% else %}<span class="small muted">—</span>{% endif %}</td>
-                <td>{{ c.group }}</td>
-                <td>{{ c.bloom }}</td>
-                <td>
-                    {% if c.resolution %}
-                    <span class="pill {% if c.resolution in ('matched','alias') %}ghost{% endif %}">{{ c.resolution }}</span>
-                    {% else %}
-                    —
-                    {% endif %}
-                    {% if c.canonical_name %}<div class="small muted">→ {{ c.canonical_name }}</div>{% endif %}
-                </td>
-                <td>
-                    {{ c.match_score if c.match_score is defined and c.match_score is not none else "—" }}
-                    {% if c.nearest_name is defined and c.nearest_name %}
-                    <div class="small muted nearest-match">
-                        ≈
-                        {% if c.nearest_skill_id %}
-                        <a href="/catalog-admin/skills/{{ c.nearest_skill_id }}" target="_blank" rel="noopener">{{ c.nearest_name }}</a>
-                        {% else %}
-                        {{ c.nearest_name }}
+            {% set rec = c.recommended_action if c.recommended_action is defined and c.recommended_action else none %}
+            {% set recommended_code = rec.code if rec else '' %}
+            <article class="candidate-review-card{% if c.decision == 'accepted' %} candidate-card-collapsed{% endif %}" data-candidate-row="{{ c.suggestion_id or '' }}" data-candidate-decision="{{ c.decision }}">
+                <div class="candidate-card-main">
+                    <div class="candidate-card-head">
+                        <div class="candidate-card-title-block">
+                            <div class="candidate-card-title-line">
+                                <h2><span class="param-index">①</span>{{ c.name }}</h2>
+                                <span class="candidate-bloom-pill"><span class="param-index">④</span>Блум {{ c.bloom }}</span>
+                                <span class="candidate-decision-compact status-badge {% if c.decision != 'accepted' %}warn{% endif %}" data-decision-compact>
+                                    {% if c.decision == 'accepted' %}Принято
+                                    {% elif c.decision == 'needs_review' %}На проверке
+                                    {% elif c.decision == 'rejected' %}Отклонено
+                                    {% elif c.decision == 'pending' %}Ожидает решения
+                                    {% elif c.decision == 'superseded' %}Заменено
+                                    {% else %}{{ c.decision }}{% endif %}
+                                </span>
+                            </div>
+                            {% if c.source_name and c.source_name != c.name %}
+                            <div class="candidate-source small muted">Исходная формулировка: {{ c.source_name }}</div>
+                            {% endif %}
+                            <div class="candidate-meta-line">
+                                <span><span class="param-index">②</span>{{ c.coverage_area or "Область покрытия не указана" }}</span>
+                                <span><span class="param-index">③</span>{{ c.group or "Группа не указана" }}</span>
+                            </div>
+                            <div class="candidate-tools small muted">
+                                <span class="param-index">①</span>Инструменты: {{ c.tools or "—" }}
+                            </div>
+                            {% if c.parent_name %}<div class="small muted">Из декомпозиции: {{ c.parent_name }}</div>{% endif %}
+                            {% if c.entity_type != 'skill' %}<div class="small muted">Тип сущности: {{ c.entity_type|review_entity_label }}</div>{% endif %}
+                        </div>
+                        <div class="candidate-card-actions">
+                            <div class="candidate-card-action-label"><span class="param-index">⑬</span>Действия</div>
+                            {% if c.can_review_inline and c.suggestion_id %}
+                            <form class="candidate-action-form" method="post" action="/intake/jobs/{{ job.id }}/candidate-decision" data-candidate-action-form>
+                                <input type="hidden" name="suggestion_id" value="{{ c.suggestion_id }}">
+                                <button type="submit" name="candidate_action" value="accept" data-action="accept" class="action-btn action-btn-icon {% if recommended_code == 'create' %}action-btn-primary action-btn-recommended{% else %}action-btn-secondary{% endif %}" title="Добавить как новый навык" aria-label="Добавить как новый навык"{% if c.decision == 'accepted' %} disabled{% endif %}>+</button>
+                                <button type="submit" name="candidate_action" value="link" data-action="link" class="action-btn action-btn-icon {% if recommended_code == 'link' %}action-btn-primary action-btn-recommended{% else %}action-btn-secondary{% endif %}" title="Привязать к ближайшему навыку из каталога" aria-label="Привязать к ближайшему навыку из каталога"{% if not c.nearest_skill_id %} data-static-disabled="1"{% endif %}{% if c.decision == 'accepted' or not c.nearest_skill_id %} disabled{% endif %}>↔</button>
+                                <button type="submit" name="candidate_action" value="review" data-action="review" class="action-btn action-btn-icon action-btn-light" title="Вернуть в проверку" aria-label="Вернуть в проверку"{% if c.decision == 'needs_review' %} disabled{% endif %}>↩</button>
+                                <button type="submit" name="candidate_action" value="reject" data-action="reject" class="action-btn action-btn-icon action-btn-danger" title="Отклонить и не использовать для покрытия" aria-label="Отклонить и не использовать для покрытия"{% if c.decision == 'rejected' %} disabled{% endif %}>×</button>
+                            </form>
+                            {% else %}
+                            <span class="small muted">Нет ручного действия</span>
+                            {% endif %}
+                            <button type="button" class="candidate-expand-toggle" data-candidate-toggle aria-expanded="{{ 'false' if c.decision == 'accepted' else 'true' }}">
+                                {{ 'Показать детали' if c.decision == 'accepted' else 'Свернуть' }}
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="candidate-card-divider"></div>
+
+                    <div class="candidate-diagnostic-row">
+                        <span class="candidate-resolution-pill">
+                            <span class="param-index">⑤</span>
+                            {% if c.resolution == 'new' %}Новый
+                            {% elif c.resolution == 'matched' %}Совпадение найдено
+                            {% elif c.resolution == 'alias' %}Синоним найден
+                            {% elif c.resolution == 'fuzzy' %}Похожий вариант
+                            {% elif c.resolution %}{{ c.resolution }}
+                            {% else %}Не проверено{% endif %}
+                        </span>
+                        {% if c.similarity_hint is defined and c.similarity_hint %}
+                        <span class="candidate-match-chip match-hint-{{ c.similarity_hint.class }}"><span class="param-index">⑥</span>{{ c.similarity_hint.label }}</span>
                         {% endif %}
-                        {% if c.nearest_group %}<span> · {{ c.nearest_group }}</span>{% endif %}
+                        <span class="candidate-nearest">
+                            <span class="param-index">⑥</span>
+                            {% if c.nearest_name is defined and c.nearest_name %}
+                            Ближайший в каталоге:
+                            {% if c.nearest_skill_id %}
+                            <a href="/catalog-admin/skills/{{ c.nearest_skill_id }}" target="_blank" rel="noopener">{{ c.nearest_name }}</a>
+                            {% else %}
+                            {{ c.nearest_name }}
+                            {% endif %}
+                            {% if c.nearest_group %}<span class="muted"> · {{ c.nearest_group }}</span>{% endif %}
+                            {% else %}
+                            Ближайший в каталоге не найден
+                            {% endif %}
+                        </span>
                     </div>
-                    {% endif %}
-                    {% if c.similarity_hint is defined and c.similarity_hint %}
-                    <div class="match-hint match-hint-{{ c.similarity_hint.class }}">
-                        <span>{{ c.similarity_hint.label }}</span>
+
+                    <div class="candidate-score-strip">
+                        <span><span class="param-index">⑥</span>похожесть <strong>{{ c.match_score if c.match_score is defined and c.match_score is not none else "—" }}</strong></span>
+                        <span><span class="param-index">⑦</span>новизна <strong>{{ c.novelty_score if c.novelty_score is defined and c.novelty_score is not none else "—" }}</strong></span>
+                        <span><span class="param-index">⑧</span>уверенность <strong>{{ c.confidence }}</strong></span>
+                        <span><span class="param-index">⑨</span>жюри <strong>{{ c.council_agreement if c.council_agreement is not none else "—" }}</strong></span>
+                        <span class="candidate-decision-badge status-badge {% if c.decision != 'accepted' %}warn{% endif %}" data-decision-badge>
+                            <span class="param-index">⑩</span>
+                            {% if c.decision == 'accepted' %}Принято
+                            {% elif c.decision == 'needs_review' %}На проверке
+                            {% elif c.decision == 'rejected' %}Отклонено
+                            {% elif c.decision == 'pending' %}Ожидает решения
+                            {% elif c.decision == 'superseded' %}Заменено
+                            {% else %}{{ c.decision }}{% endif %}
+                        </span>
                     </div>
-                    <div class="small muted match-recommendation">{{ c.similarity_hint.recommendation }}</div>
-                    {% endif %}
-                    {% if c.nearest_preview is defined and c.nearest_preview and c.nearest_preview.indicators %}
-                    <details class="nearest-preview">
-                        <summary>Индикаторы ближайшего skill</summary>
-                        <ul>
-                            {% for indicator in c.nearest_preview.indicators %}
-                            <li>
-                                {% if indicator.type %}<span class="small muted">{{ indicator.type }}{% if indicator.complexity %} · {{ indicator.complexity }}{% endif %}: </span>{% endif %}
-                                {{ indicator.text }}
-                            </li>
-                            {% endfor %}
-                        </ul>
+
+                    <div class="candidate-recommendation-panel candidate-recommendation-{{ rec.code if rec else 'review' }}">
+                        <div class="candidate-recommendation-title">
+                            <span class="param-index">⑫</span>
+                            {% if rec %}{{ rec.label }}{% else %}Нужно решение методолога{% endif %}
+                        </div>
+                        {% if rec and rec.target %}<div class="small recommendation-target">{{ rec.target }}</div>{% endif %}
+                        {% if rec and rec.detail %}<div class="small recommendation-detail">{{ rec.detail }}</div>{% endif %}
+                        {% if c.similarity_hint is defined and c.similarity_hint and c.similarity_hint.recommendation %}
+                        <div class="small recommendation-detail">{{ c.similarity_hint.recommendation }}</div>
+                        {% endif %}
+                        {% if c.decision_rationale is defined and c.decision_rationale %}
+                        <details class="decision-rationale">
+                            <summary>Почему</summary>
+                            <div class="small">{{ c.decision_rationale.summary }}</div>
+                            <div class="small muted">{{ c.decision_rationale.match_evidence }}</div>
+                            <div class="small muted">{{ c.decision_rationale.council_rationale }}</div>
+                            <div class="small muted">{{ c.decision_rationale.validator_reasons }}</div>
+                        </details>
+                        {% endif %}
+                    </div>
+
+                    <details class="candidate-card-details">
+                        <summary><span class="param-index">⑪</span>Причины{% if c.decision %} ({% if c.decision == 'needs_review' %}на проверке{% elif c.decision == 'accepted' %}принято{% elif c.decision == 'rejected' %}отклонено{% else %}{{ c.decision }}{% endif %}){% endif %}</summary>
+                        <div class="small muted">{{ c.reasons or "Причины не указаны" }}</div>
+                        {% if c.nearest_preview is defined and c.nearest_preview and c.nearest_preview.indicators %}
+                        <div class="nearest-preview">
+                            <div class="small"><strong>Индикаторы ближайшего навыка</strong></div>
+                            <ul>
+                                {% for indicator in c.nearest_preview.indicators %}
+                                <li>
+                                    {% if indicator.type %}<span class="small muted">{{ indicator.type }}{% if indicator.complexity %} · {{ indicator.complexity }}{% endif %}: </span>{% endif %}
+                                    {{ indicator.text }}
+                                </li>
+                                {% endfor %}
+                            </ul>
+                        </div>
+                        {% endif %}
                     </details>
-                    {% endif %}
-                </td>
-                <td>{{ c.novelty_score if c.novelty_score is defined and c.novelty_score is not none else "—" }}</td>
-                <td>{{ c.confidence }}</td>
-                <td>{{ c.council_agreement if c.council_agreement is not none else "—" }}</td>
-                <td><span class="status-badge {% if c.decision != 'accepted' %}warn{% endif %}" data-decision-badge>{{ c.decision }}</span></td>
-                <td class="small muted">{{ c.reasons or "—" }}</td>
-                <td class="candidate-action-cell">
-                    {% if c.can_review_inline and c.suggestion_id %}
-                    <form class="candidate-action-form" method="post" action="/intake/jobs/{{ job.id }}/candidate-decision" data-candidate-action-form>
-                        <input type="hidden" name="suggestion_id" value="{{ c.suggestion_id }}">
-                        <button type="submit" name="candidate_action" value="accept" data-action="accept" class="action-btn action-btn-icon action-btn-primary" title="Добавить как новый skill" aria-label="Добавить как новый skill"{% if c.decision == 'accepted' %} disabled{% endif %}>+</button>
-                        <button type="submit" name="candidate_action" value="link" data-action="link" class="action-btn action-btn-icon action-btn-secondary" title="Привязать к ближайшему skill из каталога" aria-label="Привязать к ближайшему skill из каталога"{% if not c.nearest_skill_id %} data-static-disabled="1"{% endif %}{% if c.decision == 'accepted' or not c.nearest_skill_id %} disabled{% endif %}>↔</button>
-                        <button type="submit" name="candidate_action" value="review" data-action="review" class="action-btn action-btn-icon action-btn-light" title="Вернуть на review" aria-label="Вернуть на review"{% if c.decision == 'needs_review' %} disabled{% endif %}>↩</button>
-                        <button type="submit" name="candidate_action" value="reject" data-action="reject" class="action-btn action-btn-icon action-btn-danger" title="Отклонить и не использовать для покрытия" aria-label="Отклонить и не использовать для покрытия"{% if c.decision == 'rejected' %} disabled{% endif %}>×</button>
-                    </form>
-                    {% else %}
-                    <span class="small muted">Нет ручного действия</span>
-                    {% endif %}
-                </td>
-            </tr>
+                </div>
+            </article>
         {% endfor %}
-        </tbody>
-    </table>
+    </div>
+
+    <div class="candidate-card-legend">
+        <div class="legend-title">Все 13 столбцов таблицы → зоны карточки</div>
+        <div class="legend-grid">
+            <span>① Навык и инструменты</span>
+            <span>② Область покрытия</span>
+            <span>③ Группа</span>
+            <span>④ Блум</span>
+            <span>⑤ Сопоставление с каталогом</span>
+            <span>⑥ Похожесть и ближайший навык</span>
+            <span>⑦ Новизна</span>
+            <span>⑧ Уверенность модели</span>
+            <span>⑨ Жюри</span>
+            <span>⑩ Решение</span>
+            <span>⑪ Причины</span>
+            <span>⑫ Рекомендация и объяснение</span>
+            <span>⑬ Действие</span>
+        </div>
+    </div>
+    </details>
 </section>
 
-<details class="collapse-panel technical-details">
+<details class="collapse-panel technical-details technical-intake-details">
 <summary>Технические детали декомпозиции и нормализации</summary>
-<section class="hero hero-compact">
+<section class="hero hero-compact technical-section-title">
     <div><h1>Декомпозиция</h1></div>
 </section>
-<section class="chips-row">
+<section class="chips-row technical-summary-grid">
     <div class="summary-card"><div class="summary-label">Тип брифа</div><div class="summary-value">{{ result.spec.artifact_type or "—" }}</div></div>
     <div class="summary-card"><div class="summary-label">Роль</div><div class="summary-value">{{ result.spec.role }}</div></div>
     <div class="summary-card"><div class="summary-label">Грейд</div><div class="summary-value">{{ result.spec.seniority }}</div></div>
@@ -270,22 +476,22 @@
 </section>
 {% endif %}
 {% if result.spec.must_include_areas %}
-<section class="table-wrap">
-    <div class="small muted">Обязательные области для coverage-check:</div>
-    <ul>{% for item in result.spec.must_include_areas %}<li>{{ item }}</li>{% endfor %}</ul>
+<section class="table-wrap must-areas-panel">
+    <div class="must-areas-title">Обязательные области покрытия</div>
+    <ul class="must-areas-list">{% for item in result.spec.must_include_areas %}<li>{{ item }}</li>{% endfor %}</ul>
 </section>
 {% endif %}
 {% if result.coverage and result.coverage.rows %}
-<section class="hero hero-compact">
+<section class="hero hero-compact technical-section-title">
     <div>
-        <h1>Coverage по обязательным областям</h1>
+        <h1>Покрытие обязательных областей</h1>
         <p class="small muted">Здесь видно, какие области программа уже закрывает кандидатами, а какие пока не покрыты и требуют доработки пайплайна или ручной методологической проверки.</p>
     </div>
 </section>
-<section class="chips-row">
-    <div class="summary-card summary-card-soft"><div class="summary-label">Covered</div><div class="summary-value">{{ result.coverage.covered_count }}</div></div>
-    <div class="summary-card"><div class="summary-label">Partial</div><div class="summary-value">{{ result.coverage.partial_count }}</div></div>
-    <div class="summary-card summary-card-warn"><div class="summary-label">Uncovered</div><div class="summary-value">{{ result.coverage.uncovered_count }}</div></div>
+<section class="chips-row technical-summary-grid technical-summary-grid-small">
+    <div class="summary-card summary-card-soft"><div class="summary-label">Закрыто</div><div class="summary-value">{{ result.coverage.covered_count }}</div></div>
+    <div class="summary-card"><div class="summary-label">Частично</div><div class="summary-value">{{ result.coverage.partial_count }}</div></div>
+    <div class="summary-card summary-card-warn"><div class="summary-label">Не закрыто</div><div class="summary-value">{{ result.coverage.uncovered_count }}</div></div>
 </section>
 <section class="table-wrap">
     <table class="data-table">
@@ -296,11 +502,11 @@
                 <td><strong>{{ row.area }}</strong></td>
                 <td>
                     {% if row.status == 'covered' %}
-                    <span class="status-badge">covered</span>
+                    <span class="status-badge">закрыто</span>
                     {% elif row.status == 'partial' %}
-                    <span class="status-badge warn">partial</span>
+                    <span class="status-badge warn">частично</span>
                     {% else %}
-                    <span class="status-badge warn">uncovered</span>
+                    <span class="status-badge warn">не закрыто</span>
                     {% endif %}
                 </td>
                 <td>{% if row.candidate_names %}{{ row.candidate_names|join(', ') }}{% else %}<span class="small muted">—</span>{% endif %}</td>
@@ -318,15 +524,15 @@
 </section>
 
 {% if result.atomize %}
-<section class="hero hero-compact">
+<section class="hero hero-compact technical-section-title">
     <div>
         <h1>Атомизация</h1>
-        <p class="small muted">Система проверяет, является ли формулировка атомарным skill, составной записью или не-навыком. Композиты разбиваются, а рамочные блоки не попадают напрямую в DAG.</p>
+        <p class="small muted">Система проверяет, является ли формулировка атомарным навыком, составной записью или не-навыком. Составные записи разбиваются, а рамочные блоки не попадают напрямую в DAG.</p>
     </div>
 </section>
-<section class="chips-row">
+<section class="chips-row technical-summary-grid">
     <div class="summary-card"><div class="summary-label">Кандидатов из синтеза</div><div class="summary-value">{{ result.atomize.raw_count }}</div></div>
-    <div class="summary-card summary-card-soft"><div class="summary-label">Атомарных skills</div><div class="summary-value">{{ result.atomize.atomic_count }}</div></div>
+    <div class="summary-card summary-card-soft"><div class="summary-label">Атомарных навыков</div><div class="summary-value">{{ result.atomize.atomic_count }}</div></div>
     <div class="summary-card summary-card-warn"><div class="summary-label">Разбито композитов</div><div class="summary-value">{{ result.atomize.composite_count }}</div></div>
     <div class="summary-card summary-card-warn"><div class="summary-label">Не-навыки</div><div class="summary-value">{{ result.atomize.non_skill_count }}</div></div>
 </section>
@@ -341,11 +547,11 @@
                 <td><strong>{{ event.parent_name }}</strong></td>
                 <td>
                     {% if event.verdict == 'composite' %}
-                    <span class="status-badge warn">composite</span>
+                    <span class="status-badge warn">составной</span>
                     {% elif event.verdict == 'non_skill' %}
-                    <span class="status-badge warn">non_skill</span>
+                    <span class="status-badge warn">не навык</span>
                     {% else %}
-                    <span class="pill ghost">atomic</span>
+                    <span class="pill ghost">атомарный</span>
                     {% endif %}
                 </td>
                 <td>
@@ -368,24 +574,24 @@
 {% endif %}
 
 {% if result.normalize %}
-<section class="hero hero-compact">
+<section class="hero hero-compact technical-section-title">
     <div>
         <h1>Нормализация и дедупликация</h1>
         <p class="small muted">После атомизации система схлопывает только безопасные exact/near-exact дубли, чтобы очередь review не раздувалась одинаковыми формулировками.</p>
     </div>
 </section>
-<section class="chips-row">
-    <div class="summary-card"><div class="summary-label">Atomic до merge</div><div class="summary-value">{{ result.normalize.atomic_input_count }}</div></div>
-    <div class="summary-card summary-card-soft"><div class="summary-label">Atomic после merge</div><div class="summary-value">{{ result.normalize.atomic_output_count }}</div></div>
+<section class="chips-row technical-summary-grid">
+    <div class="summary-card"><div class="summary-label">Атомарных до слияния</div><div class="summary-value">{{ result.normalize.atomic_input_count }}</div></div>
+    <div class="summary-card summary-card-soft"><div class="summary-label">Атомарных после слияния</div><div class="summary-value">{{ result.normalize.atomic_output_count }}</div></div>
     <div class="summary-card"><div class="summary-label">Схлопнуто дублей</div><div class="summary-value">{{ result.normalize.merged_count }}</div></div>
     <div class="summary-card"><div class="summary-label">Убрано пере-дробления</div><div class="summary-value">{{ result.normalize.compacted_count }}</div></div>
-    <div class="summary-card"><div class="summary-label">Exact merge</div><div class="summary-value">{{ result.normalize.exact_merged_count }}</div></div>
-    <div class="summary-card"><div class="summary-label">Near-exact merge</div><div class="summary-value">{{ result.normalize.fuzzy_merged_count }}</div></div>
+    <div class="summary-card"><div class="summary-label">Точное слияние</div><div class="summary-value">{{ result.normalize.exact_merged_count }}</div></div>
+    <div class="summary-card"><div class="summary-label">Похожее слияние</div><div class="summary-value">{{ result.normalize.fuzzy_merged_count }}</div></div>
 </section>
 {% if result.normalize.events %}
 <section class="table-wrap">
     <table class="data-table">
-        <thead><tr><th>Оставлено</th><th>Поглощено</th><th>Причина</th><th>Score</th><th>Coverage area</th></tr></thead>
+        <thead><tr><th>Оставлено</th><th>Поглощено</th><th>Причина</th><th>Оценка</th><th>Область покрытия</th></tr></thead>
         <tbody>
         {% for event in result.normalize.events %}
             <tr>
@@ -403,7 +609,7 @@
 {% if result.normalize.compaction_events %}
 <section class="table-wrap">
     <table class="data-table">
-        <thead><tr><th>Coverage area</th><th>Оставлены в review</th><th>Убраны как пере-дробление</th><th>Правило</th></tr></thead>
+        <thead><tr><th>Область покрытия</th><th>Оставлены на проверке</th><th>Убраны как пере-дробление</th><th>Правило</th></tr></thead>
         <tbody>
         {% for event in result.normalize.compaction_events %}
             <tr>
@@ -420,11 +626,12 @@
 {% endif %}
 </details>
 
+{% if workspace_state and workspace_state.show_downstream_sections %}
 <section class="hero hero-compact"><div><h1>Граф пререквизитов</h1></div></section>
 <section class="chips-row">
     <div class="summary-card"><div class="summary-label">Узлов в DAG</div><div class="summary-value">{{ result.dag.nodes }}</div></div>
-    <div class="summary-card"><div class="summary-label">Рёбер в operational DAG</div><div class="summary-value">{{ result.dag.edges }}</div></div>
-    <div class="summary-card summary-card-soft"><div class="summary-label">Preview-рёбер</div><div class="summary-value">{{ result.dag.visual_edge_count or result.dag.edges }}</div></div>
+    <div class="summary-card"><div class="summary-label">Подтверждённых рёбер</div><div class="summary-value">{{ result.dag.edges }}</div></div>
+    <div class="summary-card summary-card-soft"><div class="summary-label">Рёбер на проверке</div><div class="summary-value">{{ result.dag.preview_edge_count or 0 }}</div></div>
     <div class="summary-card {% if result.dag.removed_cycle %}summary-card-warn{% endif %}"><div class="summary-label">Разорвано циклов</div><div class="summary-value">{{ result.dag.removed_cycle }}</div></div>
     <div class="summary-card summary-card-soft"><div class="summary-label">Убрано избыточных</div><div class="summary-value">{{ result.dag.removed_transitive }}</div></div>
     <div class="summary-card"><div class="summary-label">Ацикличен</div><div class="summary-value">{{ "да" if result.dag.acyclic else "нет" }}</div></div>
@@ -433,17 +640,21 @@
 <section class="filter-panel">
     <div class="small"><strong>Состояние DAG:</strong> {{ result.dag.message }}</div>
     <div class="small muted">
-        accepted atomic = {{ result.dag.accepted_atomic_candidates or 0 }},
-        pending atomic = {{ result.dag.pending_atomic_candidates or 0 }},
-        open review = {{ result.dag.open_review_count or 0 }}.
+        принято атомарных = {{ result.dag.accepted_atomic_candidates or 0 }},
+        ожидают решения = {{ result.dag.pending_atomic_candidates or 0 }},
+        открыто в проверке = {{ result.dag.open_review_count or 0 }}.
     </div>
 </section>
 {% endif %}
-<div class="small muted">DAG перестраивается автоматически по текущим узлам с `entity_type=skill`, `atomicity=atomic` и `decision=accepted`.</div>
+<div class="small muted">DAG перестраивается автоматически по текущим принятым атомарным навыкам.</div>
 {% if result.dag.preview_edge_count %}
-<div class="small muted">
-    На карте ниже показан preview: {{ result.dag.preview_edge_count }} LLM-рёбер ожидают методологической проверки и не влияют на УП, пока не подтверждены.
-</div>
+<section class="filter-panel dag-review-callout">
+    <div>
+        <strong>Нужно проверить рёбра:</strong>
+        {{ result.dag.preview_edge_count }} предложенных связей видны на карте, но не влияют на УП, пока методолог их не подтвердит.
+    </div>
+    <a class="action-btn action-btn-primary" href="/reviews?status=open&entity_type=prerequisite_edge">Проверить рёбра</a>
+</section>
 {% endif %}
 
 {% set dag_visual_waves = result.dag.visual_waves if result.dag.visual_waves else result.dag.waves %}
@@ -465,6 +676,9 @@
             <span class="dag-legend-chip dag-legend-chip-review">Ожидает review</span>
         </div>
         <div class="review-actions">
+            {% if result.dag.preview_edge_count %}
+            <a class="action-btn action-btn-primary" href="/reviews?status=open&entity_type=prerequisite_edge">Проверить рёбра</a>
+            {% endif %}
             <button type="button" class="action-btn action-btn-light" id="dag-expand-all">Развернуть группы</button>
             <button type="button" class="action-btn action-btn-light" id="dag-collapse-all">Свернуть группы</button>
             <button type="button" class="action-btn" id="dag-export-svg">SVG</button>
@@ -506,21 +720,11 @@
     <div class="small muted">Наведи курсор на навык, чтобы подсветить его зависимости. Наведи на ребро, чтобы увидеть источник, confidence и причины review.</div>
 </section>
 
-<section class="hero hero-compact"><div><h1>Волны обучения</h1></div></section>
-<section class="chips-row">
-    {% for wave in result.dag.waves %}
-    <div class="summary-card">
-        <div class="summary-label">Волна {{ loop.index }}</div>
-        {% for node in wave %}
-        <div class="small{% if not loop.first %} muted{% endif %}">{{ node.name }} · bloom {{ node.bloom }} · {{ node.group }}</div>
-        {% endfor %}
-    </div>
-    {% endfor %}
-</section>
 {% endif %}
 
 {% if dag_visual_order %}
-<section class="hero hero-compact"><div><h1>Порядок preview</h1></div></section>
+<details class="collapse-panel technical-details dag-preview-details">
+<summary>Порядок предварительного графа</summary>
 <section class="table-wrap">
     <table class="data-table">
         <thead><tr><th>#</th><th>Навык</th><th>Группа</th><th>Bloom</th></tr></thead>
@@ -536,16 +740,31 @@
         </tbody>
     </table>
 </section>
+</details>
 {% endif %}
 
 {% if result.dag.final_edges or result.dag.edge_review_queue %}
 <details class="collapse-panel technical-details">
 <summary>Технические детали рёбер DAG</summary>
+<section class="dag-review-explainer">
+    <div>
+        <strong>Что здесь проверяется</strong>
+        <span>Ребро показывает зависимость: навык слева желательно изучить до навыка справа.</span>
+    </div>
+    <div>
+        <strong>Почему это важно</strong>
+        <span>Только подтверждённые связи попадают в рабочий граф и влияют на порядок блоков УП.</span>
+    </div>
+    <div>
+        <strong>Как читать таблицу</strong>
+        <span>Причина объясняет, почему связь требует внимания; важность показывает риск; уверенность — силу предположения.</span>
+    </div>
+</section>
 {% if result.dag.final_edges %}
 <section class="hero hero-compact"><div><h1>Финальные рёбра DAG</h1></div></section>
 <section class="table-wrap">
     <table class="data-table">
-        <thead><tr><th>Откуда</th><th>Куда</th><th>Тип</th><th>Источник</th><th>Уверенность</th><th>Decision</th><th>Причины</th></tr></thead>
+        <thead><tr><th>Откуда</th><th>Куда</th><th>Тип</th><th>Источник</th><th>Уверенность</th><th>Решение</th><th>Причины</th></tr></thead>
         <tbody>
         {% for edge in result.dag.final_edges %}
             <tr>
@@ -555,7 +774,7 @@
                 <td>{{ edge.source }}</td>
                 <td>{{ edge.confidence if edge.confidence is not none else "—" }}</td>
                 <td>{{ edge.decision }}</td>
-                <td class="small muted">{{ edge.reasons|join(", ") if edge.reasons else "—" }}</td>
+                <td class="small muted">{{ edge.reasons|edge_reason_label }}</td>
             </tr>
         {% endfor %}
         </tbody>
@@ -567,15 +786,15 @@
 <section class="hero hero-compact"><div><h1>Проверка рёбер DAG</h1></div></section>
 <section class="table-wrap">
     <table class="data-table">
-        <thead><tr><th>Ребро</th><th>Причина</th><th>Severity</th><th>Уверенность</th><th>Статус</th></tr></thead>
+        <thead><tr><th>Ребро</th><th>Причина</th><th>Важность</th><th>Уверенность</th><th>Статус</th></tr></thead>
         <tbody>
         {% for item in result.dag.edge_review_queue %}
             <tr>
                 <td>{{ item.edge_label }}</td>
-                <td>{{ item.reason_code }}</td>
-                <td>{{ item.severity }}</td>
+                <td>{{ item.reason_code|edge_reason_label }}</td>
+                <td>{{ item.severity|review_severity_label }}</td>
                 <td>{{ item.confidence if item.confidence is not none else "—" }}</td>
-                <td>{{ item.status }}</td>
+                <td>{{ item.status|review_status_label }}</td>
             </tr>
         {% endfor %}
         </tbody>
@@ -597,6 +816,9 @@
         <a class="action-btn action-btn-primary" href="/up/plans/{{ result.curriculum_plan.plan_id }}">Открыть УП</a>
         {% elif result.curriculum_plan.plan_id %}
         <span class="action-btn action-btn-light disabled">Открыть УП недоступно</span>
+        {% endif %}
+        {% if result.curriculum_plan.plan_id and result.curriculum_plan.template_proposal_count %}
+        <a class="action-btn action-btn-secondary" href="/up/plans/{{ result.curriculum_plan.plan_id }}/template-proposals">Шаблоны УП ({{ result.curriculum_plan.template_proposal_count }})</a>
         {% endif %}
         {% if result.curriculum_plan.rows and up_is_valid %}
         <a class="action-btn action-btn-secondary" href="/up/plans/{{ result.curriculum_plan.plan_id }}/csv">Скачать CSV</a>
@@ -637,6 +859,7 @@
                 <th>Название проекта</th>
                 <th>Образовательные результаты</th>
                 <th>Навыки</th>
+                <th>Роль навыков</th>
                 <th>Инструменты</th>
                 <th>Астр. часы</th>
             </tr>
@@ -652,6 +875,13 @@
                 </td>
                 <td class="small">{{ row.learning_outcomes }}</td>
                 <td>{{ row.skills_list }}</td>
+                <td class="small muted">
+                    {% if row.primary_skill_count is defined or row.repeat_skill_count is defined %}
+                    первичных: {{ row.primary_skill_count or 0 }}, повторов: {{ row.repeat_skill_count or 0 }}
+                    {% else %}
+                    —
+                    {% endif %}
+                </td>
                 <td>{{ row.required_tools or "—" }}</td>
                 <td>{{ row.effort_hours }}</td>
             </tr>
@@ -678,31 +908,36 @@
 <details class="collapse-panel technical-details">
 <summary>Наблюдаемость и служебные метрики</summary>
 {% if result.meta %}
-<section class="chips-row">
+<section class="chips-row service-metrics-grid">
     <div class="summary-card"><div class="summary-label">Режим</div><div class="summary-value">{{ 'LIVE' if result.meta.use_live else 'MOCK' }}</div></div>
-    <div class="summary-card"><div class="summary-label">Council</div><div class="summary-value">{{ 'включен' if result.meta.use_council else 'выключен' }}</div></div>
-    <div class="summary-card"><div class="summary-label">Plan model</div><div class="summary-value">{{ result.meta.model_plan }}</div></div>
-    <div class="summary-card"><div class="summary-label">Search model</div><div class="summary-value">{{ result.meta.model_search }}</div></div>
+    <div class="summary-card"><div class="summary-label">Жюри</div><div class="summary-value">{{ 'включено' if result.meta.use_council else 'выключено' }}</div></div>
+    <div class="summary-card"><div class="summary-label">Модель планирования</div><div class="summary-value">{{ result.meta.model_plan }}</div></div>
+    <div class="summary-card"><div class="summary-label">Модель поиска</div><div class="summary-value">{{ result.meta.model_search }}</div></div>
 </section>
 {% endif %}
 
 {% if llm_usage and llm_usage.rows %}
-<section class="hero hero-compact"><div><h1>LLM usage</h1></div></section>
-<section class="chips-row">
-    <div class="summary-card"><div class="summary-label">Total tokens</div><div class="summary-value">{{ llm_usage.total_tokens }}</div></div>
-    <div class="summary-card"><div class="summary-label">Prompt</div><div class="summary-value">{{ llm_usage.prompt_tokens }}</div></div>
-    <div class="summary-card"><div class="summary-label">Completion</div><div class="summary-value">{{ llm_usage.completion_tokens }}</div></div>
+<section class="hero hero-compact service-section-title"><div><h1>Расход LLM</h1></div></section>
+<section class="chips-row service-metrics-grid service-metrics-grid-tight">
+    <div class="summary-card"><div class="summary-label">Всего токенов</div><div class="summary-value">{{ llm_usage.total_tokens }}</div></div>
+    <div class="summary-card"><div class="summary-label">Запрос</div><div class="summary-value">{{ llm_usage.prompt_tokens }}</div></div>
+    <div class="summary-card"><div class="summary-label">Ответ</div><div class="summary-value">{{ llm_usage.completion_tokens }}</div></div>
+    <div class="summary-card"><div class="summary-label">Общее время</div><div class="summary-value">{{ llm_usage.total_latency_ms }} ms</div></div>
+    <div class="summary-card"><div class="summary-label">Стоимость</div><div class="summary-value">{{ llm_usage.estimated_cost_label }}</div></div>
 </section>
-<section class="table-wrap">
-    <table class="data-table">
+<section class="table-wrap service-table-wrap">
+    <table class="data-table service-data-table">
         <thead>
             <tr>
-                <th>Stage</th>
-                <th>Model</th>
-                <th>Calls</th>
-                <th>Prompt</th>
-                <th>Completion</th>
-                <th>Total</th>
+                <th>Этап</th>
+                <th>Модель</th>
+                <th>Вызовы</th>
+                <th>Среднее время</th>
+                <th>Общее время</th>
+                <th>Запрос</th>
+                <th>Ответ</th>
+                <th>Всего</th>
+                <th>Стоимость</th>
             </tr>
         </thead>
         <tbody>
@@ -711,9 +946,12 @@
                 <td>{{ row.stage }}</td>
                 <td>{{ row.model }}</td>
                 <td>{{ row.calls }}</td>
+                <td>{{ row.avg_latency_ms }} ms</td>
+                <td>{{ row.total_latency_ms }} ms</td>
                 <td>{{ row.prompt_tokens }}</td>
                 <td>{{ row.completion_tokens }}</td>
                 <td>{{ row.total_tokens }}</td>
+                <td>{{ row.estimated_cost_label }}</td>
             </tr>
             {% endfor %}
         </tbody>
@@ -722,20 +960,20 @@
 {% endif %}
 
 {% if result.council_metrics %}
-<section class="hero hero-compact"><div><h1>Council и Триаж</h1></div></section>
-<section class="chips-row">
+<section class="hero hero-compact service-section-title"><div><h1>Жюри и триаж</h1></div></section>
+<section class="chips-row service-metrics-grid service-metrics-grid-tight">
     <div class="summary-card"><div class="summary-label">Всего кандидатов</div><div class="summary-value">{{ result.council_metrics.total_candidates }}</div></div>
     <div class="summary-card"><div class="summary-label">Автопринято</div><div class="summary-value">{{ result.council_metrics.auto_accepted }}</div></div>
-    <div class="summary-card"><div class="summary-label">Ушло в panel</div><div class="summary-value">{{ result.council_metrics.sent_to_council }}</div></div>
-    <div class="summary-card"><div class="summary-label">Подтверждено panel</div><div class="summary-value">{{ result.council_metrics.accepted_after_council }}</div></div>
-    <div class="summary-card summary-card-warn"><div class="summary-label">Осталось на review</div><div class="summary-value">{{ result.council_metrics.needs_review_total }}</div></div>
+    <div class="summary-card"><div class="summary-label">Ушло в жюри</div><div class="summary-value">{{ result.council_metrics.sent_to_council }}</div></div>
+    <div class="summary-card"><div class="summary-label">Подтверждено жюри</div><div class="summary-value">{{ result.council_metrics.accepted_after_council }}</div></div>
+    <div class="summary-card summary-card-warn"><div class="summary-label">Осталось на проверке</div><div class="summary-value">{{ result.council_metrics.needs_review_total }}</div></div>
 </section>
-<section class="chips-row">
-    <div class="summary-card"><div class="summary-label">Matched</div><div class="summary-value">{{ result.council_metrics.matched_total }}</div></div>
-    <div class="summary-card"><div class="summary-label">Alias</div><div class="summary-value">{{ result.council_metrics.alias_total }}</div></div>
-    <div class="summary-card"><div class="summary-label">Fuzzy</div><div class="summary-value">{{ result.council_metrics.fuzzy_total }}</div></div>
-    <div class="summary-card"><div class="summary-label">New</div><div class="summary-value">{{ result.council_metrics.new_total }}</div></div>
-    <div class="summary-card"><div class="summary-label">Review после panel</div><div class="summary-value">{{ result.council_metrics.review_after_council }}</div></div>
+<section class="chips-row service-metrics-grid service-metrics-grid-tight">
+    <div class="summary-card"><div class="summary-label">Совпадения</div><div class="summary-value">{{ result.council_metrics.matched_total }}</div></div>
+    <div class="summary-card"><div class="summary-label">Синонимы</div><div class="summary-value">{{ result.council_metrics.alias_total }}</div></div>
+    <div class="summary-card"><div class="summary-label">Похожие</div><div class="summary-value">{{ result.council_metrics.fuzzy_total }}</div></div>
+    <div class="summary-card"><div class="summary-label">Новые</div><div class="summary-value">{{ result.council_metrics.new_total }}</div></div>
+    <div class="summary-card"><div class="summary-label">После жюри</div><div class="summary-value">{{ result.council_metrics.review_after_council }}</div></div>
 </section>
 {% endif %}
 
@@ -752,6 +990,113 @@
 {% endif %}
 </details>
 {% endif %}
+
+{% if workspace_state and workspace_state.show_downstream_sections and quality_metrics and quality_metrics.up_project_count %}
+<section class="filter-panel quality-dashboard">
+    <div class="summary-head">
+        <h2>Метрики качества</h2>
+        <span class="pill">Итоговый контроль после построения УП</span>
+    </div>
+    <section class="chips-row">
+        <div class="summary-card">
+            <div class="summary-label">Принято / На проверке / Отклонено</div>
+            <div class="summary-value">{{ quality_metrics.accepted_count }} / {{ quality_metrics.review_count }} / {{ quality_metrics.rejected_count }}</div>
+        </div>
+        <div class="summary-card{% if quality_metrics.false_match_count %} summary-card-warn{% endif %}">
+            <div class="summary-label">Риск ложных совпадений</div>
+            <div class="summary-value">{{ quality_metrics.false_match_rate_pct }}%</div>
+            <div class="small muted">{{ quality_metrics.false_match_count }} из {{ quality_metrics.catalog_match_count }} сопоставлений</div>
+        </div>
+        <div class="summary-card">
+            <div class="summary-label">Токены LLM</div>
+            <div class="summary-value">{{ quality_metrics.llm_total_tokens }}</div>
+        </div>
+        <div class="summary-card">
+            <div class="summary-label">Стоимость LLM</div>
+            <div class="summary-value">{{ quality_metrics.llm_estimated_cost_label }}</div>
+            {% if not quality_metrics.llm_cost_configured %}
+            <div class="small muted">задайте LLM_PRICE_USD_PER_1M</div>
+            {% endif %}
+        </div>
+        <div class="summary-card">
+            <div class="summary-label">Средняя задержка</div>
+            <div class="summary-value">{{ quality_metrics.llm_avg_latency_ms }} ms</div>
+        </div>
+        <div class="summary-card{% if quality_metrics.single_skill_project_count %} summary-card-warn{% endif %}">
+            <div class="summary-label">Одиночных проектов</div>
+            <div class="summary-value">{{ quality_metrics.single_skill_project_count }}</div>
+            <div class="small muted">avg {{ quality_metrics.avg_skills_per_project }} · перв. {{ quality_metrics.avg_primary_skills_per_project }} · повт. {{ quality_metrics.avg_repeat_skills_per_project }}</div>
+        </div>
+        <div class="summary-card quality-dashboard-card-wide">
+            <div class="summary-label">Граф зависимостей и УП</div>
+            <div class="metric-pair">
+                <span><strong>{{ quality_metrics.dag_wave_count }}</strong><small>волн DAG</small></span>
+                <span><strong>{{ quality_metrics.up_block_count }}</strong><small>блоков УП</small></span>
+            </div>
+            <div class="small muted">Волна = уровень зависимостей между навыками. Блок = учебный модуль; одна волна может разбиваться на несколько блоков по нагрузке, теме и проверяемому артефакту.</div>
+        </div>
+        <div class="summary-card">
+            <div class="summary-label">Шаблоны УП</div>
+            <div class="summary-value">{{ quality_metrics.template_proposal_count }}</div>
+            <div class="small muted">предложения для методолога</div>
+        </div>
+        <div class="summary-card{% if quality_metrics.enrichment_completeness_pct < 100 %} summary-card-warn{% endif %}">
+            <div class="summary-label">Обогащение УП</div>
+            <div class="summary-value">{{ quality_metrics.enrichment_completeness_pct }}%</div>
+            <div class="small muted">{{ quality_metrics.enriched_project_count }} из {{ quality_metrics.up_project_count }} проектов</div>
+        </div>
+    </section>
+    {% if job_observability and (job_observability.stage_latency_rows or job_observability.model_version_rows) %}
+    <details class="collapse-panel technical-details quality-observability">
+        <summary>Наблюдаемость: время, модели и версии промптов</summary>
+        {% if job_observability.stage_latency_rows %}
+        <section class="table-wrap">
+            <h2>Время по стадиям</h2>
+            <table class="data-table">
+                <thead><tr><th>Стадия</th><th>Вызовов</th><th>Итого</th><th>Среднее</th><th>Токены</th><th>Модели</th></tr></thead>
+                <tbody>
+                {% for row in job_observability.stage_latency_rows %}
+                    <tr>
+                        <td><strong>{{ row.stage_label }}</strong><div class="small muted">{{ row.stage }}</div></td>
+                        <td>{{ row.calls }}</td>
+                        <td>{{ row.total_latency_ms }} ms</td>
+                        <td>{{ row.avg_latency_ms }} ms</td>
+                        <td>{{ row.total_tokens }}</td>
+                        <td class="small muted">{{ row.models }}</td>
+                    </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </section>
+        {% endif %}
+        {% if job_observability.model_version_rows %}
+        <section class="table-wrap">
+            <h2>Версии промптов и моделей</h2>
+            <table class="data-table">
+                <thead><tr><th>Стадия</th><th>Версия промпта</th><th>Модель</th><th>Вызовы</th><th>Токены</th><th>Стоимость</th></tr></thead>
+                <tbody>
+                {% for row in job_observability.model_version_rows %}
+                    <tr>
+                        <td><strong>{{ row.stage_label }}</strong><div class="small muted">{{ row.stage }}</div></td>
+                        <td>{{ row.prompt_version }}</td>
+                        <td>{{ row.model }}</td>
+                        <td>{{ row.calls }}</td>
+                        <td>{{ row.total_tokens }}</td>
+                        <td>{{ row.estimated_cost_label }}</td>
+                    </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </section>
+        {% endif %}
+    </details>
+    {% endif %}
+    <p class="small muted">
+        Метрики строятся только после появления УП. До этого accepted/review, DAG-волны и плотность проектов не отражают финальное качество учебной программы.
+    </p>
+</section>
+{% endif %}
+{% endif %}
 <script>
 (() => {
     const intakeForm = document.getElementById("intake-form");
@@ -763,7 +1108,7 @@
     const statusNode = document.getElementById("picker-status");
     const jobStageNode = document.getElementById("job-stage");
     const jobProgressNode = document.getElementById("job-progress");
-    const jobStatusNode = document.querySelector(".hero .status-badge");
+    const jobStatusNode = document.getElementById("job-status-badge");
     const jobProgressFillNode = document.getElementById("job-progress-fill");
     const jobProgressPercentNode = document.getElementById("job-progress-percent");
     const jobProgressStepNodes = Array.from(document.querySelectorAll(".intake-progress-step"));
@@ -798,6 +1143,65 @@
         review: "needs_review",
         reject: "rejected",
     };
+    const decisionLabel = {
+        accepted: "Принято",
+        needs_review: "На проверке",
+        rejected: "Отклонено",
+        pending: "Ожидает решения",
+        superseded: "Заменено",
+    };
+
+    const setDecisionBadge = (node, decision, includeIndex = false) => {
+        if (!node) {
+            return;
+        }
+        const label = decisionLabel[decision] || decision || "Нужно решение";
+        node.innerHTML = includeIndex ? `<span class="param-index">⑩</span>${label}` : label;
+        node.classList.toggle("warn", decision !== "accepted");
+    };
+
+    const setCandidateCollapsed = (row, collapsed) => {
+        if (!row) {
+            return;
+        }
+        row.classList.toggle("candidate-card-collapsed", collapsed);
+        const toggle = row.querySelector("[data-candidate-toggle]");
+        if (toggle) {
+            toggle.setAttribute("aria-expanded", String(!collapsed));
+            toggle.textContent = collapsed ? "Показать детали" : "Свернуть";
+        }
+    };
+
+    const updateCandidateListPanel = () => {
+        const panel = document.querySelector("[data-candidate-list-panel]");
+        if (!panel) {
+            return;
+        }
+        const rows = Array.from(panel.querySelectorAll("[data-candidate-row]"));
+        const acceptedRows = rows.filter((row) => row.dataset.candidateDecision === "accepted");
+        const isComplete = rows.length > 0 && acceptedRows.length === rows.length;
+        const title = panel.querySelector("[data-candidate-list-summary]");
+        const count = panel.querySelector("[data-candidate-list-count]");
+        panel.classList.toggle("candidate-list-panel-complete", isComplete);
+        if (title) {
+            title.textContent = isComplete ? "Принятые навыки" : "Карточки навыков";
+        }
+        if (count) {
+            count.textContent = String(isComplete ? acceptedRows.length : rows.length);
+        }
+        if (isComplete) {
+            panel.open = false;
+        } else if (rows.some((row) => row.dataset.candidateDecision !== "accepted")) {
+            panel.open = true;
+        }
+    };
+
+    document.querySelectorAll("[data-candidate-toggle]").forEach((button) => {
+        button.addEventListener("click", () => {
+            const row = button.closest("[data-candidate-row]");
+            setCandidateCollapsed(row, !row?.classList.contains("candidate-card-collapsed"));
+        });
+    });
 
     document.querySelectorAll("[data-candidate-action-form]").forEach((form) => {
         form.addEventListener("submit", async (event) => {
@@ -809,11 +1213,18 @@
             const previousLabel = submitter.textContent;
             const row = form.closest("[data-candidate-row]");
             const badge = row?.querySelector("[data-decision-badge]");
+            const compactBadge = row?.querySelector("[data-decision-compact]");
             const formData = new FormData(form);
             formData.set(submitter.name, submitter.value);
+            if (!submitter.dataset.originalLabel) {
+                submitter.dataset.originalLabel = submitter.textContent;
+            }
             submitter.disabled = true;
-            submitter.textContent = "Сохраняю...";
+            submitter.textContent = "…";
             form.querySelectorAll("button").forEach((button) => {
+                if (!button.dataset.originalLabel) {
+                    button.dataset.originalLabel = button.textContent;
+                }
                 if (button !== submitter) {
                     button.disabled = true;
                 }
@@ -832,10 +1243,13 @@
                 }
                 const payload = await response.json();
                 const nextDecision = payload.decision || decisionByAction[submitter.value] || "needs_review";
-                if (badge) {
-                    badge.textContent = nextDecision;
-                    badge.classList.toggle("warn", nextDecision !== "accepted");
+                if (row) {
+                    row.dataset.candidateDecision = nextDecision;
                 }
+                setDecisionBadge(badge, nextDecision, true);
+                setDecisionBadge(compactBadge, nextDecision);
+                setCandidateCollapsed(row, nextDecision === "accepted");
+                updateCandidateListPanel();
                 form.querySelectorAll("button[data-action]").forEach((button) => {
                     const action = button.dataset.action;
                     button.disabled = button.dataset.staticDisabled === "1" || decisionByAction[action] === nextDecision;
@@ -919,10 +1333,6 @@
     };
 
     if (intakeForm && dropzone && fileInput && pathInput && briefText && statusNode) {
-        dropzone.addEventListener("click", () => {
-            fileInput.click();
-        });
-
         dropzone.addEventListener("keydown", (event) => {
             if (event.key === "Enter" || event.key === " ") {
                 event.preventDefault();
@@ -1139,6 +1549,26 @@
         return path;
     };
 
+    const roundedConnectorPath = (startX, startY, endX, endY) => {
+        const gap = Math.max(1, endX - startX);
+        const laneX = startX + Math.max(24, Math.min(gap * 0.52, 72));
+        const verticalDelta = endY - startY;
+        const direction = verticalDelta >= 0 ? 1 : -1;
+        const radius = Math.min(18, Math.abs(verticalDelta) / 2, Math.max(8, gap / 5));
+        if (Math.abs(verticalDelta) < 18) {
+            const dx = Math.max(36, gap * 0.38);
+            return `M ${startX} ${startY} C ${startX + dx} ${startY}, ${endX - dx} ${endY}, ${endX} ${endY}`;
+        }
+        return [
+            `M ${startX} ${startY}`,
+            `L ${laneX - radius} ${startY}`,
+            `Q ${laneX} ${startY} ${laneX} ${startY + direction * radius}`,
+            `L ${laneX} ${endY - direction * radius}`,
+            `Q ${laneX} ${endY} ${laneX + radius} ${endY}`,
+            `L ${endX} ${endY}`,
+        ].join(" ");
+    };
+
     const renderDagGraph = () => {
         if (!dagPayload || !dagShell || !dagSvg || !dagColumns) {
             return;
@@ -1153,14 +1583,14 @@
         dagSvg.setAttribute("height", String(height));
         dagSvg.innerHTML = `
             <defs>
-                <marker id="dag-arrow-syllabus" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
-                    <path d="M0,0 L12,6 L0,12 z" fill="#0e8f6f"></path>
+                <marker id="dag-arrow-syllabus" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+                    <path d="M0,0 L8,4 L0,8 z" fill="#0e8f6f"></path>
                 </marker>
-                <marker id="dag-arrow-ai" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
-                    <path d="M0,0 L12,6 L0,12 z" fill="#b85c38"></path>
+                <marker id="dag-arrow-ai" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+                    <path d="M0,0 L8,4 L0,8 z" fill="#b85c38"></path>
                 </marker>
-                <marker id="dag-arrow-pipeline" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
-                    <path d="M0,0 L12,6 L0,12 z" fill="#7a6a4d"></path>
+                <marker id="dag-arrow-pipeline" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+                    <path d="M0,0 L8,4 L0,8 z" fill="#7a6a4d"></path>
                 </marker>
             </defs>
         `;
@@ -1185,12 +1615,11 @@
 
             const srcRect = srcNode.getBoundingClientRect();
             const dstRect = dstNode.getBoundingClientRect();
-            const startX = srcRect.right - columnsRect.left;
+            const startX = srcRect.right - columnsRect.left + 6;
             const startY = srcRect.top - columnsRect.top + (srcRect.height / 2);
-            const endX = dstRect.left - columnsRect.left;
+            const endX = dstRect.left - columnsRect.left - 8;
             const endY = dstRect.top - columnsRect.top + (dstRect.height / 2);
-            const dx = Math.max(60, (endX - startX) * 0.4);
-            const pathData = `M ${startX} ${startY} C ${startX + dx} ${startY}, ${endX - dx} ${endY}, ${endX} ${endY}`;
+            const pathData = roundedConnectorPath(startX, startY, endX, endY);
             const sourceClass = edge.source === "ai" ? "ai" : edge.source === "syllabus" ? "syllabus" : "pipeline";
             const relationClass = edge.relation_type === "soft" ? "soft" : "hard";
             const markerId = sourceClass === "ai" ? "dag-arrow-ai" : sourceClass === "syllabus" ? "dag-arrow-syllabus" : "dag-arrow-pipeline";
@@ -1283,9 +1712,9 @@
         const parts = [
             `<svg xmlns="${svgNamespace}" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`,
             "<defs>",
-            '<marker id="export-arrow-syllabus" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#0e8f6f"></path></marker>',
-            '<marker id="export-arrow-ai" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#b85c38"></path></marker>',
-            '<marker id="export-arrow-pipeline" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="#7a6a4d"></path></marker>',
+            '<marker id="export-arrow-syllabus" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L8,4 L0,8 z" fill="#0e8f6f"></path></marker>',
+            '<marker id="export-arrow-ai" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L8,4 L0,8 z" fill="#b85c38"></path></marker>',
+            '<marker id="export-arrow-pipeline" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L8,4 L0,8 z" fill="#7a6a4d"></path></marker>',
             "</defs>",
             '<rect width="100%" height="100%" fill="#f5efe3"></rect>',
         ];
@@ -1306,10 +1735,10 @@
             const pathD = record.element.getAttribute("d");
             const sourceClass = record.edge.source === "ai" ? "ai" : record.edge.source === "syllabus" ? "syllabus" : "pipeline";
             const markerId = sourceClass === "ai" ? "export-arrow-ai" : sourceClass === "syllabus" ? "export-arrow-syllabus" : "export-arrow-pipeline";
-            const dash = record.edge.relation_type === "soft" ? ' stroke-dasharray="8 6"' : "";
-            const opacity = record.edge.decision === "accept" ? "" : ' opacity="0.58"';
+            const dash = record.edge.relation_type === "soft" ? ' stroke-dasharray="5 7"' : "";
+            const opacity = record.edge.decision === "accept" ? ' opacity="0.68"' : ' opacity="0.28"';
             const stroke = sourceClass === "ai" ? "#b85c38" : sourceClass === "syllabus" ? "#0e8f6f" : "#7a6a4d";
-            parts.push(`<path d="${pathD}" fill="none" stroke="${stroke}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"${dash}${opacity} marker-end="url(#${markerId})"></path>`);
+            parts.push(`<path d="${pathD}" fill="none" stroke="${stroke}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"${dash}${opacity} marker-end="url(#${markerId})"></path>`);
         }
 
         for (const [, layout] of nodeMap) {

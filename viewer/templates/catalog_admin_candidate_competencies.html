@@ -1,0 +1,149 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero candidate-competency-hero">
+    <div>
+        <h1>Кандидатные компетенции</h1>
+        <p>
+            Буфер новых группировок компетенций, которые появились после применения принятых навыков из брифа.
+            Пока запись не подтверждена, она не считается стабильной основой для графа зависимостей и УП.
+        </p>
+    </div>
+    <div class="review-actions">
+        <span class="status-badge {% if open_count %}warn{% endif %}">{{ open_count }} на проверке</span>
+    </div>
+</section>
+
+<section class="filter-panel">
+    <div class="summary-head candidate-competency-section-head">
+        <h2>Решения методолога</h2>
+        <span class="pill">{{ candidates|length }} кандидатов</span>
+    </div>
+    {% if candidates %}
+    <div class="candidate-competency-list">
+        {% for item in candidates %}
+        {% set review_label = 'на проверке' if item.review_state == 'needs_review' else ('принято' if item.review_state == 'accepted' else ('отклонено' if item.review_state == 'rejected' else item.review_state)) %}
+        {% set status_label = 'кандидат' if item.status == 'candidate' else ('активная' if item.status == 'active' else item.status) %}
+        {% set reason_label = 'новая кандидатная компетенция' if item.reason_code == 'new_competency_candidate' else item.reason_code %}
+        <details class="candidate-competency-card candidate-competency-window" open>
+            <summary class="candidate-competency-summary">
+                <span class="candidate-competency-summary-main">
+                    <strong>{{ item.title }}</strong>
+                    <small>компетенция #{{ item.competency_id }} · состояние: {{ review_label }} · статус: {{ status_label }}</small>
+                </span>
+                <span class="candidate-competency-summary-meta">
+                    <span class="pill">{{ item.skill_count }} навыков</span>
+                    {% if item.reason_code %}<span class="pill">{{ reason_label }}</span>{% endif %}
+                    <span class="status-badge {% if item.review_state == 'needs_review' %}warn{% endif %}">{{ review_label }}</span>
+                    <span class="candidate-competency-toggle-label"></span>
+                </span>
+            </summary>
+            <div class="candidate-competency-body">
+            <div class="candidate-competency-main">
+                {% if item.similar_competencies %}
+                <div class="competency-similarity-panel">
+                    <div class="summary-head">
+                        <h3>Похожие компетенции</h3>
+                        {% if item.nearest_competency %}
+                        <span class="pill">{{ item.nearest_competency.score }}%</span>
+                        {% endif %}
+                    </div>
+                    <div class="competency-similarity-list">
+                        {% for match in item.similar_competencies %}
+                        <a class="competency-similarity-item competency-similarity-{{ match.recommendation }}" href="/competencies/{{ match.id }}" target="_blank" rel="noopener">
+                            <span>
+                                <strong>{{ match.title }}</strong>
+                                <small>{{ match.label }} · название {{ match.title_similarity_pct }}% · слова {{ match.token_overlap_pct }}% · навыки {{ match.skill_overlap_count }}/{{ match.candidate_skill_count }}</small>
+                            </span>
+                            <b>{{ match.score }}%</b>
+                        </a>
+                        {% endfor %}
+                    </div>
+                    {% if item.nearest_competency and item.nearest_competency.recommendation == 'merge' %}
+                    <p class="small muted">Рекомендация: высокая похожесть, сначала рассмотрите слияние с ближайшей компетенцией.</p>
+                    {% elif item.nearest_competency and item.nearest_competency.recommendation == 'review' %}
+                    <p class="small muted">Рекомендация: есть частичное совпадение, проверьте смысл перед созданием новой компетенции.</p>
+                    {% else %}
+                    <p class="small muted">Рекомендация: сильных дублей не найдено, новую компетенцию можно создавать после проверки названия.</p>
+                    {% endif %}
+                </div>
+                {% endif %}
+                {% if item.skills %}
+                <div class="candidate-skill-move-list">
+                    <h3>Навыки внутри кандидатной компетенции</h3>
+                    {% for skill in item.skills %}
+                    {% set skill_review_label = 'на проверке' if skill.review_state == 'needs_review' else ('принято' if skill.review_state == 'accepted' else ('отклонено' if skill.review_state == 'rejected' else skill.review_state)) %}
+                    <div class="candidate-skill-move-row">
+                        <div>
+                            <strong>{{ skill.canonical_name or skill.source_skill_name }}</strong>
+                            <div class="small muted">связь #{{ skill.competency_skill_id }} · {{ skill_review_label }}</div>
+                        </div>
+                        <form class="inline-form" method="post" action="/catalog-admin/candidate-competencies">
+                            <input type="hidden" name="action" value="move_skill">
+                            <input type="hidden" name="competency_id" value="{{ item.competency_id }}">
+                            <input type="hidden" name="competency_skill_id" value="{{ skill.competency_skill_id }}">
+                            <select name="target_competency_id" required>
+                                <option value="">Перенести в компетенцию...</option>
+                                {% for option in competency_options %}
+                                {% if option.id != item.competency_id %}
+                                <option value="{{ option.id }}">{{ option.title }}</option>
+                                {% endif %}
+                                {% endfor %}
+                            </select>
+                            <button type="submit" class="action-btn action-btn-light">Перенести</button>
+                        </form>
+                    </div>
+                    {% endfor %}
+                </div>
+                {% endif %}
+                {% if item.details %}
+                <details class="collapse-panel technical-details">
+                    <summary>Техническая причина создания</summary>
+                    <pre>{{ item.details }}</pre>
+                </details>
+                {% endif %}
+            </div>
+            <div class="candidate-competency-actions">
+                <form method="post" action="/catalog-admin/candidate-competencies">
+                    <input type="hidden" name="competency_id" value="{{ item.competency_id }}">
+                    <label>
+                        <span>Переименовать</span>
+                        <input type="text" name="new_title" value="{{ item.title }}" required>
+                    </label>
+                    <button type="submit" name="action" value="rename" class="action-btn action-btn-light">Сохранить имя</button>
+                </form>
+
+                <form method="post" action="/catalog-admin/candidate-competencies">
+                    <input type="hidden" name="competency_id" value="{{ item.competency_id }}">
+                    <label>
+                        <span>Слить с существующей</span>
+                        <select name="target_competency_id" required>
+                            <option value="">Выберите компетенцию...</option>
+                            {% for option in competency_options %}
+                            {% if option.id != item.competency_id %}
+                            <option value="{{ option.id }}" {% if item.nearest_competency and option.id == item.nearest_competency.id %}selected{% endif %}>{{ option.title }}</option>
+                            {% endif %}
+                            {% endfor %}
+                        </select>
+                    </label>
+                    <button type="submit" name="action" value="merge" class="action-btn action-btn-secondary">Слить</button>
+                </form>
+
+                <form method="post" action="/catalog-admin/candidate-competencies">
+                    <input type="hidden" name="competency_id" value="{{ item.competency_id }}">
+                    <textarea name="resolution_note" rows="2" placeholder="Комментарий методолога"></textarea>
+                    <button type="submit" name="action" value="accept" class="action-btn action-btn-primary">Принять новую</button>
+                    <button type="submit" name="action" value="review" class="action-btn action-btn-light">Вернуть на проверку</button>
+                    <button type="submit" name="action" value="reject" class="action-btn action-btn-danger">Отклонить</button>
+                </form>
+            </div>
+            </div>
+        </details>
+        {% endfor %}
+    </div>
+    {% else %}
+    <div class="empty-state">
+        Открытых кандидатных компетенций нет. Новые группировки появятся здесь после применения принятых навыков из брифа.
+    </div>
+    {% endif %}
+</section>
+{% endblock %}

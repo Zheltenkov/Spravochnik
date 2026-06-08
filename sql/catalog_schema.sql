@@ -274,7 +274,7 @@ CREATE TABLE IF NOT EXISTS ai_analysis_suggestion (
 
 CREATE TABLE IF NOT EXISTS review_queue (
     id INTEGER PRIMARY KEY,
-    entity_type TEXT NOT NULL CHECK (entity_type IN ('workbook', 'sheet', 'block', 'competency', 'skill', 'indicator_row', 'profile', 'project', 'project_indicator', 'ai_analysis_run')),
+    entity_type TEXT NOT NULL CHECK (entity_type IN ('workbook', 'sheet', 'block', 'competency', 'skill', 'indicator_row', 'profile', 'project', 'project_indicator', 'ai_analysis_run', 'prerequisite_edge')),
     entity_id INTEGER,
     source_ref TEXT,
     reason_code TEXT NOT NULL,

@@ -219,6 +219,47 @@ CREATE INDEX IF NOT EXISTS idx_curriculum_artifact_template_status
 CREATE INDEX IF NOT EXISTS idx_curriculum_artifact_template_scope
     ON curriculum_artifact_template_scope(scope_type, normalized_scope_name);
 
+-- Версионируемые наборы skills. Это не taxonomy-группа: skill_set описывает
+-- "набор навыков для цели" и может быть собран из брифа, УП или вручную.
+CREATE TABLE IF NOT EXISTS skill_set (
+    id            INTEGER PRIMARY KEY,
+    code          TEXT NOT NULL UNIQUE,
+    title         TEXT NOT NULL,
+    description   TEXT,
+    source_type   TEXT NOT NULL CHECK (source_type IN ('brief','curriculum_plan','manual','system')),
+    source_id     INTEGER,
+    source_ref    TEXT,
+    status        TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','draft','archived')),
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS skill_set_item (
+    id            INTEGER PRIMARY KEY,
+    skill_set_id  INTEGER NOT NULL REFERENCES skill_set(id) ON DELETE CASCADE,
+    skill_id      INTEGER NOT NULL REFERENCES skill(id) ON DELETE CASCADE,
+    suggestion_id INTEGER REFERENCES skill_suggestion(id) ON DELETE SET NULL,
+    plan_row_id   INTEGER REFERENCES curriculum_plan_row(id) ON DELETE SET NULL,
+    role          TEXT NOT NULL DEFAULT 'target' CHECK (role IN ('target','prerequisite','reinforcement','assessment')),
+    weight        REAL NOT NULL DEFAULT 1.0,
+    sort_order    INTEGER NOT NULL DEFAULT 0,
+    rationale     TEXT,
+    created_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_skill_set_source
+    ON skill_set(source_type, source_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_skill_set_item_set
+    ON skill_set_item(skill_set_id, sort_order, id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_skill_set_item_unique
+    ON skill_set_item(skill_set_id, skill_id, role, COALESCE(plan_row_id, 0));
+
+CREATE INDEX IF NOT EXISTS idx_skill_set_item_skill
+    ON skill_set_item(skill_id, role);
+
 -- Предложения шаблонов УП по конкретному брифу.
 -- Это human-in-the-loop слой: proposals не применяются planner-ом, пока
 -- методолог не примет их в curriculum_artifact_template.

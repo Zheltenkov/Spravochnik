@@ -2,8 +2,15 @@
 {% block content %}
 <section class="hero">
     <div>
-        <h1>Скиллсеты</h1>
-        <p>Профили, собранные из Excel-источников и разложенные в локальную базу.</p>
+        <h1>Профили</h1>
+        <p>Ролевые компетентностные профили из исходного каталога. Служебные intake-профили скрыты по умолчанию, чтобы не смешивать рабочие черновики с каноном.</p>
+    </div>
+    <div class="review-actions">
+        {% if include_service_profiles %}
+        <a class="action-btn action-btn-secondary" href="/profiles">Скрыть служебные</a>
+        {% else %}
+        <a class="action-btn action-btn-secondary" href="/profiles?service=1">Показать служебные</a>
+        {% endif %}
     </div>
 </section>
 
@@ -13,7 +20,10 @@
         <div class="entity-head">
             <div>
                 <h2><a href="/profiles/{{ profile.id }}">{{ profile.name }}</a></h2>
-                <p class="muted">{{ profile.source_kind }}</p>
+                <p class="muted">
+                    {{ profile.source_kind }}
+                    {% if profile.slug == 'intake-accepted-skills' %} · служебный профиль intake{% endif %}
+                </p>
             </div>
             {% if profile.review_competencies %}
             <span class="status-badge warn">{{ profile.review_competencies }} needs review</span>

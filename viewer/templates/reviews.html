@@ -40,6 +40,15 @@
                 {% endfor %}
             </select>
         </label>
+        <label>
+            <span>Тип объекта</span>
+            <select name="entity_type">
+                <option value="all" {% if entity_type_filter == "all" %}selected{% endif %}>Все</option>
+                {% for option in entity_type_codes %}
+                <option value="{{ option.code }}" {% if entity_type_filter == option.code %}selected{% endif %}>{{ option.label }}</option>
+                {% endfor %}
+            </select>
+        </label>
         <button type="submit">Применить</button>
     </form>
 </section>
@@ -55,8 +64,24 @@
 </section>
 
 {% if dag_build_options %}
-<section class="filter-panel">
-    <form class="filter-form" method="post" action="/reviews/build-dag">
+<section class="filter-panel review-pipeline-actions">
+    <form class="filter-form review-pipeline-form" method="post" action="/reviews/apply-catalog">
+        <label>
+            <span>Применение принятых навыков в справочник</span>
+            <select name="brief_id">
+                {% for option in dag_build_options %}
+                <option value="{{ option.brief_id }}">
+                    #{{ option.brief_id }}
+                    {% if option.role %} · {{ option.role }}{% endif %}
+                    · принято {{ option.accepted_atomic_count }}
+                    · открыто в проверке {{ option.open_review_count }}
+                </option>
+                {% endfor %}
+            </select>
+        </label>
+        <button type="submit" class="action-btn action-btn-primary">Применить в справочник и набор навыков</button>
+    </form>
+    <form class="filter-form review-pipeline-form" method="post" action="/reviews/build-dag">
         <label>
             <span>Построение DAG по брифу</span>
             <select name="brief_id">
@@ -64,8 +89,8 @@
                 <option value="{{ option.brief_id }}">
                     #{{ option.brief_id }}
                     {% if option.role %} · {{ option.role }}{% endif %}
-                    · accepted {{ option.accepted_atomic_count }}
-                    · open review {{ option.open_review_count }}
+                    · принято {{ option.accepted_atomic_count }}
+                    · открыто в проверке {{ option.open_review_count }}
                 </option>
                 {% endfor %}
             </select>
@@ -79,43 +104,46 @@
     {% if items %}
     {% for item in items %}
     <article class="review-card">
-        <div class="review-card-header">
-            <span class="status-badge {% if item.severity != 'info' %}warn{% endif %}">{{ item.severity_label }}</span>
-            <span class="pill ghost">{{ item.status_label }}</span>
-        </div>
-        <div class="review-card-grid">
-            <div class="review-card-block">
-                <div class="review-card-label">Объект</div>
-                <div class="review-card-value">
-                    <strong>{{ item.entity_type }}</strong>
-                    {% if item.entity_id %}
-                    <div class="small muted">id {{ item.entity_id }}</div>
+        <div class="review-card-main">
+            <div class="review-card-header">
+                <div class="review-card-title">
+                    <span class="status-badge {% if item.severity != 'info' %}warn{% endif %}">{{ item.severity_label }}</span>
+                    <span class="pill ghost">{{ item.status_label }}</span>
+                    <h2>{{ item.entity_type|review_entity_label }}{% if item.entity_id %} #{{ item.entity_id }}{% endif %}</h2>
+                </div>
+                <div class="review-card-source">
+                    <span>{{ item.source_ref|review_source_label }}</span>
+                    <span>{{ item.created_at|datetime_local }}</span>
+                </div>
+            </div>
+            <div class="review-card-body">
+                <div class="review-reason-panel">
+                    <div class="review-card-label">Причина проверки</div>
+                    <div class="review-card-value">{{ item.display_reason or item.reason_label|review_text_label }}</div>
+                </div>
+                <div class="review-check-panel">
+                    <div class="review-card-label">Что проверить</div>
+                    <div class="review-details-body">{{ item.display_check or item.details|review_text_label }}</div>
+                </div>
+                <details class="review-technical-details">
+                    <summary>Технические коды</summary>
+                    <div class="small muted">Причина: <code>{{ item.reason_code }}</code></div>
+                    <div class="small muted">Источник: <code>{{ item.source_ref }}</code></div>
+                    <div class="small muted">Тип объекта: <code>{{ item.entity_type }}</code></div>
+                    {% if item.details %}
+                    <div class="small muted">Детали: <code>{{ item.details }}</code></div>
                     {% endif %}
-                </div>
-            </div>
-            <div class="review-card-block">
-                <div class="review-card-label">Причина</div>
-                <div class="review-card-value">
-                    <div>{{ item.reason_label }}</div>
-                    <div class="small muted"><code>{{ item.reason_code }}</code></div>
-                </div>
-            </div>
-            <div class="review-card-block review-card-block-wide">
-                <div class="review-card-label">Источник</div>
-                <div class="review-card-value"><code>{{ item.source_ref }}</code></div>
-            </div>
-            <div class="review-card-block review-card-block-full">
-                <div class="review-card-label">Что нужно проверить</div>
-                <div class="review-details-body">{{ item.details }}</div>
+                </details>
+                {% if item.reviewed_at or item.resolution_note %}
                 <div class="review-card-meta">
-                    <div class="small muted">Создано: {{ item.created_at }}</div>
                     {% if item.reviewed_at %}
-                    <div class="small muted">Проверено: {{ item.reviewed_at }}</div>
+                    <div class="small muted">Проверено: {{ item.reviewed_at|datetime_local }}</div>
                     {% endif %}
                     {% if item.resolution_note %}
                     <div class="small"><strong>Комментарий:</strong> {{ item.resolution_note }}</div>
                     {% endif %}
                 </div>
+                {% endif %}
             </div>
         </div>
         <div class="decision-cell">
@@ -124,6 +152,7 @@
                 <input type="hidden" name="status" value="{{ status_filter }}">
                 <input type="hidden" name="severity" value="{{ severity_filter }}">
                 <input type="hidden" name="reason" value="{{ reason_filter }}">
+                <input type="hidden" name="entity_type" value="{{ entity_type_filter }}">
                 <textarea name="resolution_note" rows="3" placeholder="Коротко: что решили и почему">{{ item.resolution_note or "" }}</textarea>
                 <div class="review-actions">
                     <button type="submit" name="new_status" value="resolved" class="action-btn action-btn-primary">Подтвердить решение</button>

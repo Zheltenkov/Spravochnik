@@ -59,6 +59,25 @@ def _env_bloom_ceiling(name: str) -> dict[str, str]:
     return ceilings
 
 
+def _env_model_price_map(name: str) -> dict[str, tuple[float, float]]:
+    """Parse `model:prompt_usd_per_1m:completion_usd_per_1m;...`."""
+    raw = os.environ.get(name, "")
+    prices: dict[str, tuple[float, float]] = {}
+    for chunk in raw.split(";"):
+        item = chunk.strip()
+        if not item:
+            continue
+        parts = [part.strip() for part in item.split(":")]
+        if len(parts) != 3:
+            continue
+        model, prompt_price, completion_price = parts
+        try:
+            prices[model] = (float(prompt_price), float(completion_price))
+        except ValueError:
+            continue
+    return prices
+
+
 _load_dotenv()
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPEN_ROUTER_API_KEY", "")
@@ -72,6 +91,7 @@ LLM_USAGE_LOG_PATH = os.environ.get(
     "LLM_USAGE_LOG_PATH",
     str(Path(__file__).resolve().parents[2] / "artifacts" / "llm_usage.jsonl"),
 )
+LLM_PRICE_USD_PER_1M = _env_model_price_map("LLM_PRICE_USD_PER_1M")
 EVIDENCE_CACHE_TTL_DAYS = int(os.environ.get("EVIDENCE_CACHE_TTL_DAYS", "30"))
 MODEL_PLAN = os.environ.get("MODEL_PLAN", "openai/gpt-5-mini")
 MODEL_SEARCH = os.environ.get("MODEL_SEARCH", "perplexity/sonar")
@@ -120,7 +140,7 @@ UP_MIN_THREAD_OCCURRENCES = int(os.environ.get("UP_MIN_THREAD_OCCURRENCES", "2")
 UP_MAX_THREAD_OCCURRENCES = int(os.environ.get("UP_MAX_THREAD_OCCURRENCES", "3"))
 UP_SPIRAL_MIN_GAP = int(os.environ.get("UP_SPIRAL_MIN_GAP", "2"))
 UP_SPIRAL_GAP_GROWTH = int(os.environ.get("UP_SPIRAL_GAP_GROWTH", "2"))
-UP_MAX_PROJECTS_PER_BLOCK = int(os.environ.get("UP_MAX_PROJECTS_PER_BLOCK", "3"))
+UP_MAX_PROJECTS_PER_BLOCK = int(os.environ.get("UP_MAX_PROJECTS_PER_BLOCK", "4"))
 UP_MAX_THEMES_PER_BLOCK = int(os.environ.get("UP_MAX_THEMES_PER_BLOCK", "2"))
 UP_MAX_BLOOM_BY_SENIORITY = _env_bloom_ceiling("UP_MAX_BLOOM_BY_SENIORITY")
 UP_GENERATED_COLUMNS = list("ABCDEFGHIJKLMN")

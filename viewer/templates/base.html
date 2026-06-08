@@ -3,27 +3,32 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{{ title }} | Skills Catalog</title>
+    <title>{{ title }} | Рабочий контур методолога</title>
     <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
     <header class="topbar">
-        <div class="brand">
-            <a href="/competencies">Локальный каталог skills</a>
+        <div class="topbar-inner">
+            <a class="wordmark" href="/intake">
+                <img class="wordmark-logo" src="/static/school21-sber-logo.jpg?v=1" alt="Школа 21">
+                <span>
+                    <span class="wordmark-name">Рабочий контур методолога</span>
+                </span>
+            </a>
+            <nav class="nav">
+                {% for item in nav %}
+                {% set state = namespace(active=false) %}
+                {% for prefix in item.prefixes or [item.href] %}
+                    {% if request_path == prefix or request_path.startswith(prefix ~ '/') %}
+                        {% set state.active = true %}
+                    {% endif %}
+                {% endfor %}
+                <a href="{{ item.href }}" class="nav-link{% if state.active %} active{% endif %}">{{ item.label }}</a>
+                {% endfor %}
+            </nav>
         </div>
-        <nav class="nav">
-            {% for item in nav %}
-            {% set state = namespace(active=false) %}
-            {% for prefix in item.prefixes or [item.href] %}
-                {% if request_path == prefix or request_path.startswith(prefix ~ '/') %}
-                    {% set state.active = true %}
-                {% endif %}
-            {% endfor %}
-            <a href="{{ item.href }}" class="nav-link{% if state.active %} active{% endif %}">{{ item.label }}</a>
-            {% endfor %}
-        </nav>
     </header>
-    {% if secondary_nav %}
+    {% if secondary_nav and show_secondary_nav %}
     <nav class="secondary-nav">
         {% for item in secondary_nav %}
         {% set state = namespace(active=false) %}

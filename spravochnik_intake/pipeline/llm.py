@@ -1,10 +1,12 @@
 """Слой доступа к LLM через OpenRouter (mock/live). Аналог content_gen/llm."""
 from __future__ import annotations
 import json
+import time
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import Path
 from . import config
+from .prompt_versions import prompt_version_for_stage
 
 _USAGE_CONTEXT: ContextVar[dict[str, object]] = ContextVar("llm_usage_context", default={})
 
@@ -23,18 +25,30 @@ def clear_usage_context() -> None:
     _USAGE_CONTEXT.set({})
 
 
-def _append_usage_log(model: str, messages: list[dict], json_mode: bool, timeout: int, max_tokens: int | None, resp: dict) -> None:
+def _append_usage_log(
+    model: str,
+    messages: list[dict],
+    json_mode: bool,
+    timeout: int,
+    max_tokens: int | None,
+    resp: dict,
+    latency_ms: float,
+) -> None:
     usage = resp.get("usage") or {}
+    context = _USAGE_CONTEXT.get() or {}
+    stage = context.get("stage")
     record = {
         "logged_at": datetime.now(UTC).isoformat(),
-        "job_id": (_USAGE_CONTEXT.get() or {}).get("job_id"),
-        "brief_id": (_USAGE_CONTEXT.get() or {}).get("brief_id"),
-        "stage": (_USAGE_CONTEXT.get() or {}).get("stage"),
+        "job_id": context.get("job_id"),
+        "brief_id": context.get("brief_id"),
+        "stage": stage,
+        "prompt_version": context.get("prompt_version") or prompt_version_for_stage(str(stage) if stage else None),
         "model": model,
         "json_mode": json_mode,
         "timeout_seconds": timeout or config.REQUEST_TIMEOUT_SECONDS,
         "max_tokens": max_tokens,
         "message_count": len(messages),
+        "latency_ms": round(latency_ms, 2),
         "prompt_tokens": usage.get("prompt_tokens"),
         "completion_tokens": usage.get("completion_tokens"),
         "total_tokens": usage.get("total_tokens"),
@@ -56,6 +70,7 @@ def chat(model: str, messages: list[dict], json_mode: bool = False, timeout: int
         payload["max_tokens"] = max_tokens
     session = requests.Session()
     session.trust_env = False
+    started_at = time.perf_counter()
     r = session.post(
         config.OPENROUTER_URL,
         headers={
@@ -67,9 +82,10 @@ def chat(model: str, messages: list[dict], json_mode: bool = False, timeout: int
         json=payload,
         timeout=timeout or config.REQUEST_TIMEOUT_SECONDS,
     )
+    latency_ms = (time.perf_counter() - started_at) * 1000
     r.raise_for_status()
     response_json = r.json()
-    _append_usage_log(model, messages, json_mode, timeout, max_tokens, response_json)
+    _append_usage_log(model, messages, json_mode, timeout, max_tokens, response_json, latency_ms)
     return response_json
 
 

@@ -80,10 +80,16 @@ ACTION_NOUNS = {
 
 _FRAGMENT_REPAIRS = {
     "пробный доступ": "Проектирование механики пробного доступа",
+    "пробных доступов": "Проектирование пробных доступов",
     "лендинг продукта": "Создание лендинга продукта для проверки спроса",
     "ключевое сообщение": "Формулирование ключевого сообщения продукта",
     "ключевого сообщения": "Формулирование ключевого сообщения продукта",
     "ценностное предложение": "Формулирование ценностного предложения",
+    "релизного процесса": "Организация релизного процесса",
+    "автоматических тестов": "Разработка автоматических тестов",
+    "каналов привлечения": "Выбор каналов привлечения",
+    "монетизационной модели": "Проектирование монетизационной модели",
+    "готовности к инцидентам": "Обеспечение готовности к инцидентам",
     "финансовые документы для запуска": "Подготовка базовых финансовых документов запуска",
     "подготовка базовые правовые": "Подготовка базового правового контура запуска",
     "настройка репозиторий": "Настройка Git-репозитория продукта",
@@ -136,6 +142,25 @@ _FRAGMENT_PREFIXES = {
     "расчет": "Расчёт",
 }
 
+_GENITIVE_FRAGMENT_HEADS = {
+    "автоматических",
+    "готовности",
+    "каналов",
+    "ключевого",
+    "монетизационной",
+    "пробных",
+    "релизного",
+    "сценариев",
+}
+
+_GENITIVE_FRAGMENT_SUFFIXES = (
+    "ого",
+    "его",
+    "ой",
+    "ых",
+    "их",
+)
+
 
 def _clean(value: str) -> str:
     return re.sub(r"\s+", " ", value.replace("‑", "-").strip(" \t\r\n.,;:"))
@@ -145,6 +170,17 @@ def _rewrite_object(value: str) -> str:
     cleaned = _clean(value)
     key = cleaned.casefold().replace("ё", "е")
     return _OBJECT_REWRITES.get(key, cleaned)
+
+
+def looks_like_genitive_fragment(name: str) -> bool:
+    """Detect object fragments like "Релизного процесса" without an observable action."""
+    cleaned = _clean(name)
+    if not cleaned:
+        return False
+    first = cleaned.split()[0].casefold().replace("ё", "е")
+    if first in ACTION_NOUNS:
+        return False
+    return first in _GENITIVE_FRAGMENT_HEADS or first.endswith(_GENITIVE_FRAGMENT_SUFFIXES)
 
 
 def canonicalize_skill_name(name: str) -> str:

@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+    <div>
+        <a class="back-link" href="/catalog-admin/skillsets">← Назад к наборам</a>
+        <h1>{{ skill_set.title }}</h1>
+        <p>{{ skill_set.description or "Набор skills без описания." }}</p>
+        <div class="small muted">
+            {{ skill_set.source_type }}{% if skill_set.source_id %} · id {{ skill_set.source_id }}{% endif %}
+            {% if skill_set.source_ref %} · {{ skill_set.source_ref }}{% endif %}
+        </div>
+    </div>
+    <div class="review-actions">
+        <span class="status-badge">{{ skill_set.status }}</span>
+        <span class="pill">{{ skill_set.skill_count }} skills</span>
+    </div>
+</section>
+
+<section class="table-wrap">
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>#</th>
+                <th>Skill</th>
+                <th>Группа</th>
+                <th>Роль</th>
+                <th>Вес</th>
+                <th>Источник</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% if items %}
+            {% for item in items %}
+            <tr>
+                <td>{{ item.sort_order }}</td>
+                <td>
+                    <strong>{{ item.canonical_name }}</strong>
+                    <div class="small muted">skill #{{ item.skill_id }}</div>
+                </td>
+                <td>{{ item.group_name or "—" }}</td>
+                <td><span class="pill">{{ item.role }}</span></td>
+                <td>{{ item.weight }}</td>
+                <td class="small muted">
+                    {% if item.suggestion_id %}suggestion #{{ item.suggestion_id }}{% endif %}
+                    {% if item.plan_row_id %}<br>УП row #{{ item.plan_row_id }}{% endif %}
+                    {% if item.rationale %}<br>{{ item.rationale }}{% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        {% else %}
+            <tr>
+                <td colspan="6" class="small muted">В наборе нет активных items.</td>
+            </tr>
+        {% endif %}
+        </tbody>
+    </table>
+</section>
+{% endblock %}

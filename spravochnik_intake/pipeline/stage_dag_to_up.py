@@ -15,6 +15,25 @@ from . import language
 from .curriculum import CurriculumBlock, PlanNode, ProjectBlueprint, SkillOccurrence, build_curriculum_blocks
 from .models import SkillCandidate
 
+_DANGLING_TAIL_WORDS = {
+    "и",
+    "или",
+    "в",
+    "во",
+    "на",
+    "для",
+    "по",
+    "с",
+    "со",
+    "к",
+    "ко",
+    "о",
+    "об",
+    "от",
+    "до",
+    "из",
+}
+
 CSV_PRIMARY_HEADER = [
     "Тематический блок",
     "Цели блока",
@@ -41,6 +60,33 @@ CSV_PRIMARY_HEADER = [
 ]
 
 CSV_SECONDARY_HEADER = [""] * len(CSV_PRIMARY_HEADER)
+
+
+def _strip_dangling_tail(text: str) -> str:
+    """Remove unfinished fragments after title compaction."""
+    cleaned = re.sub(r"\([^)]*$", "", text).strip(" .,-:;(")
+    words = cleaned.split()
+    while words and words[-1].casefold().strip(" .,-:;()") in _DANGLING_TAIL_WORDS:
+        words.pop()
+    return " ".join(words).strip(" .,-:;")
+
+
+def _drop_latin_parenthetical_notes(text: str) -> str:
+    """Remove English glossary notes from Russian curriculum titles."""
+    return re.sub(r"\s*\([^)]*[A-Za-z][^)]*\)", "", text).strip()
+
+
+def _limit_on_word_boundary(text: str, *, max_chars: int) -> str:
+    """Shorten labels without cutting a word or leaving an open parenthesis."""
+    if len(text) <= max_chars:
+        return _strip_dangling_tail(text) or text.strip(" .,-")
+    limit = max(12, max_chars - 1)
+    candidate = text[:limit].rstrip()
+    boundary = candidate.rfind(" ")
+    if boundary >= max(12, limit // 2):
+        candidate = candidate[:boundary]
+    candidate = _strip_dangling_tail(candidate)
+    return f"{candidate}…" if candidate else "…"
 
 
 def _display_name(candidate: SkillCandidate) -> str:
@@ -125,12 +171,36 @@ def _compact_label(value: str, *, max_words: int = 5, max_chars: int = 56) -> st
         return "Общее"
     # Long clarifications after colon are useful in coverage audit, but too noisy as block titles.
     text = text.split(":", 1)[0].strip()
+    text = _drop_latin_parenthetical_notes(text)
     words = text.split()
+    shortened_by_words = False
     if len(words) > max_words:
         text = " ".join(words[:max_words])
+        shortened_by_words = True
+    text = _strip_dangling_tail(text)
     if len(text) > max_chars:
-        text = text[:max_chars].rstrip(" ,.-") + "..."
+        text = _limit_on_word_boundary(text, max_chars=max_chars)
+    elif shortened_by_words and text:
+        text = f"{text}…"
     return text or "Общее"
+
+
+def _clean_project_title(value: str) -> str:
+    title = re.sub(r"^\s*(Практический\s+проект|Проект)\s*:\s*", "", value or "", flags=re.IGNORECASE).strip()
+    title = language.localize_area_label(title) or language.localize_skill_label(title) or title
+    title = re.sub(r"\s+", " ", title.replace("—", "-")).strip(" .,-")
+    if not title:
+        return "Проект"
+    if ":" in title:
+        head, tail = [part.strip(" .,-") for part in title.split(":", 1)]
+        head_label = _compact_label(head, max_words=3, max_chars=32)
+        tail_label = _compact_label(tail, max_words=4, max_chars=42)
+        title = f"{head_label}: {tail_label}" if tail_label else head_label
+    else:
+        title = _compact_label(title, max_words=8, max_chars=96)
+    if len(title) > 96:
+        title = _limit_on_word_boundary(title, max_chars=96)
+    return title
 
 
 def _join_limited(values: list[str], *, limit: int = 3) -> str:
@@ -142,7 +212,9 @@ def _join_limited(values: list[str], *, limit: int = 3) -> str:
 
 
 def _block_title(block_index: int, block_keys: list[str]) -> str:
-    theme = _join_limited(block_keys, limit=2) or "Общее"
+    labels = [_compact_label(value, max_words=3, max_chars=34) for value in block_keys if value]
+    unique = list(dict.fromkeys(labels))
+    theme = unique[0] if unique else "Общее"
     return f"Блок {block_index}. {theme}"
 
 
@@ -155,7 +227,7 @@ def _project_name(project: ProjectBlueprint, block_index: int, project_index: in
     # Название должно опираться на данные проекта, а не на доменно-локальные keyword-шаблоны.
     nodes = project.unique_nodes
     if project.title:
-        return project.title
+        return _clean_project_title(project.title)
     if len(nodes) == 1:
         return _compact_label(nodes[0].name, max_words=6, max_chars=64)
     anchor = nodes[-1].name
@@ -428,7 +500,9 @@ def _format_rows(blocks: list[CurriculumBlock], spec: dict[str, object] | None) 
     occurrence_totals = _occurrence_totals(blocks)
     for block_index, block in enumerate(blocks, start=1):
         all_block_nodes = [node for project in block.projects for node in project.unique_nodes]
-        block_keys = sorted({node.block_key for node in all_block_nodes})
+        block_keys = list(dict.fromkeys([project.block_key for project in block.projects if project.block_key]))
+        if not block_keys:
+            block_keys = list(dict.fromkeys([node.block_key for node in all_block_nodes]))
         block_title = _block_title(block_index, block_keys)
         block_goal = _block_goal(all_block_nodes)
         for project_index, project in enumerate(block.projects, start=1):
@@ -455,6 +529,8 @@ def _format_rows(blocks: list[CurriculumBlock], spec: dict[str, object] | None) 
                 "node_ids": project.node_ids,
                 "node_names": [node.name for node in project_nodes],
                 "occurrence_count": len(project.occurrences),
+                "primary_skill_count": len(project.primary_occurrences),
+                "repeat_skill_count": len([occurrence for occurrence in project.occurrences if occurrence.is_repeat]),
                 "outcome_count": outcome_count,
                 "artifact": project.artifact,
                 "artifact_key": project.artifact_key,
@@ -525,7 +601,13 @@ def _quality_metrics(rows: list[dict[str, object]], planner_meta: dict[str, obje
             "avg_skills_per_project": 0.0,
             "avg_outcomes_per_project": 0.0,
             "single_skill_project_count": 0,
+            "avg_primary_skills_per_project": 0.0,
+            "avg_repeat_skills_per_project": 0.0,
             "overloaded_project_count": 0,
+            "enriched_project_count": 0,
+            "enrichment_completeness_pct": 0.0,
+            "artifact_field_count": 0,
+            "validation_criteria_count": 0,
             "core_thread_count": 0,
             "repeated_thread_count": 0,
             "spiral_enabled": bool(config.UP_SPIRAL_ENABLED),
@@ -534,11 +616,36 @@ def _quality_metrics(rows: list[dict[str, object]], planner_meta: dict[str, obje
             "db_template_count": int(planner_meta.get("db_template_count", 0) or 0),
             "db_template_project_count": int(planner_meta.get("db_template_project_count", 0) or 0),
             "unassigned_node_count": int(planner_meta.get("unassigned_node_count", 0) or 0),
+            "dag_wave_count": int(planner_meta.get("dag_wave_count", 0) or 0),
+            "up_block_count": 0,
             "target_skills_per_project": [config.UP_TARGET_SKILLS_MIN, config.UP_TARGET_SKILLS_MAX],
             "target_outcomes_per_project": [config.UP_TARGET_OUTCOMES_MIN, config.UP_TARGET_OUTCOMES_MAX],
         }
     skill_counts = [len(row.get("node_ids") or []) for row in rows]
+    primary_skill_counts = [int(row.get("primary_skill_count", len(row.get("node_ids") or [])) or 0) for row in rows]
+    repeat_skill_counts = [int(row.get("repeat_skill_count", 0) or 0) for row in rows]
     outcome_counts = [int(row.get("outcome_count", 0) or 0) for row in rows]
+    enriched_project_count = 0
+    artifact_field_count = 0
+    validation_criteria_count = 0
+    for row in rows:
+        has_artifact = bool(str(row.get("artifact") or "").strip())
+        has_validation = bool(str(row.get("validation_criteria") or "").strip())
+        artifact_field_count += int(has_artifact)
+        validation_criteria_count += int(has_validation)
+        enriched_project_count += int(
+            all(
+                str(row.get(field) or "").strip()
+                for field in (
+                    "project_summary",
+                    "artifact",
+                    "materials",
+                    "storytelling",
+                    "validation_criteria",
+                    "delivery_format",
+                )
+            )
+        )
     overloaded = [
         row
         for row in rows
@@ -547,9 +654,15 @@ def _quality_metrics(rows: list[dict[str, object]], planner_meta: dict[str, obje
     ]
     return {
         "avg_skills_per_project": round(sum(skill_counts) / project_count, 2),
+        "avg_primary_skills_per_project": round(sum(primary_skill_counts) / project_count, 2),
+        "avg_repeat_skills_per_project": round(sum(repeat_skill_counts) / project_count, 2),
         "avg_outcomes_per_project": round(sum(outcome_counts) / project_count, 2),
         "single_skill_project_count": sum(1 for count in skill_counts if count <= 1),
         "overloaded_project_count": len(overloaded),
+        "enriched_project_count": enriched_project_count,
+        "enrichment_completeness_pct": round(enriched_project_count / project_count * 100, 1),
+        "artifact_field_count": artifact_field_count,
+        "validation_criteria_count": validation_criteria_count,
         "core_thread_count": len(planner_meta.get("core_thread_ids") or []),
         "repeated_thread_count": int(planner_meta.get("repeated_thread_count", 0) or 0),
         "spiral_enabled": bool(config.UP_SPIRAL_ENABLED),
@@ -591,6 +704,9 @@ def run(spec: dict[str, object] | None, candidates: list[SkillCandidate], dag_pa
     total_xp = sum(int(row.get("xp", 0) or 0) for row in rows)
     report = _plan_report(rows, dag_payload)
     report["quality_metrics"] = _quality_metrics(rows, planner_meta)
+    dag_waves = dag_payload.get("visual_waves") or dag_payload.get("waves") or []
+    report["quality_metrics"]["dag_wave_count"] = len(dag_waves) if isinstance(dag_waves, list) else 0
+    report["quality_metrics"]["up_block_count"] = len(blocks)
     report["planner_meta"] = planner_meta
     is_invalid = bool(report["order_violations"] or report.get("project_violations"))
 

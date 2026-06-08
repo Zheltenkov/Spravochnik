@@ -3,8 +3,8 @@
 <section class="hero">
     <div>
         <h1>Предложения шаблонов УП</h1>
-        <p>Система предлагает шаблоны по accepted skills этого брифа. Они не влияют на УП, пока методолог не примет предложение.</p>
-        <div class="small muted">plan #{{ plan.id }} · brief #{{ plan.brief_id }}</div>
+        <p>Процесс: система предлагает шаблоны по принятым навыкам, методолог редактирует и принимает. После принятия УП перестраивается.</p>
+        <div class="small muted">учебный план #{{ plan.id }} · бриф #{{ plan.brief_id }}</div>
     </div>
     <div class="review-actions">
         <a class="action-btn action-btn-light" href="/up/plans/{{ plan.id }}">Назад к УП</a>
@@ -15,25 +15,64 @@
     </div>
 </section>
 
+{% set open_count = proposals|selectattr("status", "equalto", "open")|list|length %}
+{% set accepted_count = proposals|selectattr("status", "equalto", "accepted")|list|length %}
+{% set rejected_count = proposals|selectattr("status", "equalto", "rejected")|list|length %}
+<section class="workflow-stepper" aria-label="Процесс шаблонов УП">
+    <a class="workflow-step workflow-step-done" href="#proposal-list">
+        <span class="workflow-step-index">1</span>
+        <span class="workflow-step-body">
+            <span class="workflow-step-label">Автопредложение</span>
+            <span class="workflow-step-description">Сгенерировано: {{ proposals|length }}.</span>
+        </span>
+    </a>
+    <a class="workflow-step {% if open_count %}workflow-step-active{% else %}workflow-step-done{% endif %}" href="#proposal-list">
+        <span class="workflow-step-index">2</span>
+        <span class="workflow-step-body">
+            <span class="workflow-step-label">Редактирование</span>
+            <span class="workflow-step-description">Открыто: {{ open_count }}.</span>
+        </span>
+    </a>
+    <a class="workflow-step {% if accepted_count %}workflow-step-done{% else %}workflow-step-active{% endif %}" href="/catalog-admin/artifact-templates">
+        <span class="workflow-step-index">3</span>
+        <span class="workflow-step-body">
+            <span class="workflow-step-label">Принятие</span>
+            <span class="workflow-step-description">Принято: {{ accepted_count }}, отклонено: {{ rejected_count }}.</span>
+        </span>
+    </a>
+    <a class="workflow-step {% if accepted_count %}workflow-step-done{% else %}workflow-step-pending{% endif %}" href="/up/plans/{{ plan.id }}">
+        <span class="workflow-step-index">4</span>
+        <span class="workflow-step-body">
+            <span class="workflow-step-label">Перестройка УП</span>
+            <span class="workflow-step-description">Запускается автоматически при принятии шаблона.</span>
+        </span>
+    </a>
+</section>
+
 {% if proposals %}
-<section class="list-grid">
+<section class="list-grid" id="proposal-list">
     {% for proposal in proposals %}
+    {% set status_label = 'требует решения' if proposal.status == 'open' else ('принято' if proposal.status == 'accepted' else ('отклонено' if proposal.status == 'rejected' else proposal.status)) %}
+    {% set family = namespace(label=proposal.artifact_family) %}
+    {% for value, label in artifact_family_options %}
+        {% if proposal.artifact_family == value %}
+            {% set family.label = label %}
+        {% endif %}
+    {% endfor %}
     <article class="entity-card">
         <div class="entity-head">
             <div>
                 <h2>{{ proposal.title }}</h2>
-                <p class="muted">{{ proposal.code }}</p>
             </div>
-            <span class="status-badge{% if proposal.status != 'accepted' %} warn{% endif %}">{{ proposal.status }}</span>
+            <span class="status-badge{% if proposal.status != 'accepted' %} warn{% endif %}">{{ status_label }}</span>
         </div>
 
         <div class="metrics">
-            <span>{{ proposal.artifact_family }}</span>
-            <span>confidence {{ "%.2f"|format(proposal.confidence) }}</span>
-            <span>{{ proposal.source }}</span>
-            <span>{{ proposal.covered_skill_names|length }} skills</span>
+            <span>{{ family.label }}</span>
+            <span>уверенность {{ "%.2f"|format(proposal.confidence) }}</span>
+            <span>{{ proposal.covered_skill_names|length }} навыков</span>
             {% if proposal.accepted_template_id %}
-            <span>template #{{ proposal.accepted_template_id }}</span>
+            <span>шаблон #{{ proposal.accepted_template_id }}</span>
             {% endif %}
         </div>
 
@@ -59,14 +98,14 @@
                     </select>
                 </label>
                 <label>
-                    <span>Confidence</span>
+                    <span>Уверенность</span>
                     <input type="number" step="0.01" min="0" max="1" name="confidence" value="{{ proposal.confidence }}">
                 </label>
             </div>
 
             <div class="form-grid-2">
                 <label>
-                    <span>Scope type</span>
+                    <span>Тип области применения</span>
                     <select name="scope_type">
                         {% for value, label in scope_type_options %}
                         <option value="{{ value }}" {% if proposal.scope_type == value %}selected{% endif %}>{{ label }}</option>
@@ -74,7 +113,7 @@
                     </select>
                 </label>
                 <label>
-                    <span>Scope names</span>
+                    <span>Названия областей применения</span>
                     <textarea name="scope_names" rows="3">{{ proposal.scope_names|join("\n") }}</textarea>
                 </label>
             </div>
@@ -108,15 +147,13 @@
                 <textarea name="rationale" rows="2">{{ proposal.rationale }}</textarea>
             </label>
 
-            <p class="muted">Плейсхолдеры для planner: <code>{theme}</code>, <code>{skills}</code>, <code>{first_skill}</code>, <code>{artifact}</code>, <code>{artifact_family}</code>.</p>
-
             <div class="review-actions">
                 {% if proposal.status == 'open' %}
                 <button type="submit" name="action" value="save_proposal" class="action-btn action-btn-light">Сохранить</button>
                 <button type="submit" name="action" value="accept_proposal" class="action-btn action-btn-primary">Принять и перестроить УП</button>
                 <button type="submit" name="action" value="reject_proposal" class="action-btn action-btn-danger">Отклонить</button>
                 {% elif proposal.status == 'accepted' %}
-                <span class="action-btn action-btn-light disabled">Принято в рабочие шаблоны</span>
+                <span class="action-btn action-btn-light disabled">Принято в рабочие шаблоны, УП перестроен</span>
                 {% else %}
                 <span class="action-btn action-btn-light disabled">Отклонено</span>
                 {% endif %}
@@ -128,7 +165,7 @@
 {% else %}
 <section class="filter-panel">
     <div class="empty-state">
-        Предложений пока нет. Нажмите «Сгенерировать заново»: система сгруппирует accepted skills по coverage area и предложит методологические шаблоны.
+        Предложений пока нет. Нажмите «Сгенерировать заново»: система сгруппирует принятые навыки по областям покрытия и предложит методологические шаблоны.
     </div>
 </section>
 {% endif %}

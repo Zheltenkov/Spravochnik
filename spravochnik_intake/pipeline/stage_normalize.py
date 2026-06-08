@@ -14,6 +14,7 @@ from dataclasses import dataclass
 
 from . import config
 from .models import IndicatorSpec, SkillCandidate
+from .skill_names import looks_like_genitive_fragment
 
 
 _ACTION_NORMALIZATION = {
@@ -201,12 +202,19 @@ def _looks_fragmentary(name: str) -> bool:
     stripped = name.strip()
     if not stripped:
         return True
+    if looks_like_genitive_fragment(stripped):
+        return True
     # Обрубки после неудачного split обычно начинаются со строчной буквы и не выглядят как законченный action-skill.
     if stripped[0].islower():
         return True
     if len(_token_signature(name)) < 2:
         return True
     return False
+
+
+def _must_drop_fragment(name: str) -> bool:
+    """Hard filter only fragments that cannot be interpreted as an observable skill."""
+    return looks_like_genitive_fragment(name)
 
 
 def _apply_area_compaction(
@@ -219,13 +227,23 @@ def _apply_area_compaction(
 
     grouped: dict[str, list[SkillCandidate]] = {}
     passthrough: list[SkillCandidate] = []
+    compacted_events: list[dict[str, object]] = []
     for candidate in candidates:
+        if candidate.entity_type == "skill" and candidate.atomicity == "atomic" and _must_drop_fragment(candidate.name):
+            compacted_events.append(
+                {
+                    "coverage_area": candidate.coverage_area,
+                    "kept_names": [],
+                    "dropped_names": [candidate.name],
+                    "reason": "program_brief_genitive_fragment_filter",
+                }
+            )
+            continue
         if not (candidate.entity_type == "skill" and candidate.atomicity == "atomic" and candidate.coverage_area):
             passthrough.append(candidate)
             continue
         grouped.setdefault(candidate.coverage_area, []).append(candidate)
 
-    compacted_events: list[dict[str, object]] = []
     kept: list[SkillCandidate] = list(passthrough)
     for area, area_candidates in grouped.items():
         has_non_fragment = any(not _looks_fragmentary(candidate.name) for candidate in area_candidates)

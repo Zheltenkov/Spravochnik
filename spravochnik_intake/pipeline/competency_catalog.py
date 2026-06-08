@@ -579,6 +579,56 @@ def _ensure_indicator_row(
     return int(cur.lastrowid), True
 
 
+def _level_label_for_dimension(dimension_code: str) -> str:
+    if dimension_code == "knowledge":
+        return "Знает"
+    if dimension_code == "ability":
+        return "Умеет"
+    return "Владеет"
+
+
+def _ensure_indicator_level_cell(
+    con: sqlite3.Connection,
+    *,
+    indicator_row_id: int,
+    raw_level_label: str,
+    raw_value: str,
+) -> bool:
+    if not _table_exists(con, "indicator_level_cell"):
+        return False
+    existing_id = _select_id(
+        con,
+        """
+        SELECT id
+        FROM indicator_level_cell
+        WHERE indicator_row_id = ?
+          AND raw_level_label = ?
+          AND raw_value = ?
+        ORDER BY id LIMIT 1
+        """,
+        (indicator_row_id, raw_level_label, raw_value),
+    )
+    if existing_id is not None:
+        return False
+    next_order = int(
+        con.execute(
+            "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM indicator_level_cell WHERE indicator_row_id = ?",
+            (indicator_row_id,),
+        ).fetchone()[0]
+        or 1
+    )
+    con.execute(
+        """
+        INSERT INTO indicator_level_cell(
+            indicator_row_id, proficiency_level_id, raw_level_label, raw_value, value_kind, sort_order
+        )
+        VALUES (?, NULL, ?, ?, 'text', ?)
+        """,
+        (indicator_row_id, raw_level_label, raw_value, next_order),
+    )
+    return True
+
+
 def _ensure_flat_indicator(
     con: sqlite3.Connection,
     *,
@@ -680,6 +730,12 @@ def _ensure_indicators(
         )
         if row_created:
             created_rows += 1
+        _ensure_indicator_level_cell(
+            con,
+            indicator_row_id=row_id,
+            raw_level_label=_level_label_for_dimension(dimension_code),
+            raw_value=text,
+        )
         if _ensure_flat_indicator(
             con,
             skill_id=skill_id,

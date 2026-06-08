@@ -1133,6 +1133,8 @@ def run_council(cands: list[SkillCandidate]) -> dict[str, int]:
 
 def _meets_auto_accept_policy(cand: SkillCandidate, spec: dict[str, object] | None = None) -> bool:
     artifact_type = str((spec or {}).get("artifact_type") or "").strip()
+    if not has_observable_action(cand.name):
+        return False
     # Новый skill в program_brief не публикуем автоматически: сначала нужен human check, иначе каталог быстро загрязняется.
     if (
         artifact_type in {"program_brief", "mixed"}
@@ -1164,12 +1166,15 @@ def triage_candidates(cands: list[SkillCandidate], spec: dict[str, object] | Non
             r.append("fuzzy_match_ambiguous")
         if c.resolution in {"matched", "alias", "fuzzy"} and not is_catalog_match_safe(c, spec):
             r.append("catalog_match_suspicious")
+        if not has_observable_action(c.name):
+            r.append("missing_observable_action")
         if c.confidence < config.TAU_CONFIDENCE:
             r.append("low_confidence")
         if n < config.MIN_SOURCES and c.resolution not in {"matched", "alias"}:
             r.append("single_source")
         if c.council_ran and c.council_agreement is not None and c.council_agreement < config.COUNCIL_AGREE_OK:
             r.append("council_split")
+        r = list(dict.fromkeys(r))
         if not r and _meets_auto_accept_policy(c, spec):
             c.decision = "accepted"
             c.reasons = ["auto_accept_policy"]

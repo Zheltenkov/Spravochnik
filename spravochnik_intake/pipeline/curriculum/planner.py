@@ -14,6 +14,52 @@ import networkx as nx
 from .. import config
 from .domain import CurriculumBlock, PlanNode, ProjectBlueprint, SkillOccurrence
 
+_DANGLING_TAIL_WORDS = {
+    "и",
+    "или",
+    "в",
+    "во",
+    "на",
+    "для",
+    "по",
+    "с",
+    "со",
+    "к",
+    "ко",
+    "о",
+    "об",
+    "от",
+    "до",
+    "из",
+}
+
+
+def _strip_dangling_tail(text: str) -> str:
+    """Remove half-open clauses that appear after compacting generated labels."""
+    cleaned = re.sub(r"\([^)]*$", "", text).strip(" .,-:;(")
+    words = cleaned.split()
+    while words and words[-1].casefold().strip(" .,-:;()") in _DANGLING_TAIL_WORDS:
+        words.pop()
+    return " ".join(words).strip(" .,-:;")
+
+
+def _drop_latin_parenthetical_notes(text: str) -> str:
+    """Remove English glossary notes from Russian curriculum labels."""
+    return re.sub(r"\s*\([^)]*[A-Za-z][^)]*\)", "", text).strip()
+
+
+def _limit_on_word_boundary(text: str, *, max_chars: int) -> str:
+    """Shorten text without cutting words or leaving unfinished parentheses."""
+    if len(text) <= max_chars:
+        return _strip_dangling_tail(text) or text.strip(" .,-")
+    limit = max(12, max_chars - 1)
+    candidate = text[:limit].rstrip()
+    boundary = candidate.rfind(" ")
+    if boundary >= max(12, limit // 2):
+        candidate = candidate[:boundary]
+    candidate = _strip_dangling_tail(candidate)
+    return f"{candidate}…" if candidate else "…"
+
 
 def _dag_position(dag_payload: dict[str, object]) -> dict[str, int]:
     return {
@@ -61,11 +107,17 @@ def _compact_text(value: str, *, max_words: int = 6, max_chars: int = 72) -> str
     if not text:
         return "Общее"
     text = text.split(":", 1)[0].strip()
+    text = _drop_latin_parenthetical_notes(text)
     words = text.split()
+    shortened_by_words = False
     if len(words) > max_words:
         text = " ".join(words[:max_words])
+        shortened_by_words = True
+    text = _strip_dangling_tail(text)
     if len(text) > max_chars:
-        text = text[:max_chars].rstrip(" ,.-") + "..."
+        text = _limit_on_word_boundary(text, max_chars=max_chars)
+    elif shortened_by_words and text:
+        text = f"{text}…"
     return text or "Общее"
 
 
@@ -209,12 +261,24 @@ def _template_artifact_for(nodes: list[PlanNode], block_key: str, artifact_famil
 def _template_title_for(nodes: list[PlanNode], block_key: str, artifact_family: str, template: dict[str, object] | None) -> str:
     if not template:
         return ""
-    return _render_pattern(
-        template.get("project_name_pattern") or template.get("title"),
+    pattern = str(template.get("project_name_pattern") or "").strip()
+    rendered = _render_pattern(
+        pattern,
         nodes=nodes,
         block_key=block_key,
         artifact_family=artifact_family,
     )
+    # Project-name patterns can expand into long skill lists. If that happens,
+    # use the accepted template title as the stable human-readable project name.
+    if rendered and ("{" not in pattern or len(rendered) <= 72):
+        return rendered
+    title = _render_pattern(
+        template.get("title"),
+        nodes=nodes,
+        block_key=block_key,
+        artifact_family=artifact_family,
+    )
+    return title or rendered
 
 
 def _template_enrichment_for(
@@ -245,7 +309,7 @@ def _artifact_for(nodes: list[PlanNode], block_key: str, artifact_family: str) -
 
 def _project_title_for(block_key: str, chunk_index: int, chunk_count: int) -> str:
     suffix = f" {chunk_index}" if chunk_count > 1 else ""
-    return f"Практический проект: {_compact_text(block_key, max_words=5, max_chars=56)}{suffix}"
+    return f"{_compact_text(block_key, max_words=4, max_chars=44)}{suffix}"
 
 
 def _ordered_nodes(nodes: list[PlanNode], dag_payload: dict[str, object]) -> list[PlanNode]:
